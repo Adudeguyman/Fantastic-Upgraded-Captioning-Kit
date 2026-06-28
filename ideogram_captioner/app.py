@@ -757,6 +757,16 @@ class CanvasView(QGraphicsView):
                 self.viewport().setCursor(Qt.OpenHandCursor)
             event.accept()
             return
+        # Arrow keys nudge the selected box (Shift = ×10). Falls through to the
+        # default view behaviour (scroll) when no box is selected.
+        arrows = {Qt.Key_Left: (-1, 0), Qt.Key_Right: (1, 0),
+                  Qt.Key_Up: (0, -1), Qt.Key_Down: (0, 1)}
+        if event.key() in arrows:
+            step = 10 if (event.modifiers() & Qt.ShiftModifier) else 1
+            ux, uy = arrows[event.key()]
+            if self.controller.nudge_selected_box(ux * step, uy * step):
+                event.accept()
+                return
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event) -> None:
@@ -6013,6 +6023,52 @@ class MainWindow(QMainWindow):
         if list_item is not None:
             list_item.setText(self._element_label(els[idx]))
             item.set_label(self._element_label(els[idx]))
+
+    def nudge_selected_box(self, dx: int, dy: int) -> bool:
+        """Move the selected element's box by (dx, dy) in 0–1000 units, keeping its
+        size fixed and clamped in-bounds. Returns True if there was a box to nudge."""
+        idx = self.selected_element_index
+        els = self._elements()
+        if idx is None or idx < 0 or idx >= len(els):
+            return False
+        bbox = els[idx].get("bbox")
+        if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
+            return False
+        top, left, bottom, right = (int(v) for v in bbox)
+        # clamp the shift so the box keeps its size and stays within 0–1000
+        dx = _clamp(dx, -left, 1000 - right)
+        dy = _clamp(dy, -top, 1000 - bottom)
+        if dx == 0 and dy == 0:
+            return True  # selected but pinned against the edge — still consume the key
+        new_bbox = [top + dy, left + dx, bottom + dy, right + dx]
+        els[idx]["bbox"] = new_bbox
+        self._touch_dirty()
+        item = next((it for it in self.box_items if it.element_index == idx), None)
+        if item is not None:
+            rect = self._norm_to_scene(new_bbox)
+            if rect is not None:
+                # setPos would fire itemChange -> on_box_geometry_live mid-update and
+                # clobber the box we just computed; move silently, then restore.
+                item.setFlag(QGraphicsItem.ItemSendsGeometryChanges, False)
+                item.set_scene_rect(rect)
+                item.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
+                item.setSelected(True)
+        # keep the coordinate fields in step (same path as a mouse drag)
+        self._syncing = True
+        try:
+            # block signals: the element already has a box, and firing
+            # _on_has_box_changed here would reset it to a default rectangle.
+            self.el_has_box.blockSignals(True)
+            self.el_has_box.setChecked(True)
+            self.el_has_box.blockSignals(False)
+            self._set_coords_enabled(True)
+            self.el_y1.setValue(new_bbox[0])
+            self.el_x1.setValue(new_bbox[1])
+            self.el_y2.setValue(new_bbox[2])
+            self.el_x2.setValue(new_bbox[3])
+        finally:
+            self._syncing = False
+        return True
 
     def apply_drawn_box(self, scene_rect: QRectF) -> None:
         if scene_rect.width() < MIN_BOX_PX or scene_rect.height() < MIN_BOX_PX:

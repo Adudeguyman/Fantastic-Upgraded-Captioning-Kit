@@ -25,10 +25,17 @@ leaves your machine except the requests to the endpoint you configure.
 - **Caption guidance** — Attach folder-wide and per-image guidance (style,
   characters, things to always mention or avoid) that steers generation, plus
   reusable tag/trigger chips.
-- **Local auto-captioning** — Generate plain captions, JSON from text, JSON
-  directly from an image, refinements of existing JSON, and bounding-box
-  detection — all through a local vision-language model. Batch-caption a
-  selection, retry failures, and undo the last AI job.
+- **Local auto-captioning** — Generate the structured Ideogram JSON straight from
+  an image, refine an existing caption, and run a bounding-box pass over the
+  described elements (regenerate every box, or fill only the missing ones) — all
+  through a local vision-language model you control. Caption the current image or
+  the whole folder; when re-running an already-captioned folder you can limit it to
+  new images, changed + new, or re-caption everything, and cancel a run at any time.
+- **Caption review** — Captions that come back off-schema or corrupt — empty, a
+  flat text blob instead of structured JSON, a model refusal, or a duplicate of
+  another image's caption — are automatically flagged for review after a run, with
+  a summary listing them. You can also browse and flag images yourself while a batch
+  is still running, then jump straight between flagged images to fix them.
 - **Bring your own model** — Pick from suggested Hugging Face GGUF models
   (auto-downloaded and served via llama.cpp), point at local GGUF files, or
   connect to a server you're already running. Your model choices live in a
@@ -186,7 +193,8 @@ accident:
 - `Ctrl+0` — fit the image to the canvas
 - `Ctrl+\` — collapse / expand the guidance panel
 - `Ctrl+,` — open Preferences
-- Arrow keys — step between images when the filmstrip has focus
+- Arrow keys — nudge the selected box by one unit when the canvas has focus
+  (hold `Shift` for ×10); step between images when the filmstrip has focus
 - `Tab` / `Shift+Tab` — move between fields
 - Hold `Space` (or middle-drag) — pan the canvas
 - `F11` — toggle fullscreen
