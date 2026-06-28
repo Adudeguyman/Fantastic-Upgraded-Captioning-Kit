@@ -131,6 +131,26 @@ def find_llama_server() -> Path | None:
 DEFAULT_PROFILE_DATA: dict[str, Any] = {
     "profiles": [
         {
+            "id": "llmfan46-gemma4-31b-qat-heretic-q4_0",
+            "label": "Download: Gemma 4 31B IT QAT Uncensored Heretic Q4_0 (18GB)",
+            "tasks": ["caption", "bbox"],
+            "kind": "hf",
+            "api_model": "gemma4-31b-heretic",
+            "hf_repo": "llmfan46/gemma-4-31B-it-qat-q4_0-uncensored-heretic-GGUF",
+            "model_filename": "gemma-4-31B-it-qat-Q4_0.gguf",
+            "mmproj_filename": "gemma-4-31B-it-uncensored-heretic-BF16.gguf",
+        },
+        {
+            "id": "llmfan46-gemma4-12b-qat-heretic-q4_0",
+            "label": "Download: Gemma 4 12B IT QAT Uncensored Heretic Q4_0 (8GB)",
+            "tasks": ["caption", "bbox"],
+            "kind": "hf",
+            "api_model": "gemma4-12b-heretic",
+            "hf_repo": "llmfan46/gemma-4-12B-it-qat-q4_0-uncensored-heretic-GGUF",
+            "model_filename": "gemma-4-12B-it-qat-q4_0-uncensored-heretic-Q4_0.gguf",
+            "mmproj_filename": "gemma-4-12B-it-qat-q4_0-uncensored-heretic-mmproj-BF16.gguf",
+        },
+        {
             "id": "unsloth-qwen25vl-7b-q4",
             "label": "Download: Qwen2.5-VL 7B Q4 (recommended)",
             "tasks": ["caption", "bbox"],
@@ -350,6 +370,22 @@ class CaptioningSettings:
     bbox_server_command: str = ""
     server_startup_timeout: float = 120.0
     stop_server_after_job: bool = False
+
+    # Appearance (applied at startup). Empty font family = auto-detect an installed font.
+    ui_font_family: str = ""
+    mono_font_family: str = ""
+    ui_font_size: int = 10
+    color_window: str = "#111318"
+    color_toolbar: str = "#0d0f14"
+    color_panel: str = "#171a21"
+    color_text: str = "#d9dee9"
+    color_accent: str = "#2f6fed"
+    color_selection: str = "#315fbd"
+    color_field: str = "#222733"
+    color_field_text: str = "#f2f5fb"
+    color_editor_bg: str = "#10131a"
+    color_list_bg: str = "#1f2430"
+    color_canvas: str = "#05070a"
 
     def __post_init__(self) -> None:
         if not self.models_dir:
@@ -1218,12 +1254,26 @@ Return only:
 """.strip()
 
 
+GUIDANCE_PREAMBLE = """
+PER-IMAGE USER GUIDANCE (authoritative).
+The instructions below are supplied by the user for THIS specific image. Follow them exactly. Where they conflict with the general rules above, the user guidance takes precedence. In particular, when the guidance calls for it, you MAY:
+- Emit a part, prop, held object, or weapon as its OWN separate element, even though the general rule prefers one element per subject. Anything the user wants individually located must be its own element.
+- Omit attributes the user tells you to skip (for example eye color, hair color, skin tone, or specific garments), even though the general rules ask you to name them.
+- Use exact trigger tokens or names in place of generic descriptions, and append or prepend fixed text to specific fields, exactly as instructed.
+Bounding boxes are added automatically in a later step, so you do not need to output coordinates yourself — just make sure anything that needs its own box is emitted as its own element. Do not let the general rules override an explicit user instruction.
+
+USER GUIDANCE:
+{guidance}
+""".strip()
+
+
 DEFAULT_PROMPT_TEXTS: dict[str, str] = {
     "plain_caption_system": PLAIN_CAPTION_SYSTEM,
     "plain_caption_user": PLAIN_CAPTION_USER,
     "creative_directive": CREATIVE_DIRECTIVE,
     "faithful_directive": FAITHFUL_DIRECTIVE,
     "json_schema_instructions": JSON_SCHEMA_INSTRUCTIONS,
+    "guidance_preamble": GUIDANCE_PREAMBLE,
     "text_to_json_system": TEXT_TO_JSON_SYSTEM,
     "text_to_json_user": TEXT_TO_JSON_USER,
     "image_to_json_system": IMAGE_TO_JSON_SYSTEM,
@@ -1289,16 +1339,21 @@ def _directive(settings: CaptioningSettings) -> str:
     return str(prompts[key])
 
 
-def json_system_prompt(prompts: dict[str, Any], task_system_key: str, settings: CaptioningSettings) -> str:
-    return "\n\n".join(
-        part
-        for part in (
-            str(prompts[task_system_key]).strip(),
-            str(prompts["json_schema_instructions"]).strip(),
-            _directive(settings).strip(),
-        )
-        if part
-    )
+def json_system_prompt(
+    prompts: dict[str, Any],
+    task_system_key: str,
+    settings: CaptioningSettings,
+    guidance: str = "",
+) -> str:
+    parts = [
+        str(prompts[task_system_key]).strip(),
+        str(prompts["json_schema_instructions"]).strip(),
+        _directive(settings).strip(),
+    ]
+    guidance = (guidance or "").strip()
+    if guidance:
+        parts.append(format_prompt(str(prompts["guidance_preamble"]), guidance=guidance).strip())
+    return "\n\n".join(part for part in parts if part)
 
 
 def generate_json_from_text(
@@ -1338,6 +1393,7 @@ def generate_json_from_image(
     settings: CaptioningSettings,
     image_path: Path,
     progress: ProgressCallback | None = None,
+    guidance: str = "",
 ) -> dict[str, Any]:
     config = runtime_config_for_task(settings, "caption")
     prompts = load_prompts()
@@ -1345,7 +1401,7 @@ def generate_json_from_image(
         settings=settings,
         model=config.api_model,
         image_path=image_path,
-        system=json_system_prompt(prompts, "image_to_json_system", settings),
+        system=json_system_prompt(prompts, "image_to_json_system", settings, guidance=guidance),
         user=format_prompt(prompts["image_to_json_user"], directive=""),
         max_tokens=settings.max_tokens_json,
         temperature=0.0,

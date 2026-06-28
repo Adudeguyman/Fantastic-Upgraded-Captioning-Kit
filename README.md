@@ -1,198 +1,214 @@
 # Ideogram JSON Captioner
 
-A local desktop editor for image-caption pairs in Ideogram 4 structured JSON
-format. Use it to generate either regular captions or JSON captions, review image datasets, repair generated captions, edit source
-caption text, and draw or adjust object/text bounding boxes.  You can also generate JSON captions based on your already existing and vetted captions.
+A local desktop app for building and curating image-caption datasets in
+Ideogram 4's structured JSON caption format. Open a folder of images, write or
+generate captions, draw bounding boxes, and keep your original text captions
+alongside the structured JSON — all on your own machine.
 
-The app runs locally by default. . Auto-captioning sends requests only to the OpenAI-compatible endpoint
-you configure in Preferences, such as a local llama.cpp, LM Studio, vLLM, or
-Ollama-compatible server.
+Auto-captioning is optional and runs against an OpenAI-compatible model server
+that **you** control (local llama.cpp, LM Studio, vLLM, or Ollama). Nothing
+leaves your machine except the requests to the endpoint you configure.
 
 ![Ideogram JSON Captioner screenshot](ideogramCaptionerScreenshot.png)
 
 ## Features
 
-- Open a folder of images and step through them with keyboard shortcuts.
-- Edit Ideogram JSON fields for high-level description, style, background,
-  elements, rendered text, bounding boxes, and color palettes.
-- Draw, move, resize, delete, and numerically edit bounding boxes.
-- Keep editable original captions, such as `.txt` or `.original`, separate from
-  structured JSON output.
-- Generate text captions, JSON captions from text, JSON captions from images,
-  JSON refinements, and bounding boxes with a local or existing
-  vision-language model server.
-- Batch auto-caption selected images, retry failed captions, and undo the last
-  auto-captioning job.
-- Sort and filter the image list by name, modified date, missing captions, or
-  failed auto-captioning jobs.
-- Search structured JSON captions, original text captions, or both to show only
-  images whose caption sidecars contain a word or phrase.
-- Copy the current image into an `edit` subfolder for later external editing.
+- **Dataset browsing** — Step through an image folder with keyboard shortcuts.
+  Sort and filter by name, date, missing captions, or failed jobs, and search
+  inside caption sidecars to jump straight to the images you mean.
+- **Structured caption editing** — Edit every Ideogram JSON field (description,
+  style, background, elements, rendered text, color palette) in a native Qt
+  form, with a live raw-JSON view. Original text captions (`.txt`, `.original`)
+  stay separate from the structured JSON.
+- **Bounding boxes** — Draw, move, resize, delete, and numerically edit
+  object/text boxes directly on the image, with overlap-aware selection.
+- **Caption guidance** — Attach folder-wide and per-image guidance (style,
+  characters, things to always mention or avoid) that steers generation, plus
+  reusable tag/trigger chips.
+- **Local auto-captioning** — Generate plain captions, JSON from text, JSON
+  directly from an image, refinements of existing JSON, and bounding-box
+  detection — all through a local vision-language model. Batch-caption a
+  selection, retry failures, and undo the last AI job.
+- **Bring your own model** — Pick from suggested Hugging Face GGUF models
+  (auto-downloaded and served via llama.cpp), point at local GGUF files, or
+  connect to a server you're already running. Your model choices live in a
+  local, git-ignored profile file.
 
-## Install
+Manual captioning and box editing work fully offline; a model server is only
+needed for the auto-captioning features.
 
-For most Windows users, download `IdeogramCaptioner.exe` from the GitHub
-Releases page and run it.
+## Requirements
 
-To run from source instead:
+- **Python 3.10 or newer**
+- **For auto-captioning:** an OpenAI-compatible vision model server. The
+  built-in option downloads a GGUF model and runs `llama-server` for you; you
+  can also connect to LM Studio, vLLM, Ollama, or your own llama.cpp server.
 
+## Installation
+
+Clone the repository, then set up an environment with **either** venv or conda.
+PySide6 is a large wheel (~150–200 MB), so the first install takes a minute.
+
+```bash
+git clone https://github.com/Adudeguyman/Ideogram-fantastic-upgraded-captioning-kit.git
+cd Ideogram-fantastic-upgraded-captioning-kit
+```
+
+### Quickest start — auto-launcher (venv)
+
+If you just want to run the app, use the bundled auto-launcher. On its first run
+it creates a local `.venv`, installs the requirements, and starts the app; every
+run after that launches straight away.
+
+- **Windows:** double-click `run_captioner.bat`, or run it from a terminal.
+- **Linux / macOS:**
+  ```bash
+  chmod +x run_captioner.sh   # once
+  ./run_captioner.sh
+  ```
+
+Prefer to manage the environment yourself? Set it up manually with venv or conda
+below.
+
+### Option A — venv
+
+**Linux / macOS**
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+**Windows (PowerShell)**
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+pip install -r requirements.txt
+```
+
+### Option B — conda
+
+```bash
+conda create -n id4caption python=3.11
+conda activate id4caption
+pip install -r requirements.txt
+```
+
+PySide6 installs cleanly with pip inside the conda env, so there's no need to
+chase it down on a conda channel.
+
+## Launching
+
+With your environment activated (venv or conda), launch the app with:
+
+```bash
 python -m ideogram_captioner
 ```
 
-You can also start the app with:
+or equivalently:
 
-```powershell
+```bash
 python run_captioner.py
 ```
 
-## Basic Use
+**conda convenience launcher (Linux / macOS):** `run_captioner_qt.sh` activates
+the `id4caption` environment for you, then starts the app:
 
-### Manual Captioning: 
-1. Open a folder that contains images.
-2. Choose the structured caption extension to edit, usually `.json`.
-3. Choose an original caption extension if you also want to edit source captions,
-   such as `.txt` or `.original`.
-4. Select an image, edit the fields, then use `Save` or `Enter` to save and move
-   to the next image.
-   
-### Automatic Captioning: 
-If you don't already have an OpenAI-compatible server, the easiest way to get automatic captioning working is to grab llama.cpp from their releases section - https://github.com/ggml-org/llama.cpp/releases - and be sure to grab the CUDA .dlls and put them in the same folder as llama-server.exe if you're using an Nvidia card, otherwise it will probably be quite slow.
-After you've done so, open the preferences and select where you've put llama-server.exe.  From there, just select what image(s) you want to caption and select the appropriate button from the Auto Captioning section.
-
-For automatic captioning, I would probably recommend doing a regular text caption first (if you don't have one already), and then creating the JSON caption from that, but making them directly can also work.  You will definitely want to alter the prompts sent to the LLM as they've very basic - do a few images as a test to see what you need to specify.
-
-
-## Keyboard Shortcuts
-
-- `Enter`: save and move to the next image.
-- `Shift+Enter`: insert a newline in a text field.
-- `Tab` / `Shift+Tab`: move forward or backward between fields.
-- Arrow keys: navigate images when focus is not inside an input.
-- `Ctrl+Up` / `Ctrl+Down`: navigate images even when an input has focus.
-- `Ctrl+S`: save.
-- `Ctrl+A` in the image list: select all images for batch auto-captioning.
-- `Esc`: cancel eyedropper mode or exit fullscreen.
-- `F11`: toggle fullscreen.
-
-## Auto Captioning
-
-Open `Preferences` to choose the captioning runtime, model profile, endpoint,
-model folder, prompt behavior, and bbox settings.
-
-The default runtime is `Local llama.cpp`. In this mode, the app downloads the
-selected Hugging Face GGUF model files if needed, starts `llama-server.exe`, and
-sends OpenAI-compatible requests to `http://127.0.0.1:8000/v1`.
-
-For the local runtime, put `llama-server.exe` in one of these locations:
-
-- Beside `IdeogramCaptioner.exe` or the source checkout.
-- In a `tools` folder beside the app.
-- Anywhere else selected in Preferences.
-
-The app reuses an already-running endpoint when one is available. Use
-`Connect to existing server` for LM Studio, llama.cpp, vLLM, Ollama bridges, or
-another OpenAI-compatible server you started yourself.
-
-The right-side `Auto Captioning` buttons do the following:
-
-- `Text Caption`: creates or replaces the plain original-caption sidecar.
-- `JSON from Text`: converts the original caption into Ideogram JSON.
-- `JSON from Image`: creates Ideogram JSON directly from the image.
-- `Refine JSON`: revises existing structured JSON from the image, the current
-  JSON, the original caption sidecar, and custom instructions entered at run
-  time.
-- `Add/redo BBoxes`: localizes existing JSON elements with the selected VLM.
-- `Retry Failed`: reruns images that have failed auto-captioning markers.
-- `Clear Failed`: removes failed markers without rerunning the model.
-- `Undo AI`: restores sidecar files from before the last auto-captioning job.
-
-Multiple images can be selected with Shift, Ctrl, or `Ctrl+A`. The app asks for
-confirmation before running an auto-captioning job on more than one image.
-
-## Failed Captions
-
-When auto-captioning cannot complete, the image is marked with a local
-`*.caption_failed.json` sidecar. This lets the app show failed items, retry them
-later, or clear the failed state.
-
-JSON parse failures get a repair pass before they are marked failed. If the
-repair pass still fails, retry the failed images with a larger or more reliable
-model, a larger context size, or a lower reasoning budget.
-
-Failure markers are local working files and are ignored by git.
-
-## Model Profiles
-
-Model profiles live in `captioner_model_profiles.json` beside the app or source
-checkout. This file is local and ignored by git so your model choices, local
-paths, and experiments are not overwritten by pulls or uploaded by accident.
-
-Use `Preferences` -> `Models` -> `Open Profiles File` to create or edit the
-local profile file. The tracked `captioner_model_profiles.example.json` file is
-the default seed.
-
-A downloadable Hugging Face profile looks like this:
-
-```json
-{
-  "id": "my-qwen-profile",
-  "label": "Download: My Qwen model",
-  "tasks": ["caption", "bbox"],
-  "kind": "hf",
-  "api_model": "my-qwen",
-  "hf_repo": "org/repo-name",
-  "model_filename": "model-file.gguf",
-  "mmproj_filename": "mmproj-file.gguf"
-}
+```bash
+chmod +x run_captioner_qt.sh   # once
+./run_captioner_qt.sh
 ```
 
-`tasks` can be `["caption"]`, `["bbox"]`, or both. Supported profile kinds are:
+## Basic use
 
-- `hf`: download GGUF files from Hugging Face.
-- `local`: use fixed `local_model_path` and optional `local_mmproj_path` values.
-- `server`: skip downloads and local launch; send requests using `api_model` as
-  the existing server model name.
+1. In **Preferences**, set up your server (Connection/Server) and choose the model
+   it will use (Models). For an existing server, click **Refresh** to pick from the
+   models it reports. Use **Test Server** to verify the connection. The server status
+   is always shown in the bottom-right corner of the main window.
 
-The profile dropdown also includes one-off custom choices for Hugging Face GGUF
-downloads and local GGUF files already on your computer.
+2. Open a folder of images. Per-dataset settings (guidance, tags, review flags) are
+   saved in a **.captioner** folder inside it, so they're restored the next time you
+   open that folder.
 
-## Prompt Overrides
+3. *(Optional)* Open **Guidance Settings** to add instructions for the model:
+   - **Folder-level guidance** is appended to every image — e.g. for a consistent
+     art style: *"For the high_level_description section, append the suffix
+     'in the style of my_art_style'."*
+   - **Per-image guidance** targets one image — e.g. when training multiple
+     characters: *"From left to right the characters are CharacterOne,
+     CharacterTwo…"*
+   - **Tags** are part of the image-level guidance — reusable snippets you define
+     once and reference as needed while writing an image's guidance, so recurring
+     instructions don't have to be retyped per image.
 
-Prompt overrides live in the ignored `captioner_prompts/` folder. Use
-`Preferences` -> `Pipeline` -> `Open Prompts Folder` to create or open it.
+   ![Guidance Settings — folder-level and per-image guidance with reusable tags](ideogramCaptionerScreenshot2.png)
 
-The tracked `captioner_prompts.example/` folder shows the supported filenames.
-You only need to copy the prompts you want to override; missing files fall back
-to the built-in defaults.
+4. Click **Run JSON Captioning** and choose **Caption Single Image** (the current
+   image) or **Caption All Images**. If you run the whole folder and some images
+   already have captions, a follow-up prompt lets you do *only new* images,
+   *changed + new*, or *re-caption everything*.
 
-Keep these placeholders if you edit the matching prompt:
+5. While the folder runs, captions appear as they're generated. The caption editor
+   is **read-only** during a run (a banner indicates this), but you can flag any
+   image for later review with the **F** key or by right-clicking its thumbnail —
+   flagged images show a red flag in the corner, and **Shift+F** jumps to the next
+   flagged one.
 
-- `text_to_json_user.txt`: `{caption}`
-- `json_refine_user.txt`: `{instructions}`, `{source_caption}`, `{caption_json}`
-- `bbox_user.txt`: `{context_json}`, `{targets_json}`
+6. To edit, select an image, change the fields and bounding boxes, then press
+   `Ctrl+S` to save. Edits are buffered as you move between images; `Ctrl+Shift+S`
+   writes every pending change to disk.
 
-`creative_directive.txt` or `faithful_directive.txt` is appended to the JSON
-system prompt automatically.
+## Configuration
+
+Both of these are local, git-ignored, and seeded from tracked `*.example`
+templates, so your settings survive `git pull` and are never uploaded by
+accident:
+
+- **Model profiles** — `captioner_model_profiles.json`
+  (*Preferences → Models → Open Profiles File*), seeded from
+  `captioner_model_profiles.example.json`. Each profile is a small JSON entry
+  pointing at a Hugging Face GGUF (`hf_repo` + `model_filename`, plus
+  `mmproj_filename` for vision), a local GGUF file, or an existing-server alias.
+- **Prompt overrides** — `captioner_prompts/`
+  (*Preferences → Pipeline → Open Prompts Folder*). Copy only the files you want
+  to change from `captioner_prompts.example/`; anything you don't override falls
+  back to the built-in defaults.
+
+## Keyboard shortcuts
+
+- `Ctrl+O` — open a folder of images
+- `Ctrl+S` — save the current image
+- `Ctrl+Shift+S` — save all images with pending edits
+- `Ctrl+[` / `Ctrl+]` — previous / next image
+- `F` — flag the current image for review
+- `Shift+F` — jump to the next flagged image
+- `Ctrl+J` — toggle the raw JSON view
+- `Ctrl+0` — fit the image to the canvas
+- `Ctrl+\` — collapse / expand the guidance panel
+- `Ctrl+,` — open Preferences
+- Arrow keys — step between images when the filmstrip has focus
+- `Tab` / `Shift+Tab` — move between fields
+- Hold `Space` (or middle-drag) — pan the canvas
+- `F11` — toggle fullscreen
 
 ## Troubleshooting
 
-- `Connection error`: the configured endpoint is not reachable, the local server
-  failed to start, or the model process crashed. Check Preferences, confirm the
-  server URL, and inspect any `server_logs/` output.
-- `finish_reason=length` or empty assistant text: increase the llama context
-  size, increase output tokens, reduce reasoning budget, or use a smaller image
-  or model profile.
-- JSON errors after generation: use the failed-caption filter and `Retry Failed`
-  with a stronger model or larger context.
-- Missing bbox output: confirm the selected model profile supports vision and
-  bbox tasks, and that the model has access to its `mmproj` file if required.
-- Local model download problems: verify the Hugging Face repo id, filename, and
-  network access, or use a local profile with files already on disk.
+- **`ModuleNotFoundError: No module named 'PySide6'`** — the environment isn't
+  activated, or dependencies aren't installed. Activate it and re-run
+  `pip install -r requirements.txt`.
+- **Linux: `Could not load the Qt platform plugin "xcb"`** — a system library is
+  missing on minimal installs. On Debian/Ubuntu/Mint:
+  `sudo apt install libxcb-cursor0`.
+- **Connection error during captioning** — the endpoint isn't reachable or the
+  local server failed to start; check the URL in Preferences and any
+  `server_logs/` output.
+- **Empty output or `finish_reason=length`** — raise the context size / output
+  tokens, lower the reasoning budget, or try a smaller image or model.
+- **JSON errors after generation** — filter to failed captions and use
+  **Retry Failed** with a stronger model or a larger context.
+- **No bounding boxes** — confirm the selected model profile supports
+  vision/bbox and has access to its `mmproj` file.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

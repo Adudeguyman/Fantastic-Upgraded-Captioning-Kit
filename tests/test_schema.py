@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from ideogram_captioner.schema import normalize_caption, parse_palette_text, serialize_caption
+from ideogram_captioner.schema import caption_health, normalize_caption, parse_palette_text, serialize_caption
 
 
 class SchemaTests(unittest.TestCase):
@@ -77,6 +77,51 @@ class SchemaTests(unittest.TestCase):
             }
         )
         self.assertEqual(caption["compositional_deconstruction"]["elements"][0]["bbox"], [100, 0, 900, 1000])
+
+
+class CaptionHealthTests(unittest.TestCase):
+    GOOD = {
+        "high_level_description": "A red fox sitting in snow at dusk.",
+        "style_description": {"aesthetics": "naturalistic", "lighting": "golden hour", "medium": "photograph"},
+        "compositional_deconstruction": {"background": "snowy field", "elements": [{"type": "obj", "desc": "fox"}]},
+    }
+
+    def test_healthy_caption_has_no_issues(self):
+        self.assertEqual(caption_health(self.GOOD), [])
+
+    def test_sparse_but_structured_passes(self):
+        sparse = {
+            "high_level_description": "A logo on white.",
+            "style_description": {"aesthetics": "minimal", "lighting": "flat", "medium": "graphic_design"},
+            "compositional_deconstruction": {"background": "white", "elements": []},
+        }
+        self.assertEqual(caption_health(sparse), [])
+
+    def test_flat_blob_is_flagged(self):
+        blob = normalize_caption({"high_level_description": "the image shows a thing " * 200})
+        issues = caption_health(blob)
+        self.assertTrue(any("flat text blob" in i for i in issues))
+
+    def test_off_schema_keys_become_empty_and_flag(self):
+        off = normalize_caption({"caption": "a fox", "tags": ["fox"]})
+        self.assertTrue(caption_health(off))
+
+    def test_empty_caption_flagged(self):
+        self.assertTrue(caption_health(normalize_caption({})))
+
+    def test_refusal_flagged(self):
+        ref = normalize_caption({"high_level_description": "I'm sorry, but I can't assist with this image."})
+        self.assertTrue(any("refusal" in i for i in caption_health(ref)))
+
+    def test_runaway_repetition_flagged(self):
+        rep = normalize_caption({
+            "high_level_description": "a man a man a man a man a man a man a man a man",
+            "style_description": {"aesthetics": "x"},
+        })
+        self.assertTrue(any("repetit" in i for i in caption_health(rep)))
+
+    def test_non_dict_is_flagged(self):
+        self.assertTrue(caption_health("just a string"))
 
 
 if __name__ == "__main__":

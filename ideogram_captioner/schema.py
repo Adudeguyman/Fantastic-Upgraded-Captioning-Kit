@@ -176,8 +176,10 @@ def normalize_caption(data: Any) -> dict[str, Any]:
     return caption
 
 
-def serialize_caption(data: dict[str, Any]) -> str:
+def serialize_caption(data: dict[str, Any], *, indent: int | None = None) -> str:
     caption = normalize_caption(data)
+    if indent is not None:
+        return json.dumps(caption, indent=indent, ensure_ascii=False)
     return json.dumps(caption, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -186,3 +188,92 @@ def parse_caption_text(text: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("Caption JSON must be an object.")
     return normalize_caption(parsed)
+
+
+# Phrases that signal the model refused or chatted instead of producing a caption.
+_REFUSAL_MARKERS = (
+    "i'm sorry", "i am sorry", "i cannot", "i can't", "i can not",
+    "as an ai", "i'm unable", "i am unable", "unable to assist",
+    "cannot assist", "can't help", "i won't be able", "i will not",
+    "i'm not able", "against my", "as a language model",
+)
+
+
+def _caption_strings(caption: dict[str, Any]) -> list[str]:
+    out = [_as_str(caption.get("high_level_description", ""))]
+    style = caption.get("style_description")
+    if isinstance(style, dict):
+        for key in ("aesthetics", "lighting", "photo", "art_style", "medium"):
+            out.append(_as_str(style.get(key, "")))
+    comp = caption.get("compositional_deconstruction")
+    if isinstance(comp, dict):
+        out.append(_as_str(comp.get("background", "")))
+        elements = comp.get("elements")
+        if isinstance(elements, list):
+            for el in elements:
+                if isinstance(el, dict):
+                    out.append(_as_str(el.get("desc", "")))
+                    out.append(_as_str(el.get("text", "")))
+    return [s for s in out if s.strip()]
+
+
+def _has_runaway_repetition(text: str, min_run: int = 6) -> bool:
+    words = text.split()
+    if len(words) < min_run * 2:
+        return False
+    # the same word repeated min_run+ times in a row
+    run = 1
+    for a, b in zip(words, words[1:]):
+        run = run + 1 if a == b else 1
+        if run >= min_run:
+            return True
+    # a short phrase repeated back-to-back several times
+    for size in (2, 3, 4):
+        if len(words) < size * min_run:
+            continue
+        run = 1
+        for i in range(size, len(words) - size + 1, size):
+            if words[i:i + size] == words[i - size:i]:
+                run += 1
+                if run >= min_run:
+                    return True
+            else:
+                run = 1
+    return False
+
+
+def caption_health(caption: Any) -> list[str]:
+    """Cheap structural checks on a normalized caption. Empty list == looks fine.
+
+    Catches corrupt/off-schema outputs (flat text blobs, empty results, refusals,
+    degenerate repetition) — not semantic hallucinations, which need the image.
+    """
+    if not isinstance(caption, dict):
+        return ["output is not a caption object"]
+
+    hld = _as_str(caption.get("high_level_description", "")).strip()
+    style = caption.get("style_description") if isinstance(caption.get("style_description"), dict) else {}
+    comp = caption.get("compositional_deconstruction") if isinstance(caption.get("compositional_deconstruction"), dict) else {}
+    aesthetics = _as_str(style.get("aesthetics", "")).strip()
+    lighting = _as_str(style.get("lighting", "")).strip()
+    background = _as_str(comp.get("background", "")).strip()
+    elements = comp.get("elements") if isinstance(comp.get("elements"), list) else []
+    structured_empty = not (aesthetics or lighting or background or elements)
+
+    issues: list[str] = []
+    if not hld and structured_empty:
+        return ["empty caption — no description or structure"]
+    if structured_empty:
+        issues.append("missing structured sections — looks like a flat text blob, not the nested schema")
+    elif not hld:
+        issues.append("missing high-level description")
+    if len(hld) > 2000:
+        issues.append("high-level description is unusually long (possible run-on blob)")
+
+    strings = _caption_strings(caption)
+    blob = " ".join(strings).lower()
+    if any(marker in blob for marker in _REFUSAL_MARKERS):
+        issues.append("looks like a model refusal, not a caption")
+    if any(_has_runaway_repetition(s) for s in strings):
+        issues.append("repetitive / degenerate text")
+    return issues

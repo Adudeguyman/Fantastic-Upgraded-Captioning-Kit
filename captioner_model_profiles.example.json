@@ -1,6 +1,26 @@
 {
   "profiles": [
     {
+      "id": "llmfan46-gemma4-31b-qat-heretic-q4_0",
+      "label": "Download: Gemma 4 31B IT QAT Uncensored Heretic Q4_0 (18GB)",
+      "tasks": ["caption", "bbox"],
+      "kind": "hf",
+      "api_model": "gemma4-31b-heretic",
+      "hf_repo": "llmfan46/gemma-4-31B-it-qat-q4_0-uncensored-heretic-GGUF",
+      "model_filename": "gemma-4-31B-it-qat-Q4_0.gguf",
+      "mmproj_filename": "gemma-4-31B-it-uncensored-heretic-BF16.gguf"
+    },
+    {
+      "id": "llmfan46-gemma4-12b-qat-heretic-q4_0",
+      "label": "Download: Gemma 4 12B IT QAT Uncensored Heretic Q4_0 (8GB)",
+      "tasks": ["caption", "bbox"],
+      "kind": "hf",
+      "api_model": "gemma4-12b-heretic",
+      "hf_repo": "llmfan46/gemma-4-12B-it-qat-q4_0-uncensored-heretic-GGUF",
+      "model_filename": "gemma-4-12B-it-qat-q4_0-uncensored-heretic-Q4_0.gguf",
+      "mmproj_filename": "gemma-4-12B-it-qat-q4_0-uncensored-heretic-mmproj-BF16.gguf"
+    },
+    {
       "id": "hauhaucs-qwen35-9b-aggressive-q6k",
       "label": "Download: Qwen3.5-9B Uncensored HauhauCS Aggressive Q6_K (7GB)",
       "tasks": ["caption", "bbox"],

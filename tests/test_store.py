@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ideogram_captioner.store import CaptionStore
+from ideogram_captioner.store import CaptionStore, ProjectConfig
 
 
 class StoreTests(unittest.TestCase):
@@ -27,7 +27,9 @@ class StoreTests(unittest.TestCase):
 
             self.assertEqual(saved_path, folder / "sample.caption")
             raw = saved_path.read_text(encoding="utf-8")
-            self.assertNotIn(": ", raw)
+            # captions are written pretty-printed (indented, multi-line) for readability
+            self.assertIn("\n  ", raw)
+            self.assertIn('"high_level_description": "A sign"', raw)
             self.assertEqual(json.loads(raw)["high_level_description"], "A sign")
 
     def test_imports_plain_text_caption_files(self):
@@ -95,6 +97,46 @@ class StoreTests(unittest.TestCase):
             (edit_folder / "sample.jpg").write_bytes(b"x")
 
             self.assertEqual(CaptionStore(edit_folder, ".json").images(), [])
+
+    def test_caption_flags_persist_clear_and_prune(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            (folder / "a.png").write_bytes(b"x")
+            (folder / "b.png").write_bytes(b"x")
+            store = CaptionStore(folder, ".json")
+
+            proj = ProjectConfig(name="t")
+            proj.set_flags("a.png", ["missing structured sections"])
+            proj.set_flags("b.png", [])              # empty list clears
+            proj.set_flags("ghost.png", ["orphan"])  # no matching image
+            store.save_project(proj)
+
+            reloaded = store.load_project()
+            self.assertTrue(reloaded.is_flagged("a.png"))
+            self.assertEqual(reloaded.caption_issues("a.png"), ["missing structured sections"])
+            self.assertFalse(reloaded.is_flagged("b.png"))
+            self.assertFalse(reloaded.is_flagged("ghost.png"))  # pruned on load
+
+            reloaded.clear_flag("a.png")
+            self.assertFalse(reloaded.is_flagged("a.png"))
+
+    def test_review_marks_persist_toggle_and_prune(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            (folder / "a.png").write_bytes(b"x")
+            (folder / "b.png").write_bytes(b"x")
+            store = CaptionStore(folder, ".json")
+
+            proj = ProjectConfig(name="t")
+            self.assertTrue(proj.toggle_review_mark("a.png"))   # now marked
+            self.assertFalse(proj.toggle_review_mark("a.png"))  # toggled off
+            proj.set_review_mark("a.png", True)
+            proj.set_review_mark("ghost.png", True)             # no matching image
+            store.save_project(proj)
+
+            reloaded = store.load_project()
+            self.assertTrue(reloaded.is_review_marked("a.png"))
+            self.assertFalse(reloaded.is_review_marked("ghost.png"))  # pruned on load
 
 
 if __name__ == "__main__":

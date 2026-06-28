@@ -1,4 +1,4 @@
-from ideogram_captioner.gui import main
+from ideogram_captioner.app import main
 
 
 if __name__ == "__main__":

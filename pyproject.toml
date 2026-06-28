@@ -9,8 +9,8 @@ description = "Desktop editor for image-caption pairs in Ideogram 4 JSON caption
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
-keywords = ["captioning", "ideogram", "image-dataset", "tkinter"]
-dependencies = ["Pillow>=10.0", "openai>=1.0", "huggingface_hub>=0.23"]
+keywords = ["captioning", "ideogram", "image-dataset", "qt", "pyside6"]
+dependencies = ["Pillow>=10.0", "openai>=1.0", "huggingface_hub>=0.23", "PySide6>=6.6"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: End Users/Desktop",
@@ -23,7 +23,7 @@ classifiers = [
 ]
 
 [project.scripts]
-ideogram-captioner = "ideogram_captioner.gui:main"
+ideogram-captioner = "ideogram_captioner.app:main"
 
 [tool.setuptools.packages.find]
-include = ["ideogram_captioner*"]
+include = ["ideogram_captioner"]
