@@ -169,18 +169,30 @@ activate id4caption`.
 
    ![Guidance Settings — folder-level and per-image guidance with reusable tags](ideogramCaptionerScreenshot2.png)
 
-4. Click **Run JSON Captioning** and choose **Caption Single Image** (the current
+4. *(Optional, when available)* **Use existing `.txt` captions as a starting point.**
+   If your folder already has plain-text caption files — one `.txt` per image, named
+   to match the image's filename — the captioner can read each one and rewrite it
+   into Ideogram-4 structured JSON, instead of describing the image from scratch. The
+   detected source caption is shown in the guidance panel (and in a pop-out you can
+   keep open while you browse). Turn it on with the **Use existing .txt captions as
+   guidance** toggle in the Caption Guidance panel or in **Guidance Settings**. The
+   toggle is only enabled when the folder actually contains matching `.txt` files;
+   any image without one simply falls back to image-only captioning.
+
+   ![Existing-caption mode — the source .txt is detected and used to generate structured JSON](ideogramCaptionerScreenshot3.png)
+
+5. Click **Run JSON Captioning** and choose **Caption Single Image** (the current
    image) or **Caption All Images**. If you run the whole folder and some images
    already have captions, a follow-up prompt lets you do *only new* images,
    *changed + new*, or *re-caption everything*.
 
-5. While the folder runs, captions appear as they're generated. The caption editor
+6. While the folder runs, captions appear as they're generated. The caption editor
    is **read-only** during a run (a banner indicates this), but you can flag any
    image for later review with the **F** key or by right-clicking its thumbnail —
    flagged images show a red flag in the corner, and **Shift+F** jumps to the next
    flagged one.
 
-6. To edit, select an image, change the fields and bounding boxes, then press
+7. To edit, select an image, change the fields and bounding boxes, then press
    `Ctrl+S` to save. Edits are buffered as you move between images; `Ctrl+Shift+S`
    writes every pending change to disk.
 
@@ -206,14 +218,17 @@ accident:
 - `Ctrl+S` — save the current image
 - `Ctrl+Shift+S` — save all images with pending edits
 - `Ctrl+[` / `Ctrl+]` — previous / next image
+- `A` / `D` — previous / next image, from anywhere in the window (handy on 60%
+  keyboards without arrow keys); also navigates the source-caption pop-out
 - `F` — flag the current image for review
 - `Shift+F` — jump to the next flagged image
 - `Ctrl+J` — toggle the raw JSON view
 - `Ctrl+0` — fit the image to the canvas
 - `Ctrl+\` — collapse / expand the guidance panel
 - `Ctrl+,` — open Preferences
-- Arrow keys — nudge the selected box by one unit when the canvas has focus
-  (hold `Shift` for ×10); step between images when the filmstrip has focus
+- Arrow keys or `W` `A` `S` `D` — nudge the selected box by one unit when the canvas
+  has focus (hold `Shift` for ×10). Arrow keys also step between images from the
+  filmstrip and navigate the source-caption pop-out.
 - `Delete` / `Backspace` — remove the selected box when the canvas has focus
 - `Tab` / `Shift+Tab` — move between fields
 - Hold `Space` (or middle-drag) — pan the canvas

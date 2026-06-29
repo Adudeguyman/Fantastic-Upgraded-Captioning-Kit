@@ -21,6 +21,7 @@ from ideogram_captioner.llm_captioning import (
     ensure_server_running,
     extract_json,
     format_prompt,
+    generate_json_from_image,
     generate_json_refinement,
     json_system_prompt,
     load_model_profiles,
@@ -1071,6 +1072,83 @@ class ModelDiscoveryTests(unittest.TestCase):
         self.assertEqual(ids[0], "unsloth-qwen3vl-30b-q4")
         # a saved selection pointing at the dropped profile falls back to the default
         self.assertEqual(L._profile_by_id("caption", "unsloth-qwen25vl-7b-q4").id, "unsloth-qwen3vl-30b-q4")
+
+
+class ConvertModePromptTests(unittest.TestCase):
+    """Image->JSON assembly switches to the convert framing + source-caption block
+    only when a source caption is supplied; otherwise it is the image-only path."""
+
+    CONVERT_PHRASE = "synthesize it into the schema fields"
+
+    def _run(self, **kwargs):
+        captured = {}
+
+        def fake_chat_vision(settings, model, image_path, system, user, max_tokens, temperature=0.0):
+            captured["system"], captured["user"] = system, user
+            return ('{"high_level_description":"x","style_description":{"aesthetics":"a",'
+                    '"lighting":"l","photo":"p","medium":"photograph"},'
+                    '"compositional_deconstruction":{"background":"b","elements":[]}}')
+
+        import ideogram_captioner.llm_captioning as L
+        with tempfile.TemporaryDirectory() as temp:
+            img = Path(temp) / "foo.jpg"
+            img.write_bytes(b"x")
+            with patch.object(L, "chat_vision", fake_chat_vision):
+                L.generate_json_from_image(CaptioningSettings(caption_model="m"), img, **kwargs)
+        return captured
+
+    def test_convert_mode_uses_framing_and_source_caption(self):
+        cap = self._run(guidance="folder words", source_caption="four puppies, indoor, warm")
+        self.assertIn(self.CONVERT_PHRASE, cap["system"])           # framing carries it
+        self.assertIn("Source caption:\nfour puppies", cap["user"])  # source in user msg
+        self.assertIn("folder words", cap["system"])                # guidance still present
+        self.assertEqual(cap["user"].count(self.CONVERT_PHRASE), 0)  # not duplicated into user
+
+    def test_image_only_mode_unchanged_without_source(self):
+        cap = self._run(guidance="g")
+        self.assertNotIn(self.CONVERT_PHRASE, cap["system"])
+        self.assertIn("Do not reference any existing sidecar caption", cap["user"])
+
+
+class ServerLogDiagnosisTests(unittest.TestCase):
+    def _diag(self, text):
+        import ideogram_captioner.llm_captioning as L
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "llama-server.log"
+            log.write_text(text, encoding="utf-8")
+            return L.diagnose_server_log(log)
+
+    def test_classifies_oom(self):
+        cat, hint = self._diag("cudaMalloc failed: out of memory\n")
+        self.assertEqual(cat, "oom")
+        self.assertIn("VRAM", hint)
+
+    def test_classifies_missing_lib_nccl(self):
+        cat, hint = self._diag("error while loading shared libraries: libnccl.so.2\n")
+        self.assertEqual(cat, "missing_lib")
+        self.assertIn("nvidia-nccl-cu12", hint)
+
+    def test_classifies_crash(self):
+        cat, _ = self._diag("/x/ggml.c:1: GGML_ASSERT(a==b) failed\nAborted (core dumped)\n")
+        self.assertEqual(cat, "crash")
+
+    def test_clean_log_is_unclassified(self):
+        self.assertEqual(self._diag("srv log_info: ready\n"), ("", ""))
+
+    def test_oom_hint_is_server_agnostic(self):
+        # The classifier must not bake in built-in-only remediation (context/GPU
+        # layers aren't configurable for an external server).
+        _cat, hint = self._diag("cudaMalloc failed: out of memory\n")
+        self.assertNotIn("Preferences", hint)
+        self.assertNotIn("GPU layers", hint)
+
+    def test_startup_hint_adds_builtin_oom_remediation(self):
+        import ideogram_captioner.llm_captioning as L
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "llama-server.log"
+            log.write_text("cudaMalloc failed: out of memory\n", encoding="utf-8")
+            hint = L._server_startup_hint(log)
+        self.assertIn("GPU layers in Preferences", hint)
 
 
 if __name__ == "__main__":

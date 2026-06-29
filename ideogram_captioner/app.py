@@ -100,6 +100,9 @@ from .llm_captioning import (
     profile_label_from_id,
     is_server_ready,
     server_model_ids,
+    server_log_path,
+    diagnose_server_log,
+    BUILTIN_OOM_HINT,
     ensure_server_running,
     stop_server_process,
     find_llama_server,
@@ -794,10 +797,12 @@ class CanvasView(QGraphicsView):
             if self.controller.delete_selected_box():
                 event.accept()
             return
-        # Arrow keys nudge the selected box (Shift = ×10). Falls through to the
-        # default view behaviour (scroll) when no box is selected.
+        # Arrow keys (and WASD) nudge the selected box (Shift = ×10). Falls through
+        # to the default view behaviour (scroll) when no box is selected.
         arrows = {Qt.Key_Left: (-1, 0), Qt.Key_Right: (1, 0),
-                  Qt.Key_Up: (0, -1), Qt.Key_Down: (0, 1)}
+                  Qt.Key_Up: (0, -1), Qt.Key_Down: (0, 1),
+                  Qt.Key_A: (-1, 0), Qt.Key_D: (1, 0),
+                  Qt.Key_W: (0, -1), Qt.Key_S: (0, 1)}
         if event.key() in arrows:
             step = 10 if (event.modifiers() & Qt.ShiftModifier) else 1
             ux, uy = arrows[event.key()]
@@ -956,7 +961,8 @@ class AiJobThread(QThread):
             op = self.operation
             if op == "json_image":
                 caption = generate_json_from_image(
-                    self.settings, self.image_path, progress=prog, guidance=self.guidance
+                    self.settings, self.image_path, progress=prog,
+                    guidance=self.guidance, source_caption=self.source_caption,
                 )
                 if self.settings.add_bboxes_after_json and not self.isInterruptionRequested():
                     caption, _att, _add, _reasons = add_bboxes_to_caption(
@@ -1001,7 +1007,7 @@ class BatchCaptionThread(QThread):
     def __init__(self, settings, items, delay_ms: int = 0):
         super().__init__()
         self.settings = settings
-        self.items = items  # list of (Path, guidance)
+        self.items = items  # list of (Path, guidance, source_caption)
         self.delay_ms = max(0, int(delay_ms))
 
     def _interruptible_sleep(self, ms: int) -> None:
@@ -1030,7 +1036,7 @@ class BatchCaptionThread(QThread):
             self.item_error.emit("", f"Could not start the server: {exc}")
             self.batch_finished.emit(0, 0, False)
             return
-        for i, (image_path, guidance) in enumerate(self.items, start=1):
+        for i, (image_path, guidance, source_caption) in enumerate(self.items, start=1):
             if self.isInterruptionRequested():
                 cancelled = True
                 break
@@ -1041,7 +1047,8 @@ class BatchCaptionThread(QThread):
 
             try:
                 caption = generate_json_from_image(
-                    self.settings, image_path, progress=prog, guidance=guidance
+                    self.settings, image_path, progress=prog,
+                    guidance=guidance, source_caption=source_caption,
                 )
                 if self.settings.add_bboxes_after_json and not self.isInterruptionRequested():
                     caption, _att, _add, _reasons = add_bboxes_to_caption(
@@ -3899,7 +3906,42 @@ class GuidanceDialog(QDialog):
             super().reject()
 
 
+class SourcePopout(QDialog):
+    """Modeless source-caption inspector. Plain Left/Right arrows navigate to the
+    previous/next image (mirroring the main window). An event filter catches the
+    arrows even when the read-only text field has focus, while modified arrows
+    (Shift/Ctrl) still pass through so text selection and copy keep working."""
+
+    def __init__(self, parent, on_prev, on_next) -> None:
+        super().__init__(parent)
+        self._on_prev = on_prev
+        self._on_next = on_next
+
+    def _nav_key(self, event) -> bool:
+        if event.modifiers() == Qt.NoModifier:
+            if event.key() in (Qt.Key_Left, Qt.Key_A):
+                self._on_prev()
+                return True
+            if event.key() in (Qt.Key_Right, Qt.Key_D):
+                self._on_next()
+                return True
+        return False
+
+    def keyPressEvent(self, event) -> None:
+        if self._nav_key(event):
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.KeyPress and self._nav_key(event):
+            return True
+        return super().eventFilter(obj, event)
+
+
 class MainWindow(QMainWindow):
+    _SC_THUMB_H = 300  # fixed height of the source-popout thumbnail box (stops layout jitter)
+
     def __init__(self) -> None:
         super().__init__()
         self.settings = load_settings()
@@ -3908,6 +3950,7 @@ class MainWindow(QMainWindow):
         self._default_tags = self._load_default_tags()
         self.store: CaptionStore | None = None
         self.images: list[Path] = []
+        self._has_source_txt = False
         self.current: Path | None = None
         self.current_caption: dict = default_caption()
         self.project: ProjectConfig = ProjectConfig()
@@ -4169,8 +4212,9 @@ class MainWindow(QMainWindow):
     def _open_text_expand(self, field, title: str, single_line: bool, with_tags: bool = False) -> None:
         if not field.isEnabled():
             return
+        read_only = bool(getattr(field, "isReadOnly", lambda: False)())
         current = field.toPlainText() if isinstance(field, QPlainTextEdit) else field.text()
-        use_tags = with_tags and self.store is not None
+        use_tags = with_tags and self.store is not None and not read_only
         dlg = QDialog(self)
         dlg.setWindowTitle(title)
         dlg.resize(900, 680 if use_tags else 600)
@@ -4187,13 +4231,18 @@ class MainWindow(QMainWindow):
         else:
             editor = QPlainTextEdit()
             editor.setPlainText(current)
+            editor.setReadOnly(read_only)
             v.addWidget(editor, 1)
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
+        if read_only:
+            buttons = QDialogButtonBox(QDialogButtonBox.Close)
+            buttons.rejected.connect(dlg.reject)
+        else:
+            buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dlg.accept)
+            buttons.rejected.connect(dlg.reject)
         v.addWidget(buttons)
         editor.setFocus()
-        if dlg.exec():
+        if dlg.exec():  # Save only; read-only Close rejects, so no write-back
             text = editor.toPlainText()
             if single_line:
                 text = text.replace("\r", " ").replace("\n", " ")
@@ -4625,6 +4674,7 @@ class MainWindow(QMainWindow):
         has_images = self.store is not None and bool(self.images)
         if has_images:
             self.commit_guidance()  # make the project reflect the current main fields
+            self._refresh_source_availability()
 
         dlg = GuidanceDialog(self)
         dlg.setWindowTitle("Custom Caption Guidance")
@@ -4634,6 +4684,26 @@ class MainWindow(QMainWindow):
 
         left = QVBoxLayout()
         body.addLayout(left, 3)
+        if has_images:
+            dlg_convert = ToggleSwitch()
+            dlg_convert.setChecked(self._convert_active())
+            dlg_convert.setEnabled(getattr(self, "_has_source_txt", False))
+            dlg_convert.toggled.connect(self._set_convert_mode)
+            conv_row = self._explained_toggle_row(
+                "Use existing .txt captions as guidance",
+                "Each image's matching .txt sidecar is fed to the captioner to upgrade into "
+                "structured JSON. Images without a .txt fall back to image-only captioning. "
+                "Folder-wide; applies as soon as you toggle it.",
+                dlg_convert,
+            )
+            self._style_convert_row(conv_row, teal_title=True)
+            dlg_convert.toggled.connect(
+                lambda _checked, r=conv_row: self._style_convert_row(r, teal_title=True))
+            left.addWidget(conv_row)
+            conv_div = QFrame()
+            conv_div.setObjectName("PanelDivider")
+            conv_div.setFrameShape(QFrame.HLine)
+            left.addWidget(conv_div)
         folder_initial = self.project.folder_guidance if has_images else self.g_folder.toPlainText()
         folder_ed = self._build_popup_scope(left, "folder", "Folder · all images", folder_initial)
 
@@ -4824,6 +4894,24 @@ class MainWindow(QMainWindow):
             "Per-image guidance (read-only here). Edit it in Guidance Settings. Added on top "
             "of the folder guidance for this image only."
         )
+        # Convert mode (folder-wide): feed each image's .txt sidecar to the captioner
+        # as a source caption to upgrade into structured JSON.
+        self.g_convert_enabled = ToggleSwitch()
+        self.g_convert_enabled.setEnabled(False)
+        self._convert_row = self._explained_toggle_row(
+            "Use existing .txt captions as guidance",
+            "Upgrade each image's .txt into structured JSON — no .txt means image-only.",
+            self.g_convert_enabled,
+            "When on, each image's matching .txt sidecar is fed to the captioner as a source "
+            "caption to upgrade into structured JSON. Images without a .txt use image-only captioning.",
+        )
+        self.g_convert_enabled.toggled.connect(self._on_convert_toggled)
+        # Read-only preview of the detected .txt for the current image.
+        self.g_source_caption = QPlainTextEdit()
+        self.g_source_caption.setObjectName("GuidanceBoxRO")
+        self.g_source_caption.setReadOnly(True)
+        self.g_source_caption.setFixedHeight(72)
+        self.g_source_caption.setToolTip("The .txt source caption fed to the captioner for this image (read-only).")
 
         title = QLabel("Caption Guidance")
         title.setObjectName("SectionLabel")
@@ -4849,6 +4937,7 @@ class MainWindow(QMainWindow):
         )
         settings_btn.clicked.connect(self._open_guidance_expand)
         lay.addWidget(settings_btn)
+        lay.addWidget(self._convert_row)
 
         # ---- Global (applies to every image) ----
         lay.addWidget(self._folder_enabled_row)
@@ -4872,6 +4961,39 @@ class MainWindow(QMainWindow):
         image_label.setToolTip("Guidance applied only to the currently selected image.")
         lay.addWidget(image_label)
         lay.addWidget(self.g_per_image)
+
+        # Source caption sub-section (only visible in convert mode): a status line
+        # and a read-only preview of the detected .txt, with an expand handle.
+        self._source_caption_box = QWidget()
+        sc_lay = QVBoxLayout(self._source_caption_box)
+        sc_lay.setContentsMargins(0, 6, 0, 0)
+        sc_lay.setSpacing(4)
+        sc_head = QHBoxLayout()
+        sc_head.setContentsMargins(0, 0, 0, 0)
+        sc_label = self._field_label("Source caption")
+        sc_label.setToolTip("The .txt fed to the captioner as source material for this image.")
+        sc_head.addWidget(sc_label)
+        sc_head.addStretch(1)
+        self._source_status = QLabel("")
+        self._source_status.setObjectName("Hint")
+        sc_head.addWidget(self._source_status)
+        sc_lay.addLayout(sc_head)
+        sc_field_row = QWidget()
+        sc_field_h = QHBoxLayout(sc_field_row)
+        sc_field_h.setContentsMargins(0, 0, 0, 0)
+        sc_field_h.setSpacing(4)
+        sc_field_h.addWidget(self.g_source_caption, 1)
+        sc_expand = QToolButton()
+        sc_expand.setObjectName("ExpandBtn")
+        sc_expand.setIcon(self._expand_icon())
+        sc_expand.setIconSize(QSize(14, 14))
+        sc_expand.setFixedSize(22, 22)
+        sc_expand.setToolTip("Pop out the source caption — stays open and follows the image you're on")
+        sc_expand.clicked.connect(self._open_source_popout)
+        sc_field_h.addWidget(sc_expand, 0, Qt.AlignTop)
+        sc_lay.addWidget(sc_field_row)
+        self._source_caption_box.setVisible(False)
+        lay.addWidget(self._source_caption_box)
 
         # Tags used — read-only reflection of which palette tags appear in THIS
         # image's per-image guidance. Editing happens only in Guidance Settings.
@@ -4945,6 +5067,89 @@ class MainWindow(QMainWindow):
         h.addWidget(lab, 1)
         h.addWidget(switch, 0, Qt.AlignVCenter)
         return row
+
+    def _explained_toggle_row(self, title: str, description: str, switch: "ToggleSwitch",
+                              tooltip: str = "") -> QWidget:
+        """A toggle row with a title and a muted one-line description beneath it, for
+        settings that warrant more than a bare label. Toggle stays right-aligned."""
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(8)
+        col = QVBoxLayout()
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(1)
+        lab = QLabel(title)
+        lab.setWordWrap(True)
+        desc = QLabel(description)
+        desc.setObjectName("Hint")
+        desc.setWordWrap(True)
+        col.addWidget(lab)
+        col.addWidget(desc)
+        h.addLayout(col, 1)
+        h.addWidget(switch, 0, Qt.AlignVCenter)
+        if tooltip:
+            lab.setToolTip(tooltip)
+            switch.setToolTip(tooltip)
+        row._title_lbl = lab          # exposed so callers can recolour / re-text
+        row._desc_lbl = desc
+        row._avail_desc = description  # the "feature available" description to restore
+        return row
+
+    _CONVERT_NO_TXT_DESC = ("No .txt caption files were found in this folder. Add a .txt "
+                            "caption file that matches an image's filename to use this feature.")
+
+    def _refresh_source_availability(self) -> None:
+        """Recompute whether the folder has any .txt sidecars (folder-level gate)."""
+        self._has_source_txt = bool(
+            self.store is not None and self.images and self.store.any_source_text(self.images))
+
+    def _convert_active(self) -> bool:
+        """Convert mode is only effective when it's on AND the folder actually has
+        at least one matching .txt to draw from."""
+        return bool(self.project is not None and self.project.convert_txt_to_json
+                    and getattr(self, "_has_source_txt", False))
+
+    def _style_convert_row(self, row, *, teal_title: bool) -> None:
+        """Colour and text a convert toggle row by availability. Title goes teal in
+        the popup; the live description is amber there while convert is on and gray
+        when it's off (a quick at-a-glance indicator). Both surfaces swap to a muted
+        'no .txt found' note when the folder has no source captions."""
+        if row is None:
+            return
+        avail = getattr(self, "_has_source_txt", False)
+        on = bool(self.project is not None and self.project.convert_txt_to_json)
+        title = getattr(row, "_title_lbl", None)
+        desc = getattr(row, "_desc_lbl", None)
+        if title is not None:
+            title.setStyleSheet("color:#2FC6B3; font-weight:600;" if teal_title else "")
+        if desc is None:
+            return
+        if avail:
+            desc.setText(getattr(row, "_avail_desc", ""))
+            if teal_title:
+                amber = getattr(self.theme, "warning", "#E0A33B")
+                desc.setStyleSheet(f"color:{amber};" if on else "color:#9aa4b6;")
+            else:
+                desc.setStyleSheet("")
+        else:
+            desc.setText(self._CONVERT_NO_TXT_DESC)
+            desc.setStyleSheet("color:#9aa4b6;")
+
+    def _set_convert_mode(self, checked: bool) -> None:
+        """Apply convert mode (folder-wide). Used by both the panel toggle and the
+        Guidance Settings dialog toggle, keeping the two in sync."""
+        if self.store is None:
+            return
+        self.project.convert_txt_to_json = bool(checked)
+        self._guidance_dirty = True
+        self.persist_guidance_if_dirty()
+        sw = getattr(self, "g_convert_enabled", None)
+        if sw is not None and sw.isChecked() != bool(checked):
+            sw.blockSignals(True)
+            sw.setChecked(bool(checked))
+            sw.blockSignals(False)
+        self._refresh_source_caption()
 
     @staticmethod
     def _tag_used_in(text: str, tag: str) -> bool:
@@ -5035,9 +5240,17 @@ class MainWindow(QMainWindow):
             self.g_folder.setPlainText(self.project.folder_guidance)
             self.g_mode.setCurrentText(CREATIVE_TO_MODE.get(self.project.creative_json, "Inherit"))
             self._sync_folder_toggle()
+            self._refresh_source_availability()
+            avail = getattr(self, "_has_source_txt", False)
+            self.g_convert_enabled.setEnabled(self.store is not None and avail)
+            self.g_convert_enabled.blockSignals(True)
+            self.g_convert_enabled.setChecked(self._convert_active())
+            self.g_convert_enabled.blockSignals(False)
+            self._style_convert_row(getattr(self, "_convert_row", None), teal_title=False)
         finally:
             self._loading = False
         self._guidance_dirty = False
+        self._refresh_source_caption()
 
     def load_per_image_guidance(self, filename: str) -> None:
         self._loading = True
@@ -5047,6 +5260,159 @@ class MainWindow(QMainWindow):
         finally:
             self._loading = False
         self._refresh_guidance_changes()
+        self._refresh_source_caption()
+
+    def _on_convert_toggled(self, checked: bool) -> None:
+        if self._loading or self.store is None:
+            return
+        self._set_convert_mode(checked)
+
+    @staticmethod
+    def _elide_middle(text: str, limit: int = 26) -> str:
+        if len(text) <= limit:
+            return text
+        keep = max(1, limit - 1)
+        head = keep // 2
+        return text[:head] + "\u2026" + text[-(keep - head):]
+
+    def _current_source_caption(self):
+        """(found_text, status_label, status_color, placeholder) for the current image.
+        found_text is "" when there is no .txt. Returns None when convert mode is off
+        or no folder/image is active."""
+        if not self._convert_active():
+            return None
+        if self.store is None or self.current is None:
+            return None
+        text = self.store.load_source_text(self.current)
+        if text:
+            name = self.store.source_text_path(self.current).name
+            return text, "\u2713 " + self._elide_middle(name), "#3ddc84", ""
+        warn = getattr(self.theme, "warning", "#E0A33B")
+        return ("", "no .txt \u00b7 image-only", warn,
+                "No source caption for this image — the captioner will work from the image alone.")
+
+    def _refresh_source_caption(self) -> None:
+        box = getattr(self, "_source_caption_box", None)
+        if box is None:
+            return
+        convert_on = self._convert_active()
+        box.setVisible(convert_on)
+        if not convert_on:
+            self._close_source_popout()
+        info = self._current_source_caption()
+        if info is None:
+            self.g_source_caption.setPlainText("")
+            self._source_status.setText("")
+        else:
+            text, status, color, placeholder = info
+            self.g_source_caption.setPlainText(text)
+            self._source_status.setText(status)
+            self._source_status.setStyleSheet(f"color:{color}; font-size:11px;")
+            self.g_source_caption.setPlaceholderText(placeholder)
+        self._update_source_popout()
+
+    def _open_source_popout(self) -> None:
+        """A modeless source-caption inspector: it stays open while you browse and
+        follows the current image (thumbnail + .txt) as you navigate the main window."""
+        if not self.g_source_caption.isEnabled():
+            return
+        existing = getattr(self, "_source_popout", None)
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            self._update_source_popout()
+            return
+        dlg = SourcePopout(self, self.prev_image, self.next_image)
+        dlg.setWindowTitle("Source caption")
+        dlg.setModal(False)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+        dlg.resize(420, 600)
+        v = QVBoxLayout(dlg)
+        thumb = QLabel()
+        thumb.setObjectName("Panel")
+        thumb.setAlignment(Qt.AlignCenter)
+        # Fixed-height box so the image (whatever its aspect) centers inside a
+        # constant frame — the nav bar and everything below never shift.
+        thumb.setFixedHeight(self._SC_THUMB_H)
+        v.addWidget(thumb)
+        nav = QHBoxLayout()
+        prev_btn = QToolButton()
+        prev_btn.setIcon(lucide_icon("chevron-left", self.theme.text_secondary, 18))
+        prev_btn.setToolTip("Previous image")
+        prev_btn.clicked.connect(self.prev_image)
+        next_btn = QToolButton()
+        next_btn.setIcon(lucide_icon("chevron-right", self.theme.text_secondary, 18))
+        next_btn.setToolTip("Next image")
+        next_btn.clicked.connect(self.next_image)
+        name_lab = QLabel()
+        name_lab.setObjectName("Hint")
+        name_lab.setAlignment(Qt.AlignCenter)
+        name_lab.setWordWrap(True)
+        nav.addWidget(prev_btn)
+        nav.addWidget(name_lab, 1)
+        nav.addWidget(next_btn)
+        v.addLayout(nav)
+        status_lab = QLabel()
+        status_lab.setAlignment(Qt.AlignCenter)
+        v.addWidget(status_lab)
+        text = QPlainTextEdit()
+        text.setReadOnly(True)
+        text.setObjectName("GuidanceBoxRO")
+        text.installEventFilter(dlg)  # let plain Left/Right navigate even when text is focused
+        v.addWidget(text, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dlg.reject)
+        v.addWidget(buttons)
+        dlg._sc_thumb, dlg._sc_name, dlg._sc_status, dlg._sc_text = thumb, name_lab, status_lab, text
+        dlg._sc_prev, dlg._sc_next = prev_btn, next_btn
+        dlg.destroyed.connect(lambda *_: setattr(self, "_source_popout", None))
+        self._source_popout = dlg
+        self._update_source_popout()
+        dlg.show()
+
+    def _update_source_popout(self) -> None:
+        dlg = getattr(self, "_source_popout", None)
+        if dlg is None:
+            return
+        if self.current is not None:
+            pm = QPixmap(str(self.current))
+            if pm.isNull():
+                dlg._sc_thumb.setPixmap(QPixmap())
+                dlg._sc_thumb.setText("(cannot load image)")
+            else:
+                dlg._sc_thumb.setPixmap(pm.scaled(380, self._SC_THUMB_H, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            total = len(self.images)
+            idx = (self.images.index(self.current) + 1) if self.current in self.images else 0
+            dlg._sc_name.setText(f"{self.current.name}   ({idx} / {total})" if idx else self.current.name)
+        else:
+            dlg._sc_thumb.setPixmap(QPixmap())
+            dlg._sc_thumb.setText("(no image)")
+            dlg._sc_name.setText("")
+        # Nav mirrors the main window: disabled at the ends, and while a batch has
+        # navigation locked (so the pop-out can't move the selection mid-run).
+        prev_btn = getattr(dlg, "_sc_prev", None)
+        next_btn = getattr(dlg, "_sc_next", None)
+        if prev_btn is not None and next_btn is not None:
+            total = len(self.images)
+            pos = (self.images.index(self.current)) if (self.current in self.images) else -1
+            locked = getattr(self, "_nav_locked", False)
+            prev_btn.setEnabled(not locked and pos > 0)
+            next_btn.setEnabled(not locked and 0 <= pos < total - 1)
+        info = self._current_source_caption()
+        if info is None:
+            dlg._sc_text.setPlainText("")
+            dlg._sc_status.setText("")
+        else:
+            text, status, color, placeholder = info
+            dlg._sc_text.setPlainText(text)
+            dlg._sc_text.setPlaceholderText(placeholder)
+            dlg._sc_status.setText(status)
+            dlg._sc_status.setStyleSheet(f"color:{color}; font-size:11px;")
+
+    def _close_source_popout(self) -> None:
+        dlg = getattr(self, "_source_popout", None)
+        if dlg is not None:
+            dlg.close()  # WA_DeleteOnClose + destroyed handler clears the reference
 
     def commit_guidance(self) -> None:
         self.project.folder_guidance = self.g_folder.toPlainText()
@@ -5482,19 +5848,31 @@ class MainWindow(QMainWindow):
         # resolved guidance (folder + per-image) applies to image->JSON generation;
         # the per-project creative/faithful override, when set, wins over the global.
         guidance = self.project.resolved_for(self.current.name) if operation == "json_image" else ""
+        # Convert mode: feed this image's .txt sidecar (if any) as the source caption.
+        # Running the image always overwrites the in-editor caption, so no extra
+        # confirmation is needed for a single run.
+        source_caption = ""
+        if operation == "json_image" and self.project.convert_txt_to_json:
+            source_caption = self.store.load_source_text(self.current)
         self._job_operation = operation
         self._job_guidance = guidance
         job_settings = self.settings
         if self.project.creative_json is not None:
             job_settings = replace(self.settings, creative_json=self.project.creative_json)
         image_path = self.current
-        self._ensure_local_binary_then(
-            lambda: self._start_ai_job(operation, job_settings, caption_copy, guidance, image_path)
+        self._preflight_server_or_warn(
+            lambda: self._ensure_local_binary_then(
+                lambda: self._start_ai_job(operation, job_settings, caption_copy, guidance, image_path, source_caption)
+            ),
+            batch=False,
         )
 
-    def _start_ai_job(self, operation, job_settings, caption_copy, guidance, image_path) -> None:
+    def _start_ai_job(self, operation, job_settings, caption_copy, guidance, image_path, source_caption="") -> None:
         if not self._ensure_model_configured():
             return
+        if getattr(self, "_force_autostart", False):
+            job_settings = replace(job_settings, auto_start_server=True)
+            self._force_autostart = False
         if not self._confirm_model_download():
             self._set_status("Cancelled.")
             return
@@ -5508,7 +5886,7 @@ class MainWindow(QMainWindow):
             image_path=image_path,
             caption=caption_copy,
             guidance=guidance,
-            source_caption="",
+            source_caption=source_caption,
             instructions=self.settings.json_refine_instructions,
         )
         thread.progress.connect(self._on_job_progress)
@@ -5518,6 +5896,95 @@ class MainWindow(QMainWindow):
         thread.server_started.connect(self._on_server_started)
         self._ai_thread = thread
         thread.start()
+
+    def _preflight_server_or_warn(self, proceed, *, batch: bool) -> None:
+        """Before a run, check the server is usable and, if not, show one tailored
+        notice instead of letting it fail mid-request. Calls proceed() when the
+        server is up (or the user opts to try anyway)."""
+        settings = self.settings
+        mode = settings.server_start_mode
+        if mode == "local":
+            running = self._server_is_running()
+            model_less = running and getattr(self, "_server_modelless", False)
+            if running and not model_less:
+                proceed()
+                return
+            binary = find_llama_server()
+            configured = binary is not None and has_model_config(settings, "caption")
+            if not configured:
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Information)
+                box.setWindowTitle("No captioning server configured")
+                box.setText(
+                    "There's nothing set up to generate captions yet. Open Preferences to "
+                    "pick a built-in llama.cpp model, or point at a server you already run."
+                )
+                prefs = box.addButton("Open Preferences", QMessageBox.AcceptRole)
+                box.addButton(QMessageBox.Cancel)
+                box.exec()
+                if box.clickedButton() is prefs:
+                    self.open_preferences("Connection/Server")
+                return
+            # Configured but not running (or up without a model loaded).
+            count = len(self.images) if (batch and self.images) else 0
+            tail = f" and caption all {count} images?" if count else "?"
+            relaunch = " (it's running without a model, so it needs to reload)" if model_less else ""
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle("Start the captioning server?")
+            box.setText(
+                f"Captioning uses the built-in llama.cpp server, but it isn't ready yet{relaunch}. "
+                f"Start it and load the captioning model{tail}\n\n"
+                "The model loads into VRAM — make sure enough is free."
+            )
+            start = box.addButton("Start && caption", QMessageBox.AcceptRole)
+            box.addButton(QMessageBox.Cancel)
+            box.setDefaultButton(start)
+            box.exec()
+            if box.clickedButton() is start:
+                # Honour the start even if auto-start is off, for this run only. The
+                # worker's job_settings was captured before this gate, so flag it and
+                # let _start_ai_job/_start_batch_job apply the override.
+                if not settings.auto_start_server:
+                    self._force_autostart = True
+                proceed()
+            return
+        # Remote / custom server.
+        if not (settings.base_url or "").strip():
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Information)
+            box.setWindowTitle("No captioning server configured")
+            box.setText(
+                "No server address is configured. Open Preferences to set the server URL "
+                "and the model to request, or switch to the built-in llama.cpp server."
+            )
+            prefs = box.addButton("Open Preferences", QMessageBox.AcceptRole)
+            box.addButton(QMessageBox.Cancel)
+            box.exec()
+            if box.clickedButton() is prefs:
+                self.open_preferences("Connection/Server")
+            return
+        if self._server_reachable:
+            proceed()
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Server not responding")
+        box.setText(
+            f"A remote captioning server is configured ({settings.base_url}) but isn't "
+            "responding right now. Make sure it's running, has the model from your Model "
+            "preferences loaded, and is accepting connections — then try again."
+        )
+        anyway = box.addButton("Run anyway", QMessageBox.AcceptRole)
+        prefs = box.addButton("Open Preferences", QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(prefs)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is anyway:
+            proceed()
+        elif clicked is prefs:
+            self.open_preferences("Connection/Server")
 
     def _ensure_local_binary_then(self, proceed) -> None:
         """Pre-flight for local mode: if we're set to auto-launch a local server but
@@ -5762,6 +6229,13 @@ class MainWindow(QMainWindow):
         new_imgs = [img for img in self.images if img not in already_set]
         stale = [img for img in already if self.project.guidance_changed(img.name)]
         work = list(self.images)
+        convert_note = ""
+        if self.project.convert_txt_to_json:
+            with_txt = sum(1 for img in self.images if self.store.has_source_text(img))
+            convert_note = (
+                f"Convert mode: {with_txt} of {total} image(s) have a matching .txt "
+                "source caption; the rest fall back to image-only captioning."
+            )
         if already:
             box = QMessageBox(self)
             box.setWindowTitle("Caption all images")
@@ -5769,6 +6243,8 @@ class MainWindow(QMainWindow):
             if stale:
                 msg += (f"\n{len(stale)} of those have guidance changes since they "
                         "were last captioned.")
+            if convert_note:
+                msg += "\n\n" + convert_note
             box.setText(msg)
             box.setInformativeText("What would you like to run?")
             new_btn = box.addButton(f"Only new ({len(new_imgs)})", QMessageBox.AcceptRole)
@@ -5795,10 +6271,12 @@ class MainWindow(QMainWindow):
                 self._set_status("Nothing to do.")
                 return
         else:
+            extra = ("\n\n" + convert_note) if convert_note else ""
             resp = QMessageBox.question(
                 self, "Caption all images",
                 f"Generate JSON for all {total} image(s)?\n\n"
-                "Images are processed one at a time through your configured server.",
+                "Images are processed one at a time through your configured server."
+                + extra,
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             if resp != QMessageBox.Yes:
@@ -5810,25 +6288,36 @@ class MainWindow(QMainWindow):
         job_settings = self.settings
         if self.project.creative_json is not None:
             job_settings = replace(self.settings, creative_json=self.project.creative_json)
-        items = [(img, self.project.resolved_for(img.name)) for img in work]
+        items = [
+            (img, self.project.resolved_for(img.name),
+             self.store.load_source_text(img) if self.project.convert_txt_to_json else "")
+            for img in work
+        ]
         # remember the guidance actually sent, to stamp each caption on completion
-        self._batch_guidance = {str(img): g for img, g in items}
+        self._batch_guidance = {str(img): g for img, g, _sc in items}
         # health/dup tracking for this run: serialized caption -> first filename seen
         self._batch_caption_hashes = {}
         self._batch_flagged = {}
         n = len(items)
         delay = int(self.qsettings.value("batch_delay_ms", 0, int) or 0)
-        self._ensure_local_binary_then(
-            lambda: self._start_batch_job(job_settings, items, n, delay)
+        self._preflight_server_or_warn(
+            lambda: self._ensure_local_binary_then(
+                lambda: self._start_batch_job(job_settings, items, n, delay)
+            ),
+            batch=True,
         )
 
     def _start_batch_job(self, job_settings, items, n, delay) -> None:
         if not self._ensure_model_configured():
             return
+        if getattr(self, "_force_autostart", False):
+            job_settings = replace(job_settings, auto_start_server=True)
+            self._force_autostart = False
         if not self._confirm_model_download():
             self._set_status("Cancelled.")
             return
         self._job_cancelled = False
+        self._batch_abort_shown = False
         self._set_ai_running(True)
         self._set_read_only(True)
         self._set_job_progress(f"Captioning 0/{n}…", value=0, total=n)
@@ -5882,7 +6371,17 @@ class MainWindow(QMainWindow):
             self._dirty = False
 
     def _on_batch_item_error(self, image_path_str: str, message: str) -> None:
-        self._set_status(f"Failed {Path(image_path_str).name}: {message}")
+        sev, text = self._diagnose_run_failure(message)
+        self._set_status(f"Failed {Path(image_path_str).name}: {text}")
+        # A dead/OOM'd server fails every remaining image identically — stop the run
+        # and say why, once, instead of grinding through the whole folder.
+        if sev == "fatal_server" and not getattr(self, "_batch_abort_shown", False):
+            self._batch_abort_shown = True
+            if self._ai_thread is not None:
+                self._ai_thread.requestInterruption()
+            QMessageBox.critical(
+                self, "Server stopped — batch halted",
+                f"{text}\n\nThe rest of the batch was stopped so it doesn't fail every remaining image.")
 
     def _on_batch_finished(self, success: int, fail: int, cancelled: bool) -> None:
         self._set_ai_running(False)
@@ -5942,10 +6441,52 @@ class MainWindow(QMainWindow):
         self._refresh_guidance_changes()
         self._set_job_progress("AI job complete.")
 
+    def _diagnose_run_failure(self, message: str):
+        """Map a raw job error to (severity, user_text). severity 'fatal_server'
+        means the server died/OOM'd (so a batch should stop); '' means pass through."""
+        low = message.lower()
+        proc = getattr(self, "_server_proc", None)
+        local = self.settings.server_start_mode == "local"
+        log = server_log_path(self.settings)
+        # Confirmed crash of the server we launched.
+        if proc is not None and proc.poll() is not None:
+            cat, hint = diagnose_server_log(log)
+            if hint:
+                if cat == "oom":
+                    hint = hint + " " + BUILTIN_OOM_HINT
+                return "fatal_server", (
+                    f"The built-in llama.cpp server stopped during the run. {hint}\n\nLog: {log}")
+            return "fatal_server", (
+                f"The built-in llama.cpp server crashed during the run (exit {proc.returncode}). "
+                f"The log should have the cause.\n\nLog: {log}")
+        # Connection lost mid-request (server crashed/closed/hung, or remote went away).
+        looks_conn = ("connection" in low or "stopped responding" in low
+                      or "did not become ready" in low or "remote end closed" in low
+                      or "incomplete" in low or "broken pipe" in low)
+        if looks_conn:
+            if local:
+                cat, hint = diagnose_server_log(log)
+                if cat == "oom":
+                    return "fatal_server", (
+                        f"The built-in server ran out of VRAM and dropped the connection. "
+                        f"{hint} {BUILTIN_OOM_HINT}")
+                if hint:
+                    return "fatal_server", (
+                        f"Lost the connection to the built-in server. {hint}\n\nLog: {log}")
+                return "fatal_server", (
+                    "Lost the connection to the built-in server mid-request — it may have crashed "
+                    f"or run out of VRAM.\n\nLog: {log}")
+            return "fatal_server", (
+                "The captioning server stopped responding — it may have crashed, run out of memory, "
+                "or closed the connection. Make sure it's still running with the right model loaded, "
+                "then try again.")
+        return "", message
+
     def _on_job_error(self, message: str) -> None:
         if self._job_cancelled:
             return
-        QMessageBox.critical(self, "AI job failed", message)
+        _sev, text = self._diagnose_run_failure(message)
+        QMessageBox.critical(self, "AI job failed", text)
         self._set_job_progress("AI job failed.")
         if self._maybe_offer_launch_rollback(message):
             return
@@ -6105,6 +6646,9 @@ class MainWindow(QMainWindow):
         self.filmstrip.customContextMenuRequested.connect(self._filmstrip_context_menu)
         self.filmstrip.viewport().setMouseTracking(True)
         self.filmstrip.viewport().installEventFilter(self)
+        # App-level filter so A/D move between images from anywhere in the window
+        # (60% keyboards often lack arrow keys), without stealing letters while typing.
+        QApplication.instance().installEventFilter(self)
         self._hover_item = None
         self._preview_cache: dict[str, QPixmap] = {}
         self._hover_preview = FilmstripPreview(self.theme, None)
@@ -6408,7 +6952,39 @@ class MainWindow(QMainWindow):
             return QPixmap(THUMB, THUMB)
         return pm.scaled(THUMB, THUMB, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
+    def _maybe_wasd_navigate(self, event) -> bool:
+        """A = previous image, D = next image — from anywhere in the main window or
+        the source pop-out, unless the user is typing or editing a value. (W/S are
+        reserved for bbox nudging on the canvas, handled by the view itself.)"""
+        if event.modifiers() != Qt.NoModifier:
+            return False
+        key = event.key()
+        if key == Qt.Key_A:
+            delta = -1
+        elif key == Qt.Key_D:
+            delta = 1
+        else:
+            return False
+        # Only when our window (or the pop-out) is active — never over a dialog.
+        active = QApplication.activeWindow()
+        if active is not self and active is not getattr(self, "_source_popout", None):
+            return False
+        fw = QApplication.focusWidget()
+        # Don't steal letters from an editable text field or a value editor.
+        if isinstance(fw, (QLineEdit, QPlainTextEdit)) and not fw.isReadOnly():
+            return False
+        if isinstance(fw, (QSpinBox, QDoubleSpinBox, QComboBox)):
+            return False
+        # On the canvas, A/D nudge the selected box — let the view handle WASD.
+        view = getattr(self, "view", None)
+        if view is not None and fw in (view, view.viewport()):
+            return False
+        (self.prev_image if delta < 0 else self.next_image)()
+        return True
+
     def eventFilter(self, obj, event):
+        if event.type() == QEvent.KeyPress and self._maybe_wasd_navigate(event):
+            return True
         if obj is self.filmstrip.viewport():
             et = event.type()
             if et == QEvent.MouseMove:

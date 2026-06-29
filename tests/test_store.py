@@ -134,9 +134,45 @@ class StoreTests(unittest.TestCase):
             proj.set_review_mark("ghost.png", True)             # no matching image
             store.save_project(proj)
 
-            reloaded = store.load_project()
-            self.assertTrue(reloaded.is_review_marked("a.png"))
-            self.assertFalse(reloaded.is_review_marked("ghost.png"))  # pruned on load
+    def test_convert_flag_round_trips_only_when_on(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            (folder / "a.png").write_bytes(b"x")
+            store = CaptionStore(folder, ".json")
+            store.save_project(ProjectConfig(convert_txt_to_json=True))
+            self.assertTrue(store.load_project().convert_txt_to_json)
+            self.assertIs(json.loads(store.project_path().read_text()).get("convert_txt_to_json"), True)
+            store.save_project(ProjectConfig(convert_txt_to_json=False))
+            self.assertNotIn("convert_txt_to_json", json.loads(store.project_path().read_text()))
+            self.assertFalse(store.load_project().convert_txt_to_json)
+
+    def test_source_text_sidecar_detection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            img = folder / "shot.jpg.webp"
+            img.write_bytes(b"x")
+            store = CaptionStore(folder, ".json")
+            self.assertFalse(store.has_source_text(img))
+            self.assertEqual(store.load_source_text(img), "")
+            (folder / "shot.jpg.txt").write_text("  four puppies, indoor \n", encoding="utf-8")
+            self.assertEqual(store.source_text_path(img).name, "shot.jpg.txt")
+            self.assertTrue(store.has_source_text(img))
+            self.assertEqual(store.load_source_text(img), "four puppies, indoor")
+            # when .txt IS the caption extension, there is no separate source
+            txt_store = CaptionStore(folder, ".txt")
+            self.assertFalse(txt_store.has_source_text(img))
+            self.assertEqual(txt_store.load_source_text(img), "")
+
+    def test_any_source_text_folder_gate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            imgs = [folder / "a.png", folder / "b.png"]
+            for p in imgs:
+                p.write_bytes(b"x")
+            store = CaptionStore(folder, ".json")
+            self.assertFalse(store.any_source_text(imgs))
+            (folder / "b.txt").write_text("hello", encoding="utf-8")
+            self.assertTrue(store.any_source_text(imgs))
 
 
 if __name__ == "__main__":

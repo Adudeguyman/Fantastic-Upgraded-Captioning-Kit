@@ -1995,24 +1995,64 @@ def start_server_process(
     raise AutoCaptionError(f"{name} server did not become ready within {startup_timeout:.0f} seconds.")
 
 
-def _server_startup_hint(log_path: Path) -> str:
-    """Turn a known fatal startup log line into an actionable hint. Today that's
-    mainly the missing-shared-library case (libnccl.so.2 on recent CUDA builds)."""
+def server_log_path(settings: CaptioningSettings) -> Path:
+    """Where the managed llama-server writes its log."""
+    return Path(settings.models_dir).expanduser().resolve() / "server_logs" / "llama-server.log"
+
+
+# Extra remediation that only applies to the server WE launch (context size and
+# GPU-layer offload are llama.cpp launch flags the app controls; an external server
+# configures those in its own tool, not in our Preferences).
+BUILTIN_OOM_HINT = "For the built-in server you can also lower the context size and GPU layers in Preferences."
+
+
+def diagnose_server_log(log_path: Path) -> tuple[str, str]:
+    """Classify the tail of a server log into (category, actionable hint).
+
+    category is one of 'oom', 'missing_lib', 'crash', or '' when nothing is
+    recognized. The hint is server-agnostic (it describes the cause and the
+    remediations that apply to any server); callers that know they launched the
+    built-in server can append BUILTIN_OOM_HINT for the OOM case."""
     try:
-        tail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+        tail = log_path.read_text(encoding="utf-8", errors="replace")[-6000:]
     except OSError:
-        return ""
+        return "", ""
+    low = tail.lower()
+    if ("out of memory" in low or "cudamalloc failed" in low
+            or "failed to allocate" in low or "unable to allocate" in low
+            or "cuda error: out of memory" in low):
+        return ("oom",
+                "The server ran out of GPU memory (VRAM). Close other GPU apps "
+                "(for example LM Studio with a model loaded) or switch to a smaller model.")
     m = re.search(r"error while loading shared libraries:\s*([^\s:]+)", tail)
-    if not m:
+    if m:
+        lib = m.group(1)
+        if "nccl" in lib.lower():
+            return ("missing_lib",
+                    f"The CUDA build can't find {lib}. Recent llama.cpp CUDA releases "
+                    "need NVIDIA NCCL, which the download doesn't bundle. Install it in "
+                    "this environment with:  pip install nvidia-nccl-cu12  (or "
+                    "conda install -c conda-forge nccl), then start the server again.")
+        return ("missing_lib",
+                f"The server can't find the shared library {lib}. Install it or add its "
+                "folder to your library path, then try again.")
+    if ("ggml_assert" in low or "terminate called" in low or "segmentation fault" in low
+            or "core dumped" in low or "cuda error" in low):
+        return ("crash",
+                "The server hit an internal error and stopped. The log has the details; "
+                "a different model/quant or a fresh llama.cpp build often resolves it.")
+    return "", ""
+
+
+def _server_startup_hint(log_path: Path) -> str:
+    """Leading-space actionable hint for a startup failure, or "" if unrecognized.
+    Startup is always the server we launch, so OOM gets the built-in remediation."""
+    category, hint = diagnose_server_log(log_path)
+    if not hint:
         return ""
-    lib = m.group(1)
-    if "nccl" in lib.lower():
-        return (f" The CUDA build can't find {lib}. Recent llama.cpp CUDA releases "
-                "need NVIDIA NCCL, which the download doesn't bundle. Install it in "
-                "this environment with:  pip install nvidia-nccl-cu12  (or "
-                "conda install -c conda-forge nccl), then start the server again.")
-    return (f" The server can't find the shared library {lib}. Install it or add its "
-            "folder to your library path, then try again.")
+    if category == "oom":
+        hint = hint + " " + BUILTIN_OOM_HINT
+    return " " + hint
 
 
 def close_process_log(process: subprocess.Popen) -> None:
@@ -2478,6 +2518,18 @@ Create an Ideogram 4 structured JSON caption for this image.
 Do not reference any existing sidecar caption.
 """.strip()
 
+IMAGE_TO_JSON_CONVERT_SYSTEM = """
+You inspect an image together with a provided source caption, and produce an Ideogram 4 structured JSON caption.
+The image is authoritative for what is visible and for layout. The source caption supplies intended content, names, and intent — synthesize it into the schema fields, and do not copy it verbatim. The source caption may be written as prose or as a comma-separated tag list; in either case express its meaning through the fields rather than repeating it.
+""".strip()
+
+IMAGE_TO_JSON_CONVERT_USER = """
+Create an Ideogram 4 structured JSON caption for this image, using the source caption below as content guidance.
+
+Source caption:
+{source_caption}
+""".strip()
+
 JSON_REFINE_SYSTEM = """
 You revise an existing Ideogram 4 structured JSON caption for an image dataset.
 Use the image as the visual authority, the current JSON as the structure to improve,
@@ -2591,6 +2643,8 @@ DEFAULT_PROMPT_TEXTS: dict[str, str] = {
     "text_to_json_user": TEXT_TO_JSON_USER,
     "image_to_json_system": IMAGE_TO_JSON_SYSTEM,
     "image_to_json_user": IMAGE_TO_JSON_USER,
+    "image_to_json_convert_system": IMAGE_TO_JSON_CONVERT_SYSTEM,
+    "image_to_json_convert_user": IMAGE_TO_JSON_CONVERT_USER,
     "json_refine_system": JSON_REFINE_SYSTEM,
     "json_refine_user": JSON_REFINE_USER,
     "bbox_system": BATCH_GROUND_SYSTEM,
@@ -2707,15 +2761,26 @@ def generate_json_from_image(
     image_path: Path,
     progress: ProgressCallback | None = None,
     guidance: str = "",
+    source_caption: str = "",
 ) -> dict[str, Any]:
     config = runtime_config_for_task(settings, "caption")
     prompts = load_prompts()
+    source_caption = (source_caption or "").strip()
+    if source_caption:
+        # Convert mode: the image grounds layout/visibility, the source caption
+        # supplies content. The synthesize-don't-copy instruction lives in the
+        # framing system prompt (one place); guidance stays purely the user's words.
+        system = json_system_prompt(prompts, "image_to_json_convert_system", settings, guidance=guidance)
+        user = format_prompt(prompts["image_to_json_convert_user"], source_caption=source_caption, directive="")
+    else:
+        system = json_system_prompt(prompts, "image_to_json_system", settings, guidance=guidance)
+        user = format_prompt(prompts["image_to_json_user"], directive="")
     raw = chat_vision(
         settings=settings,
         model=config.api_model,
         image_path=image_path,
-        system=json_system_prompt(prompts, "image_to_json_system", settings, guidance=guidance),
-        user=format_prompt(prompts["image_to_json_user"], directive=""),
+        system=system,
+        user=user,
         max_tokens=settings.max_tokens_json,
         temperature=0.0,
     )

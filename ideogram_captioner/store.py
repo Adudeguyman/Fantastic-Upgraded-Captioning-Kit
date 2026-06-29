@@ -25,6 +25,9 @@ class ProjectConfig:
     per_image: dict[str, str] = field(default_factory=dict)
     per_image_enabled: dict[str, bool] = field(default_factory=dict)
     creative_json: bool | None = None  # None = inherit the global setting
+    # When True, captioning feeds each image's matching .txt sidecar to the model
+    # as a source caption to upgrade into structured JSON (folder-wide mode).
+    convert_txt_to_json: bool = False
     # filename -> the effective guidance string that produced its current caption.
     # Lets us flag images whose guidance has changed since they were last run.
     generated_guidance: dict[str, str] = field(default_factory=dict)
@@ -119,6 +122,35 @@ class CaptionStore:
 
     def caption_path(self, image_path: Path) -> Path:
         return image_path.with_suffix(self.extension)
+
+    def source_text_path(self, image_path: Path) -> Path:
+        """The plain-text source caption sidecar for an image (image.jpg -> image.txt),
+        following the same last-suffix convention as the JSON caption."""
+        return image_path.with_suffix(".txt")
+
+    def load_source_text(self, image_path: Path) -> str:
+        """The image's .txt source caption stripped of whitespace, or "" if none.
+        Returns "" when .txt is itself the caption extension (no separate source)."""
+        path = self.source_text_path(image_path)
+        if path == self.caption_path(image_path):
+            return ""
+        try:
+            if path.is_file():
+                return path.read_text(encoding="utf-8-sig", errors="replace").strip()
+        except OSError:
+            pass
+        return ""
+
+    def has_source_text(self, image_path: Path) -> bool:
+        path = self.source_text_path(image_path)
+        if path == self.caption_path(image_path):
+            return False
+        return path.is_file()
+
+    def any_source_text(self, images) -> bool:
+        """True if at least one image in the folder has a matching .txt sidecar.
+        Used to gate the convert feature — pointless with no source captions."""
+        return any(self.has_source_text(img) for img in images)
 
     def failure_path(self, image_path: Path) -> Path:
         return image_path.with_suffix(".caption_failed.json")
@@ -244,6 +276,7 @@ class CaptionStore:
             per_image=per_image,
             per_image_enabled=per_image_enabled,
             creative_json=creative if isinstance(creative, bool) else None,
+            convert_txt_to_json=bool(data.get("convert_txt_to_json", False)),
             generated_guidance=generated_guidance,
             caption_flags=caption_flags,
             review_marks=review_marks,
@@ -266,6 +299,8 @@ class CaptionStore:
             data["per_image_enabled"] = enabled
         if config.creative_json is not None:
             data["creative_json"] = config.creative_json
+        if config.convert_txt_to_json:
+            data["convert_txt_to_json"] = True
         # Keep a stamp for every still-present image (empty string is meaningful:
         # "generated with no guidance"), so changes are detected after a restart.
         gen = {name: text for name, text in config.generated_guidance.items()}
