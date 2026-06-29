@@ -696,11 +696,14 @@ class BBoxItem(QGraphicsRectItem):
 
     def mousePressEvent(self, event) -> None:
         self.controller.on_box_pressed(self)
-        handle = self._handle_at(event.pos())
-        if handle and self.isSelected():
-            self._resize_handle = handle
-            event.accept()
-            return
+        # Read-only (job in progress): allow selecting to view, but no resize. Moves are
+        # already prevented by clearing ItemIsMovable in the controller's canvas lock.
+        if not getattr(self.controller, "_read_only", False):
+            handle = self._handle_at(event.pos())
+            if handle and self.isSelected():
+                self._resize_handle = handle
+                event.accept()
+                return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
@@ -849,7 +852,7 @@ class CanvasView(QGraphicsView):
             self.viewport().setCursor(Qt.ClosedHandCursor)
             event.accept()
             return
-        if self.mode == "draw" and event.button() == Qt.LeftButton:
+        if self.mode == "draw" and event.button() == Qt.LeftButton and not getattr(self.controller, "_read_only", False):
             self._draw_start = self._scene_pos(event)
             self._draw_item = QGraphicsRectItem(QRectF(self._draw_start, self._draw_start))
             accent = getattr(self.controller, "theme", None)
@@ -6192,6 +6195,9 @@ class MainWindow(QMainWindow):
         for b in self.ai_buttons:
             b.setEnabled(not running)
         self.btn_cancel.setEnabled(running)
+        # Any AI job (single or batch) freezes the caption/elements fields and the
+        # canvas so an in-flight result can't be clobbered, and boxes can't be moved.
+        self._set_read_only(running)
 
     def run_ai_job(self, operation: str) -> None:
         if self._job_running:
@@ -6402,12 +6408,39 @@ class MainWindow(QMainWindow):
         self._nav_locked = locked
         self.filmstrip.setEnabled(not locked)
 
+    def _set_panel_editable(self, editable: bool) -> None:
+        """Make the caption/elements fields read-only (but still readable and tab-
+        switchable) rather than disabling the whole tab widget. Programmatic reloads
+        still populate read-only fields, so a completing batch item can refresh them."""
+        ro = not editable
+        for f in (self.cap_high_level, self.cap_background, self.cap_aesthetics,
+                  self.cap_lighting, self.cap_medium, self.cap_style_detail,
+                  self.el_desc, self.el_text,
+                  self.el_y1, self.el_x1, self.el_y2, self.el_x2):
+            f.setReadOnly(ro)
+        for c in (self.style_mode, self.el_type):
+            c.setEnabled(editable)
+        self.el_has_box.setEnabled(editable)
+        self.el_duplicate_btn.setEnabled(editable)
+        self.el_remove_btn.setEnabled(editable)
+
+    def _set_canvas_locked(self, locked: bool) -> None:
+        """Freeze box editing on the canvas: boxes can't be moved (flag cleared),
+        resized, drawn, or deleted, and the tool strip is disabled. Selecting a box to
+        view it (and panning/zooming) still works."""
+        for it in getattr(self, "box_items", []):
+            it.setFlag(QGraphicsItem.ItemIsMovable, not locked)
+        ts = getattr(self, "_toolstrip", None)
+        if ts is not None:
+            ts.setEnabled(not locked)
+
     def _set_read_only(self, on: bool) -> None:
-        """Batch read-only mode: navigation stays live (review as captions land),
-        but the caption editor is paused so a completing item can't clobber edits."""
+        """Batch read-only mode: navigation stays live (review as captions land), but
+        the caption/elements fields and the canvas are frozen so a completing item
+        can't clobber edits — while tabs stay switchable for read-only review."""
         self._read_only = on
-        if hasattr(self, "right_tabs"):
-            self.right_tabs.setEnabled(not on)
+        self._set_panel_editable(not on)
+        self._set_canvas_locked(on)
         if hasattr(self, "_readonly_banner"):
             self._readonly_banner.setVisible(on)
 
@@ -6696,7 +6729,6 @@ class MainWindow(QMainWindow):
         self._job_cancelled = False
         self._batch_abort_shown = False
         self._set_ai_running(True)
-        self._set_read_only(True)
         self._set_job_progress(f"Captioning 0/{n}…", value=0, total=n)
         thread = BatchCaptionThread(job_settings, items, delay_ms=delay)
         thread.item_progress.connect(self._on_batch_progress)
@@ -6766,7 +6798,6 @@ class MainWindow(QMainWindow):
 
     def _on_batch_finished(self, success: int, fail: int, cancelled: bool) -> None:
         self._set_ai_running(False)
-        self._set_read_only(False)
         self._ai_thread = None
         # persist the per-image guidance stamps gathered during the run
         if self.store is not None:
@@ -8358,6 +8389,7 @@ class MainWindow(QMainWindow):
             self.box_items.append(item)
         if self.selected_element_index is not None:
             self._select_box_for_element(self.selected_element_index)
+        self._set_canvas_locked(getattr(self, "_read_only", False))
 
     def _select_box_for_element(self, idx: int | None) -> None:
         for it in self.box_items:
@@ -8400,6 +8432,8 @@ class MainWindow(QMainWindow):
     def nudge_selected_box(self, dx: int, dy: int) -> bool:
         """Move the selected element's box by (dx, dy) in 0–1000 units, keeping its
         size fixed and clamped in-bounds. Returns True if there was a box to nudge."""
+        if getattr(self, "_read_only", False):
+            return False
         idx = self.selected_element_index
         els = self._elements()
         if idx is None or idx < 0 or idx >= len(els):
@@ -8495,6 +8529,8 @@ class MainWindow(QMainWindow):
         """Delete the box of the currently selected element. Both the Delete key and
         the delete tool route here, so deletion always targets the box the user
         selected — never a larger box that merely overlaps the click point."""
+        if getattr(self, "_read_only", False):
+            return False
         idx = self.selected_element_index
         els = self._elements()
         if idx is None or not (0 <= idx < len(els)):
