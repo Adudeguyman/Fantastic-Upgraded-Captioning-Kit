@@ -11,6 +11,22 @@ leaves your machine except the requests to the endpoint you configure.
 
 ![Ideogram JSON Captioner screenshot](ideogramCaptionerScreenshot.png)
 
+## Contents
+
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+  - [Quickest start — auto-launcher (venv)](#quickest-start--auto-launcher-venv)
+  - [Option A — venv](#option-a--venv)
+  - [Option B — conda](#option-b--conda)
+  - [Optional — CUDA acceleration](#optional--cuda-acceleration-for-the-built-in-server-nvidia-linux)
+- [Launching](#launching)
+- [Basic use](#basic-use)
+- [Configuration](#configuration)
+- [Keyboard shortcuts](#keyboard-shortcuts)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
+
 ## Features
 
 - **Dataset browsing** — Step through an image folder with keyboard shortcuts.
