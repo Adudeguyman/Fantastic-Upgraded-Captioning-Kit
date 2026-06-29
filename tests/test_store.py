@@ -134,6 +134,108 @@ class StoreTests(unittest.TestCase):
             proj.set_review_mark("ghost.png", True)             # no matching image
             store.save_project(proj)
 
+    def test_split_guidance_stamps_attribute_scope_and_round_trip(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            (folder / "a.png").write_bytes(b"x")
+            store = CaptionStore(folder, ".json")
+
+            proj = ProjectConfig(name="t", folder_guidance="F", folder_guidance_enabled=True)
+            proj.per_image["a.png"] = "P"
+            proj.mark_generated("a.png", proj.resolved_for("a.png"),
+                                proj.effective_folder_guidance(),
+                                proj.effective_image_guidance("a.png"))
+            self.assertFalse(proj.guidance_changed("a.png"))
+            self.assertFalse(proj.folder_guidance_changed("a.png"))
+            self.assertFalse(proj.image_guidance_changed("a.png"))
+
+            # folder edit attributes to folder only
+            proj.folder_guidance = "F2"
+            self.assertTrue(proj.guidance_changed("a.png"))
+            self.assertTrue(proj.folder_guidance_changed("a.png"))
+            self.assertFalse(proj.image_guidance_changed("a.png"))
+
+            # per-image edit attributes to per-image
+            proj.per_image["a.png"] = "P2"
+            self.assertTrue(proj.image_guidance_changed("a.png"))
+
+            # round-trip the split stamps
+            store.save_project(proj)
+            raw = json.loads(store.project_path().read_text())
+            self.assertIn("generated_folder", raw)
+            self.assertIn("generated_image", raw)
+            reloaded = store.load_project()
+            self.assertTrue(reloaded.folder_guidance_changed("a.png"))
+            self.assertTrue(reloaded.image_guidance_changed("a.png"))
+
+    def test_legacy_combined_stamp_cannot_attribute_scope(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            (folder / "a.png").write_bytes(b"x")
+            proj = ProjectConfig(name="t", folder_guidance="F", folder_guidance_enabled=True)
+            # legacy: only the combined stamp, no split parts
+            proj.mark_generated("a.png", proj.resolved_for("a.png"))
+            proj.folder_guidance = "F2"
+            self.assertTrue(proj.guidance_changed("a.png"))   # dot still fires
+            self.assertFalse(proj.folder_guidance_changed("a.png"))  # unattributable
+            self.assertFalse(proj.image_guidance_changed("a.png"))
+
+    def test_caption_file_issues_flags_corrupt_empty_and_healthy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            (folder / "a.png").write_bytes(b"x")
+            (folder / "b.png").write_bytes(b"x")
+            (folder / "c.png").write_bytes(b"x")
+            (folder / "d.png").write_bytes(b"x")
+            store = CaptionStore(folder, ".json")
+
+            # no caption file -> nothing to flag
+            self.assertEqual(store.caption_file_issues(folder / "a.png"), [])
+
+            # corrupt JSON -> flagged
+            (folder / "b.json").write_text('{"high_level_descrip', encoding="utf-8")
+            issues = store.caption_file_issues(folder / "b.png")
+            self.assertTrue(issues and "corrupt" in issues[0], issues)
+
+            # empty file -> flagged
+            (folder / "c.json").write_text("   ", encoding="utf-8")
+            self.assertEqual(store.caption_file_issues(folder / "c.png"),
+                             ["caption file is empty"])
+
+            # healthy caption -> no issues
+            store.save_caption(folder / "d.png", {
+                "high_level_description": "A dog.",
+                "style_description": {"aesthetics": "warm", "lighting": "soft", "medium": "photograph"},
+                "compositional_deconstruction": {"background": "a wall", "elements": []},
+            })
+            self.assertEqual(store.caption_file_issues(folder / "d.png"), [])
+
+    def test_convert_omit_round_trips_and_prunes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            (folder / "a.png").write_bytes(b"x")
+            (folder / "b.png").write_bytes(b"x")
+            store = CaptionStore(folder, ".json")
+
+            proj = ProjectConfig(name="t")
+            self.assertFalse(proj.is_convert_omitted("a.png"))
+            proj.set_convert_omit("a.png", True)
+            proj.set_convert_omit("ghost.png", True)   # no matching image -> pruned on load
+            self.assertTrue(proj.is_convert_omitted("a.png"))
+            store.save_project(proj)
+            self.assertEqual(
+                json.loads(store.project_path().read_text()).get("convert_omit"),
+                ["a.png", "ghost.png"],
+            )
+            reloaded = store.load_project()
+            self.assertTrue(reloaded.is_convert_omitted("a.png"))
+            self.assertNotIn("ghost.png", reloaded.convert_omit)  # orphan pruned
+
+            # clearing the last omit drops the key entirely (reloaded already pruned the orphan)
+            reloaded.set_convert_omit("a.png", False)
+            store.save_project(reloaded)
+            self.assertNotIn("convert_omit", json.loads(store.project_path().read_text()))
+
     def test_convert_flag_round_trips_only_when_on(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)

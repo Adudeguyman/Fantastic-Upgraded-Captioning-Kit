@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .schema import IMAGE_EXTENSIONS, caption_from_plain_text, default_caption, parse_caption_text, serialize_caption
+from .schema import IMAGE_EXTENSIONS, caption_from_plain_text, caption_health, default_caption, parse_caption_text, serialize_caption
 
 PROJECT_DIRNAME = ".captioner"
 PROJECT_FILENAME = "project.json"
@@ -31,11 +31,28 @@ class ProjectConfig:
     # filename -> the effective guidance string that produced its current caption.
     # Lets us flag images whose guidance has changed since they were last run.
     generated_guidance: dict[str, str] = field(default_factory=dict)
+    # The same snapshot split by scope, so a "guidance changed" notice can say whether
+    # the folder-wide guidance, this image's guidance, or both changed. Absent for
+    # captions made before split-stamping existed (those fall back to a generic notice).
+    generated_folder: dict[str, str] = field(default_factory=dict)
+    generated_image: dict[str, str] = field(default_factory=dict)
     # filename -> list of issue strings from the last health check (corrupt/off-schema output).
     # Empty/absent = no known problems. Surfaced as a review marker; cleared when re-saved.
     caption_flags: dict[str, list[str]] = field(default_factory=dict)
     # filenames the user has manually flagged for review (independent of caption_flags).
     review_marks: set[str] = field(default_factory=set)
+    # filenames where convert mode is overridden OFF — even with a matching .txt, this
+    # image is captioned from the image alone. Stored as exceptions (default = use .txt).
+    convert_omit: set[str] = field(default_factory=set)
+
+    def set_convert_omit(self, filename: str, omit: bool) -> None:
+        if omit:
+            self.convert_omit.add(filename)
+        else:
+            self.convert_omit.discard(filename)
+
+    def is_convert_omitted(self, filename: str) -> bool:
+        return filename in self.convert_omit
 
     def set_review_mark(self, filename: str, marked: bool) -> None:
         if marked:
@@ -69,9 +86,16 @@ class ProjectConfig:
     def is_flagged(self, filename: str) -> bool:
         return bool(self.caption_flags.get(filename))
 
-    def mark_generated(self, filename: str, guidance: str) -> None:
-        """Stamp the guidance that produced this image's just-saved caption."""
+    def mark_generated(self, filename: str, guidance: str,
+                       folder: str | None = None, image: str | None = None) -> None:
+        """Stamp the guidance that produced this image's just-saved caption. The
+        folder/per-image parts are stamped too (when given) so a later change can be
+        attributed to a scope."""
         self.generated_guidance[filename] = guidance or ""
+        if folder is not None:
+            self.generated_folder[filename] = folder
+        if image is not None:
+            self.generated_image[filename] = image
 
     def last_run_guidance(self, filename: str) -> str | None:
         """The guidance recorded at the last successful generation, or None."""
@@ -84,6 +108,33 @@ class ProjectConfig:
         if prev is None:
             return False
         return prev.strip() != self.resolved_for(filename).strip()
+
+    def effective_folder_guidance(self) -> str:
+        """The folder-wide guidance actually applied right now ("" when disabled/empty)."""
+        if self.folder_guidance_enabled and self.folder_guidance.strip():
+            return self.folder_guidance.strip()
+        return ""
+
+    def effective_image_guidance(self, filename: str) -> str:
+        """This image's per-image guidance actually applied right now ("" when off/empty)."""
+        per_image = self.per_image.get(filename, "")
+        if per_image.strip() and self.per_image_active(filename):
+            return per_image.strip()
+        return ""
+
+    def folder_guidance_changed(self, filename: str) -> bool:
+        """True when the folder-wide guidance differs from the last generation's.
+        False when there's no split stamp (caption predates split-stamping)."""
+        if filename not in self.generated_folder:
+            return False
+        return self.generated_folder[filename].strip() != self.effective_folder_guidance()
+
+    def image_guidance_changed(self, filename: str) -> bool:
+        """True when this image's per-image guidance differs from the last generation's.
+        False when there's no split stamp (caption predates split-stamping)."""
+        if filename not in self.generated_image:
+            return False
+        return self.generated_image[filename].strip() != self.effective_image_guidance(filename)
 
     def per_image_guidance(self, filename: str) -> str:
         return self.per_image.get(filename, "")
@@ -196,6 +247,26 @@ class CaptionStore:
                 return caption_from_plain_text(raw), f"Imported plain text from {caption_path.name}; save will convert it to Ideogram JSON."
             return default_caption(), f"Could not parse {caption_path.name}: {exc}"
 
+    def caption_file_issues(self, image_path: Path) -> list[str]:
+        """Health issues for an image's caption file as it sits on disk, including parse
+        failures. Empty list means either there is no caption yet (nothing to flag) or
+        the caption is healthy. Re-validates existing files (e.g. on folder open) so a
+        hand-edited or corrupt caption is flagged, not only freshly generated ones."""
+        caption_path = self.caption_path(image_path)
+        if not caption_path.exists():
+            return []
+        try:
+            raw = caption_path.read_text(encoding="utf-8-sig")
+        except OSError:
+            return ["could not read caption file"]
+        if not raw.strip():
+            return ["caption file is empty"]
+        try:
+            caption = parse_caption_text(raw)
+        except (json.JSONDecodeError, ValueError):
+            return ["corrupt caption file — could not parse JSON"]
+        return caption_health(caption)
+
     def save_caption(self, image_path: Path, caption: dict[str, Any]) -> Path:
         caption_path = self.caption_path(image_path)
         caption_path.write_text(serialize_caption(caption, indent=2), encoding="utf-8")
@@ -248,6 +319,20 @@ class CaptionStore:
         if existing:
             generated_guidance = {n: g for n, g in generated_guidance.items() if n in existing}
 
+        def _load_str_map(field_name: str) -> dict[str, str]:
+            out: dict[str, str] = {}
+            raw = data.get(field_name, {})
+            if isinstance(raw, dict):
+                for key, value in raw.items():
+                    if isinstance(key, str) and isinstance(value, str):
+                        out[key] = value
+            if existing:
+                out = {n: g for n, g in out.items() if n in existing}
+            return out
+
+        generated_folder = _load_str_map("generated_folder")
+        generated_image = _load_str_map("generated_image")
+
         caption_flags: dict[str, list[str]] = {}
         raw_flags = data.get("caption_flags", {})
         if isinstance(raw_flags, dict):
@@ -268,6 +353,15 @@ class CaptionStore:
         if existing:
             review_marks = {n for n in review_marks if n in existing}
 
+        convert_omit: set[str] = set()
+        raw_omit = data.get("convert_omit", [])
+        if isinstance(raw_omit, list):
+            for name in raw_omit:
+                if isinstance(name, str):
+                    convert_omit.add(name)
+        if existing:
+            convert_omit = {n for n in convert_omit if n in existing}
+
         creative = data.get("creative_json")
         return ProjectConfig(
             name=str(data.get("name", "")),
@@ -278,8 +372,11 @@ class CaptionStore:
             creative_json=creative if isinstance(creative, bool) else None,
             convert_txt_to_json=bool(data.get("convert_txt_to_json", False)),
             generated_guidance=generated_guidance,
+            generated_folder=generated_folder,
+            generated_image=generated_image,
             caption_flags=caption_flags,
             review_marks=review_marks,
+            convert_omit=convert_omit,
         )
 
     def save_project(self, config: ProjectConfig) -> Path:
@@ -306,10 +403,18 @@ class CaptionStore:
         gen = {name: text for name, text in config.generated_guidance.items()}
         if gen:
             data["generated_guidance"] = gen
+        gen_folder = {name: text for name, text in config.generated_folder.items()}
+        if gen_folder:
+            data["generated_folder"] = gen_folder
+        gen_image = {name: text for name, text in config.generated_image.items()}
+        if gen_image:
+            data["generated_image"] = gen_image
         flags = {name: list(v) for name, v in config.caption_flags.items() if v}
         if flags:
             data["caption_flags"] = flags
         if config.review_marks:
             data["review_marks"] = sorted(config.review_marks)
+        if config.convert_omit:
+            data["convert_omit"] = sorted(config.convert_omit)
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return path

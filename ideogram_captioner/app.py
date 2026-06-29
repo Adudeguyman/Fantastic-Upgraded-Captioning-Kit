@@ -501,6 +501,8 @@ REVIEW_ROLE = int(Qt.UserRole) + 3   # per-item flag: caption failed a health ch
 REVIEW_COLOR = "#E24B4A"             # red — "needs review: caption may be corrupt"
 FLAG_ROLE = int(Qt.UserRole) + 4     # per-item flag: user manually flagged for review
 FLAG_COLOR = "#E5484D"               # red flag — "you flagged this for manual review"
+OMIT_ROLE = int(Qt.UserRole) + 5     # per-item flag: convert mode on but this image's .txt is omitted
+OMIT_COLOR = "#A78BFA"               # violet (guidance family) — "source .txt omitted for this image"
 
 SERVER_PING_INTERVAL_MS = 2000  # how often the background monitor re-checks the server
 RESOURCE_SAMPLE_INTERVAL_MS = 2000  # how often the status-bar resource readout refreshes
@@ -3110,7 +3112,24 @@ class FilmstripDelegate(QStyledItemDelegate):
             painter.drawEllipse(QPointF(cx, cy), r + ring, r + ring)
             painter.setBrush(QColor(STALE_COLOR))
             painter.drawEllipse(QPointF(cx, cy), r, r)
-        # review dot: red circle at the BOTTOM-LEFT — caption failed a health check.
+        # omit marker: violet slashed dot on the LEFT edge, just below the stale dot,
+        # so it reads as a distinct shape in the same guidance colour family — "this
+        # image's source .txt is omitted (image-only) even though convert mode is on".
+        if icon_rect is not None and bool(index.data(OMIT_ROLE)):
+            r = 5.0
+            ring = 2.0
+            cx = max(float(icon_rect.left()) - 1.0, float(rect.left()) + (r + ring))
+            cy = max(float(icon_rect.top()) - 1.0, float(rect.top()) + (r + ring)) + 2 * (r + ring) + 2.0
+            cy = min(cy, float(rect.bottom()) - (r + ring))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(t.surface_1))
+            painter.drawEllipse(QPointF(cx, cy), r + ring, r + ring)
+            painter.setBrush(QColor(OMIT_COLOR))
+            painter.drawEllipse(QPointF(cx, cy), r, r)
+            # diagonal slash, ringed-coloured so it reads as "struck out"
+            d = r * 0.7
+            painter.setPen(QPen(QColor(t.surface_1), 1.6, Qt.SolidLine, Qt.RoundCap))
+            painter.drawLine(QPointF(cx - d, cy + d), QPointF(cx + d, cy - d))
         if icon_rect is not None and bool(index.data(REVIEW_ROLE)):
             r = 5.0
             ring = 2.0
@@ -3183,17 +3202,14 @@ class FilmstripPreview(QWidget):
         cl.setContentsMargins(PREVIEW_PAD, PREVIEW_PAD, PREVIEW_PAD, PREVIEW_PAD)
         cl.setSpacing(0)
 
-        # Amber banner shown only when the previewed image has unsaved edits.
-        self.unsaved_bar = QLabel("Unsaved changes", self.card)
-        self.unsaved_bar.setAlignment(Qt.AlignCenter)
-        self.unsaved_bar.setStyleSheet(
-            f"background: {theme.warning}; color: {theme.surface_0};"
-            f" font-family: {self._MONO}; font-size: 10px; font-weight: 600;"
-            f" border-radius: 4px; padding: 3px 0; margin-bottom: 5px;"
-        )
-        self.unsaved_bar.setVisible(False)
-        self._bar_shown = False
-        cl.addWidget(self.unsaved_bar)
+        # A vertical stack of marker banners, rebuilt per image (unsaved, guidance
+        # changed, omitted, problems, flagged). Empty -> zero height, image sits at top.
+        self._banner_box = QWidget(self.card)
+        self._banner_lay = QVBoxLayout(self._banner_box)
+        self._banner_lay.setContentsMargins(0, 0, 0, 0)
+        self._banner_lay.setSpacing(4)
+        self._banner_labels: list[QLabel] = []
+        cl.addWidget(self._banner_box)
 
         self.image = QLabel(self.card)
         self.image.setFixedSize(PREVIEW_IMG_W, PREVIEW_IMG_H)
@@ -3249,16 +3265,35 @@ class FilmstripPreview(QWidget):
 
     # ---- content + show/hide -------------------------------------------
     def set_content(self, pixmap: QPixmap, name: str, index_text: str,
-                    unsaved: bool = False) -> None:
+                    banners: tuple = ()) -> None:
+        """banners: an iterable of (text, bg_color, fg_color, tooltip) specs, painted
+        as a vertical stack above the image in the order given."""
         fm = QFontMetrics(self.name.font())
         self.name.setText(fm.elidedText(name, Qt.ElideRight, PREVIEW_IMG_W - 60))
         self.idx.setText(index_text)
         if not pixmap.isNull():
             self.image.setPixmap(pixmap)
-        if self._bar_shown != unsaved:
-            self._bar_shown = unsaved
-            self.unsaved_bar.setVisible(unsaved)
-            self._resize_to_card()
+        # rebuild the banner stack
+        for lbl in self._banner_labels:
+            self._banner_lay.removeWidget(lbl)
+            lbl.deleteLater()
+        self._banner_labels = []
+        for spec in banners:
+            text, bg, fg = spec[0], spec[1], spec[2]
+            tip = spec[3] if len(spec) > 3 else ""
+            lbl = QLabel(text, self._banner_box)
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setStyleSheet(
+                f"background: {bg}; color: {fg};"
+                f" font-family: {self._MONO}; font-size: 10px; font-weight: 600;"
+                f" border-radius: 4px; padding: 3px 6px;"
+            )
+            if tip:
+                lbl.setToolTip(tip)
+            self._banner_lay.addWidget(lbl)
+            self._banner_labels.append(lbl)
+        self._banner_lay.setContentsMargins(0, 0, 0, 5 if self._banner_labels else 0)
+        self._resize_to_card()
 
     def show_at(self, final_pos: QPoint, arrow_x: int) -> None:
         self._arrow_x = arrow_x
@@ -3266,6 +3301,134 @@ class FilmstripPreview(QWidget):
         self.setWindowOpacity(1.0)
         self.show()
         self.update()
+
+
+class GuidanceDiffPopup(QWidget):
+    """A hover card showing the full 'guidance changed' diff (added lines in the stale
+    violet, removed lines struck through and muted). Used when the sidebar section is
+    too short to show the diff inline — hovering the section reveals it here. Mirrors
+    the filmstrip preview's card styling. Dark theme only."""
+
+    _BORDER = STALE_COLOR  # violet — guidance-changed family
+
+    def __init__(self, theme: "Theme", parent=None) -> None:
+        super().__init__(parent, Qt.ToolTip | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self._margin = 18  # room for the drop shadow
+        self.card = QWidget(self)
+        self.card.setObjectName("DiffCard")
+        self.card.setStyleSheet(
+            f"#DiffCard {{ background: {theme.surface_2};"
+            f" border: 1px solid {self._BORDER}; border-radius: 8px; }}"
+        )
+        shadow = QGraphicsDropShadowEffect(self.card)
+        shadow.setBlurRadius(32)
+        shadow.setXOffset(0)
+        shadow.setYOffset(12)
+        shadow.setColor(QColor(0, 0, 0, 140))
+        self.card.setGraphicsEffect(shadow)
+        cl = QVBoxLayout(self.card)
+        cl.setContentsMargins(12, 10, 12, 12)
+        cl.setSpacing(6)
+        head = QLabel("Guidance changed since last caption")
+        head.setWordWrap(True)
+        head.setStyleSheet(f"color: {STALE_COLOR}; font-weight: 600; font-size: 11px;")
+        self._diff = QLabel()
+        self._diff.setObjectName("Hint")
+        self._diff.setWordWrap(True)
+        self._diff.setTextFormat(Qt.RichText)
+        cl.addWidget(head)
+        cl.addWidget(self._diff)
+        self.card.setFixedWidth(320)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(self._margin, self._margin, self._margin, self._margin)
+        v.addWidget(self.card)
+
+    def show_diff(self, diff_html: str, target_global: QPoint, screen=None) -> None:
+        """Show the diff with the card's top-left anchored near target_global (the
+        section's top-right corner), clamped onto the given screen rect."""
+        self._diff.setText(diff_html)
+        self.adjustSize()
+        gap = 8
+        x = target_global.x() + gap - self._margin
+        y = target_global.y() - self._margin
+        if screen is not None:
+            x = min(x, screen.right() - self.width())
+            x = max(x, screen.left())
+            y = min(y, screen.bottom() - self.height())
+            y = max(y, screen.top())
+        self.move(int(x), int(y))
+        self.show()
+
+
+class TagListPopup(QWidget):
+    """A hover card listing all 'tags used' for the current image, one per line, shown
+    when there are too many (or too long) to fit inline without crowding the sidebar.
+    Mirrors the diff pop-out styling. Dark theme only."""
+
+    _BORDER = STALE_COLOR  # purple — tag family
+
+    def __init__(self, theme: "Theme", parent=None) -> None:
+        super().__init__(parent, Qt.ToolTip | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self._theme = theme
+        self._margin = 18
+        self.card = QWidget(self)
+        self.card.setObjectName("TagCard")
+        # The main-window stylesheet doesn't cascade into this separate top-level
+        # window, so the #UsedPill rule is restated here to keep the chips styled.
+        self.card.setStyleSheet(
+            f"#TagCard {{ background: {theme.surface_2};"
+            f" border: 1px solid {self._BORDER}; border-radius: 8px; }}"
+            f" #UsedPill {{ background: {theme.accent_subtle};"
+            f" border: 1px solid {theme.accent_subtle_border}; border-radius: 12px;"
+            f" color: {theme.accent_on_subtle}; padding: 3px 10px; }}"
+        )
+        shadow = QGraphicsDropShadowEffect(self.card)
+        shadow.setBlurRadius(32)
+        shadow.setXOffset(0)
+        shadow.setYOffset(12)
+        shadow.setColor(QColor(0, 0, 0, 140))
+        self.card.setGraphicsEffect(shadow)
+        cl = QVBoxLayout(self.card)
+        cl.setContentsMargins(12, 10, 12, 12)
+        cl.setSpacing(6)
+        head = QLabel("Tags used")
+        head.setStyleSheet(f"color: {STALE_COLOR}; font-weight: 600; font-size: 11px;")
+        cl.addWidget(head)
+        self._list = QWidget()
+        self._list_lay = QVBoxLayout(self._list)
+        self._list_lay.setContentsMargins(0, 0, 0, 0)
+        self._list_lay.setSpacing(5)
+        cl.addWidget(self._list)
+        self.card.setFixedWidth(300)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(self._margin, self._margin, self._margin, self._margin)
+        v.addWidget(self.card)
+
+    def show_tags(self, make_pill, tags, target_global: QPoint, screen=None) -> None:
+        while self._list_lay.count():
+            item = self._list_lay.takeAt(0)
+            wdg = item.widget()
+            if wdg is not None:
+                wdg.setParent(None)
+                wdg.deleteLater()
+        for tag in tags:
+            pill = make_pill(tag)
+            pill.setWordWrap(True)          # let a long re-used phrase wrap inside its chip
+            pill.setMaximumWidth(264)
+            self._list_lay.addWidget(pill, 0, Qt.AlignLeft)  # one per line, hugging content
+        self.adjustSize()
+        gap = 8
+        x = target_global.x() + gap - self._margin
+        y = target_global.y() - self._margin
+        if screen is not None:
+            x = min(x, screen.right() - self.width())
+            x = max(x, screen.left())
+            y = min(y, screen.bottom() - self.height())
+            y = max(y, screen.top())
+        self.move(int(x), int(y))
+        self.show()
 
 
 class ToggleSwitch(QAbstractButton):
@@ -3518,6 +3681,7 @@ class DraggableTagButton(QPushButton):
     def __init__(self, text: str = "", parent=None) -> None:
         super().__init__(text, parent)
         self._press = None
+        self._full_text = text  # display text may be elided; drag/insert use the full tag
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
@@ -3539,8 +3703,8 @@ class DraggableTagButton(QPushButton):
         self._press = None
         self.setDown(False)  # don't leave the button stuck pressed
         mime = QMimeData()
-        mime.setData(TriggerTextEdit.TRIGGER_MIME, self.text().encode("utf-8"))
-        mime.setText(self.text())
+        mime.setData(TriggerTextEdit.TRIGGER_MIME, self._full_text.encode("utf-8"))
+        mime.setText(self._full_text)
         drag = QDrag(self)
         drag.setMimeData(mime)
         pm = self.grab()
@@ -4361,7 +4525,17 @@ class MainWindow(QMainWindow):
         btn = DraggableTagButton(text)
         btn.setObjectName("PillText")
         btn.setCursor(Qt.PointingHandCursor)
-        btn.setToolTip("Click to insert at the cursor, or drag into the text")
+        # Cap the display width so a long re-used phrase becomes an elided chip with the
+        # full text on hover, instead of stretching the pill (and the whole window) wide.
+        # The full text is retained on the button for click/drag insertion.
+        _MAX = 360
+        _disp = btn.fontMetrics().elidedText(text, Qt.ElideRight, _MAX)
+        btn.setText(_disp)
+        btn.setMaximumWidth(_MAX + 16)
+        if _disp != text:
+            btn.setToolTip(text)  # full phrase on hover
+        else:
+            btn.setToolTip("Click to insert at the cursor, or drag into the text")
         btn.clicked.connect(lambda _c=False, t=text: self._insert_tag(image_ed, t))
         h.addWidget(btn)
         if removable:
@@ -4719,6 +4893,29 @@ class MainWindow(QMainWindow):
         image_ed = self._build_popup_scope(left, "image", "This image", image_initial)
         state = {"idx": start_idx}
 
+        if has_images:
+            dlg_omit = ToggleSwitch()
+            left.addWidget(self._toggle_row(
+                "Use this image's .txt caption", dlg_omit,
+                "Off = caption this image from the image alone, even though convert mode is on. "
+                "Available when convert mode is on and this image has a matching .txt."))
+            self._dlg_omit_toggle = dlg_omit
+
+            def refresh_omit() -> None:
+                img = self.images[state["idx"]]
+                self._dlg_omit_name = img.name
+                on = bool(self._convert_active() and self.store is not None
+                          and self.store.has_source_text(img))
+                dlg_omit.setEnabled(on)
+                dlg_omit.blockSignals(True)
+                dlg_omit.setChecked(on and not self.project.is_convert_omitted(img.name))
+                dlg_omit.blockSignals(False)
+
+            dlg_omit.toggled.connect(
+                lambda checked: self._set_image_omit(self.images[state["idx"]].name, omit=not checked))
+            dlg_convert.toggled.connect(lambda *_: refresh_omit())
+            refresh_omit()
+
         original_folder = folder_initial
         original_per_image = {k: v for k, v in work_per_image.items() if v.strip()}
         original_image = image_initial
@@ -4781,6 +4978,7 @@ class MainWindow(QMainWindow):
                 image_ed._reject_btn.setEnabled(False)
                 image_ed.rescan()
                 refresh_preview()
+                refresh_omit()
 
             prev_btn.clicked.connect(lambda: go(-1))
             next_btn.clicked.connect(lambda: go(1))
@@ -4845,6 +5043,8 @@ class MainWindow(QMainWindow):
 
         folder_ed.setFocus()
         dlg.exec()
+        self._dlg_omit_toggle = None
+        self._dlg_omit_name = None
 
     def _build_guidance_panel(self) -> QWidget:
         w = QWidget()
@@ -4977,6 +5177,11 @@ class MainWindow(QMainWindow):
         self._source_status = QLabel("")
         self._source_status.setObjectName("Hint")
         sc_head.addWidget(self._source_status)
+        self.g_source_use = ToggleSwitch()
+        self.g_source_use.setToolTip(
+            "Use this image's .txt caption. Turn off to caption this image from the image alone.")
+        self.g_source_use.toggled.connect(self._on_source_use_toggled)
+        sc_head.addWidget(self.g_source_use)
         sc_lay.addLayout(sc_head)
         sc_field_row = QWidget()
         sc_field_h = QHBoxLayout(sc_field_row)
@@ -5009,26 +5214,46 @@ class MainWindow(QMainWindow):
         self._used_tags_host = FlowWidget()
         self._used_tags_flow = FlowLayout(self._used_tags_host, 0, 6)
         lay.addWidget(self._used_tags_host)
+        # When the tags get numerous or long enough to crowd the panel, the inline
+        # pills collapse to this purple "View tags" pill whose hover reveals the full
+        # list in a pop-out (keeps the common, few-tags case flat and quick-reference).
+        self._used_tags_collapsed = QLabel("View tags")
+        self._used_tags_collapsed.setObjectName("ViewTagsPill")
+        self._used_tags_collapsed.setStyleSheet(
+            "QLabel#ViewTagsPill { background: rgba(167,139,250,0.16); color: #A78BFA;"
+            " border: 1px solid #A78BFA; border-radius: 10px;"
+            " padding: 3px 10px; font-size: 11px; font-weight: 600; }"
+        )
+        self._used_tags_collapsed.setCursor(Qt.PointingHandCursor)
+        self._used_tags_collapsed.setVisible(False)
+        self._used_tags_collapsed.installEventFilter(self)  # hover -> tag-list pop-out
+        _vt_row = QHBoxLayout()
+        _vt_row.setContentsMargins(0, 0, 0, 0)
+        _vt_row.addWidget(self._used_tags_collapsed)
+        _vt_row.addStretch(1)
+        lay.addLayout(_vt_row)
 
-        # Guidance-changed banner — shown when THIS image's effective guidance has
-        # changed since its caption was generated. Same violet as the filmstrip
-        # flag, with a compact line-diff of what changed since the last run.
+        # Guidance-changed section — shown when THIS image's effective guidance has
+        # changed since its caption was generated. The full color-coded diff would be
+        # variable-length and clip at the bottom of the panel, so it lives in a hover
+        # pop-out (GuidanceDiffPopup); only this compact header + hint stay inline.
         self._gchg_box = QWidget()
         gv = QVBoxLayout(self._gchg_box)
         gv.setContentsMargins(0, 10, 0, 0)
-        gv.setSpacing(4)
+        gv.setSpacing(2)
         self._gchg_head = QLabel("Guidance changed since last caption")
         self._gchg_head.setWordWrap(True)
         self._gchg_head.setStyleSheet(
             f"color: {STALE_COLOR}; font-weight: 600; font-size: 11px;"
         )
-        self._gchg_diff = QLabel()
-        self._gchg_diff.setObjectName("Hint")
-        self._gchg_diff.setWordWrap(True)
-        self._gchg_diff.setTextFormat(Qt.RichText)
+        self._gchg_hint = QLabel("Hover to see what changed")
+        self._gchg_hint.setObjectName("Hint")
+        self._gchg_hint.setWordWrap(True)
         gv.addWidget(self._gchg_head)
-        gv.addWidget(self._gchg_diff)
+        gv.addWidget(self._gchg_hint)
         self._gchg_box.setVisible(False)
+        self._gchg_box.setCursor(Qt.PointingHandCursor)
+        self._gchg_box.installEventFilter(self)  # Enter/Leave -> show/hide the diff pop-out
         lay.addWidget(self._gchg_box)
         lay.addStretch(1)
 
@@ -5150,6 +5375,50 @@ class MainWindow(QMainWindow):
             sw.setChecked(bool(checked))
             sw.blockSignals(False)
         self._refresh_source_caption()
+        self._refresh_omit_markers()  # convert on/off flips every image's omit marker
+
+    def _set_image_omit(self, name: str, omit: bool) -> None:
+        """Per-image override of convert mode. Used by the sidebar, pop-out, and
+        dialog toggles, all kept in sync. The toggles are framed positively ("use
+        this image's .txt"), so checked = not omitted."""
+        if self.store is None or self.project is None:
+            return
+        self.project.set_convert_omit(name, omit)
+        self._guidance_dirty = True
+        self.persist_guidance_if_dirty()
+        self._refresh_source_caption()  # restyles strip + pop-out toggles/text/status
+        self._sync_dialog_omit_toggle(name)
+        path = next((p for p in self.images if p.name == name), None)
+        if path is not None:
+            self._refresh_thumb_marker(path)
+
+    def _sync_dialog_omit_toggle(self, name: str) -> None:
+        tog = getattr(self, "_dlg_omit_toggle", None)
+        if tog is None or getattr(self, "_dlg_omit_name", None) != name:
+            return
+        checked = not self.project.is_convert_omitted(name)
+        if tog.isChecked() != checked:
+            tog.blockSignals(True)
+            tog.setChecked(checked)
+            tog.blockSignals(False)
+
+    def _image_is_omit_marked(self, img: Path) -> bool:
+        """Whether the filmstrip should show the violet omit marker: convert active,
+        the image has a .txt, and the user omitted it."""
+        return bool(self._convert_active() and self.store is not None
+                    and self.store.has_source_text(img)
+                    and self.project.is_convert_omitted(img.name))
+
+    def _refresh_omit_markers(self) -> None:
+        """Update the omit marker on every thumbnail (e.g. when convert toggles)."""
+        items = getattr(self, "_thumb_items", {})
+        for path in self.images:
+            item = items.get(str(path))
+            if item is not None:
+                item.setData(OMIT_ROLE, self._image_is_omit_marked(path))
+        vp = getattr(self, "filmstrip", None)
+        if vp is not None:
+            self.filmstrip.viewport().update()
 
     @staticmethod
     def _tag_used_in(text: str, tag: str) -> bool:
@@ -5173,23 +5442,41 @@ class MainWindow(QMainWindow):
         pill.setFont(QFont(self.settings.mono_font_family or "Monospace"))
         return pill
 
+    # Tags stay inline (flat, quick-reference) until they'd crowd the narrow panel:
+    # more than this many, or any single one this long (a re-used phrase, not a name).
+    _TAGS_INLINE_MAX = 6
+    _TAG_LEN_INLINE_MAX = 22
+
+    def _tags_overflow(self, tags: list[str]) -> bool:
+        return (len(tags) > self._TAGS_INLINE_MAX
+                or any(len(t) > self._TAG_LEN_INLINE_MAX for t in tags))
+
     def _refresh_tags_used(self) -> None:
         if not hasattr(self, "_used_tags_flow"):
             return
-        self._clear_layout(self._used_tags_flow)
         text = self.g_per_image.toPlainText()
         known = list(getattr(self, "_folder_tags", [])) + [
             t for t in self._default_tags if t not in getattr(self, "_folder_tags", [])
         ]
         used = [t for t in known if self._tag_used_in(text, t)]
-        for tag in used:
-            self._used_tags_flow.addWidget(self._make_used_pill(tag))
-        self._used_tags_host.setVisible(bool(used))
-        # adjustSize() collapsed the host to one pill's width (forcing a single
-        # column and a too-short height on re-populate). Invalidate the flow and
-        # let the parent re-query heightForWidth at the real panel width instead.
-        self._used_tags_flow.invalidate()
-        self._used_tags_host.updateGeometry()
+        self._used_tags_used = used
+        self._clear_layout(self._used_tags_flow)
+        if used and self._tags_overflow(used):
+            # collapse to the "View tags" pill; the full list lives in the hover pop-out
+            self._used_tags_host.setVisible(False)
+            self._used_tags_collapsed.setText(f"View tags ({len(used)})  \u2197")
+            self._used_tags_collapsed.setVisible(True)
+        else:
+            self._used_tags_collapsed.setVisible(False)
+            self._hide_tags_popup()
+            for tag in used:
+                self._used_tags_flow.addWidget(self._make_used_pill(tag))
+            self._used_tags_host.setVisible(bool(used))
+            # adjustSize() collapsed the host to one pill's width (forcing a single
+            # column and a too-short height on re-populate). Invalidate the flow and
+            # let the parent re-query heightForWidth at the real panel width instead.
+            self._used_tags_flow.invalidate()
+            self._used_tags_host.updateGeometry()
 
     def _mark_guidance_dirty(self, *args) -> None:
         if not self._loading:
@@ -5267,6 +5554,11 @@ class MainWindow(QMainWindow):
             return
         self._set_convert_mode(checked)
 
+    def _on_source_use_toggled(self, checked: bool) -> None:
+        if self._loading or self.store is None or self.current is None:
+            return
+        self._set_image_omit(self.current.name, omit=not checked)
+
     @staticmethod
     def _elide_middle(text: str, limit: int = 26) -> str:
         if len(text) <= limit:
@@ -5275,21 +5567,41 @@ class MainWindow(QMainWindow):
         head = keep // 2
         return text[:head] + "\u2026" + text[-(keep - head):]
 
+    def _image_uses_source(self, img: Path) -> bool:
+        """True if this image's .txt should be fed to the captioner: convert mode is
+        active, the image has a matching .txt, and the user hasn't omitted it."""
+        return bool(self._convert_active() and self.store is not None
+                    and self.store.has_source_text(img)
+                    and not self.project.is_convert_omitted(img.name))
+
+    def _apply_source_strikethrough(self, field, omitted: bool) -> None:
+        """Strike through the source-caption text when this image is omitted, so the
+        skipped caption reads as struck out."""
+        cur = field.textCursor()
+        cur.select(QTextCursor.Document)
+        fmt = QTextCharFormat()
+        fmt.setFontStrikeOut(bool(omitted))
+        cur.mergeCharFormat(fmt)
+        cur.clearSelection()
+        field.setTextCursor(cur)
+
     def _current_source_caption(self):
-        """(found_text, status_label, status_color, placeholder) for the current image.
-        found_text is "" when there is no .txt. Returns None when convert mode is off
-        or no folder/image is active."""
+        """(found_text, status_label, status_color, placeholder, omitted) for the
+        current image. found_text is "" when there is no .txt. Returns None when
+        convert mode is off or no folder/image is active."""
         if not self._convert_active():
             return None
         if self.store is None or self.current is None:
             return None
         text = self.store.load_source_text(self.current)
         if text:
+            if self.project.is_convert_omitted(self.current.name):
+                return text, "omitted \u00b7 image-only", OMIT_COLOR, "", True
             name = self.store.source_text_path(self.current).name
-            return text, "\u2713 " + self._elide_middle(name), "#3ddc84", ""
+            return text, "\u2713 " + self._elide_middle(name), "#3ddc84", "", False
         warn = getattr(self.theme, "warning", "#E0A33B")
         return ("", "no .txt \u00b7 image-only", warn,
-                "No source caption for this image — the captioner will work from the image alone.")
+                "No source caption for this image — the captioner will work from the image alone.", False)
 
     def _refresh_source_caption(self) -> None:
         box = getattr(self, "_source_caption_box", None)
@@ -5299,16 +5611,39 @@ class MainWindow(QMainWindow):
         box.setVisible(convert_on)
         if not convert_on:
             self._close_source_popout()
+        # the per-image "use this .txt" toggle (only meaningful with a .txt present)
+        tog = getattr(self, "g_source_use", None)
+        if tog is not None:
+            has_txt = bool(convert_on and self.store is not None and self.current is not None
+                           and self.store.has_source_text(self.current))
+            tog.setEnabled(has_txt)
+            tog.blockSignals(True)
+            tog.setChecked(has_txt and not self.project.is_convert_omitted(self.current.name))
+            tog.blockSignals(False)
         info = self._current_source_caption()
         if info is None:
             self.g_source_caption.setPlainText("")
             self._source_status.setText("")
+            self._source_status.setToolTip("")
+            self._apply_source_strikethrough(self.g_source_caption, False)
         else:
-            text, status, color, placeholder = info
+            text, status, color, placeholder, omitted = info
             self.g_source_caption.setPlainText(text)
-            self._source_status.setText(status)
-            self._source_status.setStyleSheet(f"color:{color}; font-size:11px;")
+            # Compact indicator next to the title (the full status would crowd out the
+            # title in this narrow pane): green check = this .txt is used, purple X =
+            # omitted. No glyph when there's no .txt. The full status sits on its tooltip.
+            if omitted:
+                glyph, gcolor = "\u2717", OMIT_COLOR          # ✗ purple
+            elif text:
+                glyph, gcolor = "\u2713", "#3ddc84"           # ✓ green
+            else:
+                glyph, gcolor = "", color
+            self._source_status.setText(glyph)
+            self._source_status.setStyleSheet(
+                f"color:{gcolor}; font-size:13px; font-weight:600;")
+            self._source_status.setToolTip(status)
             self.g_source_caption.setPlaceholderText(placeholder)
+            self._apply_source_strikethrough(self.g_source_caption, omitted)
         self._update_source_popout()
 
     def _open_source_popout(self) -> None:
@@ -5355,6 +5690,16 @@ class MainWindow(QMainWindow):
         status_lab = QLabel()
         status_lab.setAlignment(Qt.AlignCenter)
         v.addWidget(status_lab)
+        use_row = QHBoxLayout()
+        use_lab = QLabel("Use this image's .txt caption")
+        use_lab.setObjectName("Hint")
+        use_tog = ToggleSwitch()
+        use_tog.setToolTip("Off = caption this image from the image alone.")
+        use_tog.toggled.connect(self._on_popout_use_toggled)
+        use_row.addWidget(use_lab)
+        use_row.addStretch(1)
+        use_row.addWidget(use_tog)
+        v.addLayout(use_row)
         text = QPlainTextEdit()
         text.setReadOnly(True)
         text.setObjectName("GuidanceBoxRO")
@@ -5364,7 +5709,7 @@ class MainWindow(QMainWindow):
         buttons.rejected.connect(dlg.reject)
         v.addWidget(buttons)
         dlg._sc_thumb, dlg._sc_name, dlg._sc_status, dlg._sc_text = thumb, name_lab, status_lab, text
-        dlg._sc_prev, dlg._sc_next = prev_btn, next_btn
+        dlg._sc_prev, dlg._sc_next, dlg._sc_use = prev_btn, next_btn, use_tog
         dlg.destroyed.connect(lambda *_: setattr(self, "_source_popout", None))
         self._source_popout = dlg
         self._update_source_popout()
@@ -5399,15 +5744,30 @@ class MainWindow(QMainWindow):
             prev_btn.setEnabled(not locked and pos > 0)
             next_btn.setEnabled(not locked and 0 <= pos < total - 1)
         info = self._current_source_caption()
+        use_tog = getattr(dlg, "_sc_use", None)
+        has_txt = bool(self._convert_active() and self.store is not None and self.current is not None
+                       and self.store.has_source_text(self.current))
+        if use_tog is not None:
+            use_tog.setEnabled(has_txt)
+            use_tog.blockSignals(True)
+            use_tog.setChecked(has_txt and not self.project.is_convert_omitted(self.current.name))
+            use_tog.blockSignals(False)
         if info is None:
             dlg._sc_text.setPlainText("")
             dlg._sc_status.setText("")
+            self._apply_source_strikethrough(dlg._sc_text, False)
         else:
-            text, status, color, placeholder = info
+            text, status, color, placeholder, omitted = info
             dlg._sc_text.setPlainText(text)
             dlg._sc_text.setPlaceholderText(placeholder)
             dlg._sc_status.setText(status)
             dlg._sc_status.setStyleSheet(f"color:{color}; font-size:11px;")
+            self._apply_source_strikethrough(dlg._sc_text, omitted)
+
+    def _on_popout_use_toggled(self, checked: bool) -> None:
+        if self.store is None or self.current is None:
+            return
+        self._set_image_omit(self.current.name, omit=not checked)
 
     def _close_source_popout(self) -> None:
         dlg = getattr(self, "_source_popout", None)
@@ -5852,10 +6212,16 @@ class MainWindow(QMainWindow):
         # Running the image always overwrites the in-editor caption, so no extra
         # confirmation is needed for a single run.
         source_caption = ""
-        if operation == "json_image" and self.project.convert_txt_to_json:
+        if operation == "json_image" and self._image_uses_source(self.current):
             source_caption = self.store.load_source_text(self.current)
         self._job_operation = operation
         self._job_guidance = guidance
+        if operation == "json_image":
+            self._job_guidance_folder = self.project.effective_folder_guidance()
+            self._job_guidance_image = self.project.effective_image_guidance(self.current.name)
+        else:
+            self._job_guidance_folder = ""
+            self._job_guidance_image = ""
         job_settings = self.settings
         if self.project.creative_json is not None:
             job_settings = replace(self.settings, creative_json=self.project.creative_json)
@@ -6232,10 +6598,16 @@ class MainWindow(QMainWindow):
         convert_note = ""
         if self.project.convert_txt_to_json:
             with_txt = sum(1 for img in self.images if self.store.has_source_text(img))
+            omitted = sum(1 for img in self.images
+                          if self.store.has_source_text(img)
+                          and self.project.is_convert_omitted(img.name))
+            using = with_txt - omitted
             convert_note = (
-                f"Convert mode: {with_txt} of {total} image(s) have a matching .txt "
+                f"Convert mode: {using} of {total} image(s) will use a matching .txt "
                 "source caption; the rest fall back to image-only captioning."
             )
+            if omitted:
+                convert_note += f" ({omitted} with a .txt marked image-only.)"
         if already:
             box = QMessageBox(self)
             box.setWindowTitle("Caption all images")
@@ -6290,11 +6662,16 @@ class MainWindow(QMainWindow):
             job_settings = replace(self.settings, creative_json=self.project.creative_json)
         items = [
             (img, self.project.resolved_for(img.name),
-             self.store.load_source_text(img) if self.project.convert_txt_to_json else "")
+             self.store.load_source_text(img) if self._image_uses_source(img) else "")
             for img in work
         ]
         # remember the guidance actually sent, to stamp each caption on completion
         self._batch_guidance = {str(img): g for img, g, _sc in items}
+        # the same, split by scope, so a later change can be attributed folder vs per-image
+        self._batch_guidance_folder = {
+            str(img): self.project.effective_folder_guidance() for img in work}
+        self._batch_guidance_image = {
+            str(img): self.project.effective_image_guidance(img.name) for img in work}
         # health/dup tracking for this run: serialized caption -> first filename seen
         self._batch_caption_hashes = {}
         self._batch_flagged = {}
@@ -6347,7 +6724,11 @@ class MainWindow(QMainWindow):
         guidance = getattr(self, "_batch_guidance", {}).get(
             image_path_str, self.project.resolved_for(path.name)
         )
-        self.project.mark_generated(path.name, guidance)   # persisted at batch end
+        folder_part = getattr(self, "_batch_guidance_folder", {}).get(
+            image_path_str, self.project.effective_folder_guidance())
+        image_part = getattr(self, "_batch_guidance_image", {}).get(
+            image_path_str, self.project.effective_image_guidance(path.name))
+        self.project.mark_generated(path.name, guidance, folder_part, image_part)   # persisted at batch end
         # Tier 0-2 health check: flag corrupt/off-schema captions for review.
         issues = caption_health(caption)
         try:
@@ -6429,7 +6810,10 @@ class MainWindow(QMainWindow):
         # the AI result is now on disk; drop any buffered edits and reload it
         self._pending.pop(str(self.current), None)
         if getattr(self, "_job_operation", "") == "json_image":
-            self.project.mark_generated(self.current.name, getattr(self, "_job_guidance", ""))
+            self.project.mark_generated(
+                self.current.name, getattr(self, "_job_guidance", ""),
+                getattr(self, "_job_guidance_folder", ""),
+                getattr(self, "_job_guidance_image", ""))
             self.project.set_flags(self.current.name, caption_health(caption))
             try:
                 self.store.save_project(self.project)
@@ -6930,11 +7314,15 @@ class MainWindow(QMainWindow):
             item.setData(Qt.UserRole, str(path))
             item.setData(UNSAVED_ROLE, False)
             item.setData(STALE_ROLE, self.project.guidance_changed(path.name))
-            _issues = self.project.caption_issues(path.name)
+            # Re-validate the caption file on disk (catches hand-edits / corruption
+            # since the last run), not just the flags stamped at generation time.
+            _issues = self.store.caption_file_issues(path)
+            self.project.set_flags(path.name, _issues)
             _flagged = self.project.is_review_marked(path.name)
             item.setData(REVIEW_ROLE, bool(_issues))
             item.setData(FLAG_ROLE, _flagged)
-            item.setToolTip(self._thumb_tooltip(_issues, _flagged))
+            item.setData(OMIT_ROLE, self._image_is_omit_marked(path))
+            item.setToolTip("")  # marker meanings now live in the hover-preview banners
             self.filmstrip.addItem(item)
             self._thumb_items[str(path)] = item
             item.setIcon(self._decorated_thumb(path))
@@ -6985,7 +7373,20 @@ class MainWindow(QMainWindow):
     def eventFilter(self, obj, event):
         if event.type() == QEvent.KeyPress and self._maybe_wasd_navigate(event):
             return True
-        if obj is self.filmstrip.viewport():
+        if obj is getattr(self, "_gchg_box", None):
+            et = event.type()
+            if et == QEvent.Enter:
+                self._show_gdiff_popup()
+            elif et in (QEvent.Leave, QEvent.Hide):
+                self._hide_gdiff_popup()
+        if obj is getattr(self, "_used_tags_collapsed", None):
+            et = event.type()
+            if et == QEvent.Enter:
+                self._show_tags_popup()
+            elif et in (QEvent.Leave, QEvent.Hide):
+                self._hide_tags_popup()
+        fs = getattr(self, "filmstrip", None)
+        if fs is not None and obj is fs.viewport():
             et = event.type()
             if et == QEvent.MouseMove:
                 item = self.filmstrip.itemAt(event.position().toPoint())
@@ -7028,7 +7429,7 @@ class MainWindow(QMainWindow):
             idx_text = f"{self.images.index(path) + 1} / {len(self.images)}"
         except ValueError:
             idx_text = ""
-        self._hover_preview.set_content(pm, path.name, idx_text, self._has_unsaved(path))
+        self._hover_preview.set_content(pm, path.name, idx_text, self._thumb_banners(path))
 
         vp = self.filmstrip.viewport()
         rect = self.filmstrip.visualItemRect(item)
@@ -7134,13 +7535,36 @@ class MainWindow(QMainWindow):
         base = self._thumb_base.get(str(path))
         return QIcon(base) if base is not None else QIcon()
 
-    def _thumb_tooltip(self, issues: list[str], flagged: bool) -> str:
-        parts = []
-        if flagged:
-            parts.append("Flagged for review")
+    def _thumb_banners(self, path: Path) -> list[tuple]:
+        """Marker banners for the hover-preview stack, in display order (the two red
+        states on top), each as (text, bg_color, fg_color, tooltip). Colors match the
+        filmstrip dots; the problems banner carries the specific issues on its tooltip."""
+        name = path.name
+        dark = self.theme.surface_0
+        violet = STALE_COLOR  # guidance family (stale + omit share this colour)
+        out: list[tuple] = []
+        if self.project.is_review_marked(name):
+            out.append(("Flagged for review", FLAG_COLOR, "#ffffff", ""))
+        issues = self.project.caption_issues(name)
         if issues:
-            parts.append("Possible problems:\n• " + "\n• ".join(issues))
-        return "\n\n".join(parts)
+            tip = "\u2022 " + "\n\u2022 ".join(issues)
+            out.append(("Caption may have problems", REVIEW_COLOR, "#ffffff", tip))
+        if self._has_unsaved(path):
+            out.append(("Unsaved changes", self.theme.warning, dark, ""))
+        if self.project.guidance_changed(name):
+            folder_ch = self.project.folder_guidance_changed(name)
+            image_ch = self.project.image_guidance_changed(name)
+            if not folder_ch and not image_ch:
+                # caption predates split-stamping — can't attribute the scope
+                out.append(("Guidance changed", violet, dark, ""))
+            else:
+                if folder_ch:
+                    out.append(("Folder guidance changed", violet, dark, ""))
+                if image_ch:
+                    out.append(("This image's guidance changed", violet, dark, ""))
+        if self._image_is_omit_marked(path):
+            out.append((".txt caption omitted", OMIT_COLOR, dark, ""))
+        return out
 
     def _toggle_review_flag(self, *args) -> None:
         if self.store is None or self.current is None:
@@ -7212,7 +7636,8 @@ class MainWindow(QMainWindow):
             flagged = self.project.is_review_marked(path.name)
             item.setData(REVIEW_ROLE, bool(issues))
             item.setData(FLAG_ROLE, flagged)
-            item.setToolTip(self._thumb_tooltip(issues, flagged))
+            item.setData(OMIT_ROLE, self._image_is_omit_marked(path))
+            item.setToolTip("")  # marker meanings now live in the hover-preview banners
             item.setText(self._thumb_label(path))
             item.setIcon(self._decorated_thumb(path))
             if now != was:
@@ -7257,18 +7682,15 @@ class MainWindow(QMainWindow):
         self._refresh_guidance_changes()
 
     def _refresh_guidance_changes(self) -> None:
-        """Show/hide the read-only 'guidance changed' banner for the current image,
-        with a compact diff of what changed since its caption was last generated."""
+        """Show/hide the compact 'guidance changed' section for the current image.
+        The full diff is shown on hover via the pop-out, so nothing to render inline."""
         if not hasattr(self, "_gchg_box"):
             return
         name = self.current.name if self.current is not None else None
-        if name is None or not self.project.guidance_changed(name):
-            self._gchg_box.setVisible(False)
-            return
-        prev = self.project.last_run_guidance(name) or ""
-        curr = self.project.resolved_for(name)
-        self._gchg_diff.setText(self._guidance_diff_html(prev, curr))
-        self._gchg_box.setVisible(True)
+        changed = name is not None and self.project.guidance_changed(name)
+        self._gchg_box.setVisible(changed)
+        if not changed:
+            self._hide_gdiff_popup()
 
     @staticmethod
     def _guidance_diff_html(prev: str, curr: str) -> str:
@@ -7289,6 +7711,61 @@ class MainWindow(QMainWindow):
         if not rows:
             return '<span style="color:#6C737C">Guidance text changed.</span>'
         return "<br>".join(rows)
+
+    def _ensure_gdiff_popup(self) -> "GuidanceDiffPopup":
+        pop = getattr(self, "_gdiff_popup", None)
+        if pop is None:
+            pop = GuidanceDiffPopup(self.theme, None)
+            self._gdiff_popup = pop
+        return pop
+
+    def _show_gdiff_popup(self) -> None:
+        box = getattr(self, "_gchg_box", None)
+        if box is None or box.isHidden() or self.current is None:
+            return
+        name = self.current.name
+        if not self.project.guidance_changed(name):
+            return
+        prev = self.project.last_run_guidance(name) or ""
+        curr = self.project.resolved_for(name)
+        html = self._guidance_diff_html(prev, curr)
+        pop = self._ensure_gdiff_popup()
+        target = box.mapToGlobal(QPoint(box.width(), 0))
+        try:
+            screen = self.screen().availableGeometry()
+        except Exception:
+            screen = None
+        pop.show_diff(html, target, screen)
+
+    def _hide_gdiff_popup(self) -> None:
+        pop = getattr(self, "_gdiff_popup", None)
+        if pop is not None:
+            pop.hide()
+
+    def _ensure_tags_popup(self) -> "TagListPopup":
+        pop = getattr(self, "_tags_popup", None)
+        if pop is None:
+            pop = TagListPopup(self.theme, None)
+            self._tags_popup = pop
+        return pop
+
+    def _show_tags_popup(self) -> None:
+        pill = getattr(self, "_used_tags_collapsed", None)
+        used = getattr(self, "_used_tags_used", [])
+        if pill is None or pill.isHidden() or not used:
+            return
+        pop = self._ensure_tags_popup()
+        target = pill.mapToGlobal(QPoint(pill.width(), 0))
+        try:
+            screen = self.screen().availableGeometry()
+        except Exception:
+            screen = None
+        pop.show_tags(self._make_used_pill, used, target, screen)
+
+    def _hide_tags_popup(self) -> None:
+        pop = getattr(self, "_tags_popup", None)
+        if pop is not None:
+            pop.hide()
 
     def _repaint_thumb(self, key: str) -> None:
         item = self._thumb_items.get(key)
@@ -7351,6 +7828,10 @@ class MainWindow(QMainWindow):
             self._select_box_for_element(self.selected_element_index)
         # buffered images carry unsaved edits; freshly-loaded ones are clean
         self._dirty = pending
+        # On-disk loads: re-validate the file so an external edit/corruption updates the
+        # review marker (buffered edits are validated when generated/saved instead).
+        if not pending:
+            self.project.set_flags(path.name, self.store.caption_file_issues(path))
         self._refresh_thumb_marker(path)
         self._refresh_json_view()
         if message:
