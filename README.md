@@ -132,6 +132,18 @@ or equivalently:
 python run_captioner.py
 ```
 
+**venv convenience launchers:** `run_captioner_venv.sh` (Linux / macOS) and
+`run_captioner_venv.bat` (Windows) need no activation — on first run they create a
+local `.venv`, install the requirements, and start the app; every run after that
+launches straight away (the same auto-launcher described in *Quickest start* above):
+
+```bash
+chmod +x run_captioner_venv.sh   # once
+./run_captioner_venv.sh
+```
+
+On Windows, double-click `run_captioner_venv.bat` (or run it from a terminal).
+
 **conda convenience launchers:** `run_captioner_conda.sh` (Linux / macOS) and
 `run_captioner_conda.bat` (Windows) activate the `id4caption` environment for
 you, then start the app:
