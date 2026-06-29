@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import mimetypes
 import os
+import platform
 import re
+import shutil
+import signal
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.request
+import zipfile
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -55,6 +62,8 @@ class ModelProfile:
     mmproj_filename: str = ""
     local_model_path: str = ""
     local_mmproj_path: str = ""
+    vram_gb: float = 0.0          # approx VRAM needed at default context (0 = unknown)
+    note: str = ""                # optional one-line annotation shown in the picker
 
 
 @dataclass(frozen=True)
@@ -93,6 +102,13 @@ def default_models_dir() -> Path:
     return app_base_dir() / "models"
 
 
+def default_llama_dir() -> Path:
+    """Stable home for the managed llama.cpp binary. Deliberately independent of
+    the models dir: the user can relocate large model files to another drive, but
+    the small server binary stays put so discovery and teardown keep working."""
+    return app_base_dir() / "llama"
+
+
 def default_settings_path() -> Path:
     return app_base_dir() / "captioner_settings.json"
 
@@ -110,89 +126,775 @@ def default_prompts_path() -> Path:
 
 
 def find_llama_server() -> Path | None:
-    candidates: list[Path] = []
-    base = app_base_dir()
+    """Locate a llama-server binary the app can launch, in priority order:
+    app-relative install spots, the dedicated managed llama dir (where downloaded
+    builds land), then anything on the system PATH. Returns None if nothing fits."""
     executable = "llama-server.exe" if os.name == "nt" else "llama-server"
-    candidates.extend(
-        [
-            base / executable,
-            base / "tools" / executable,
-            base / "llama.cpp" / executable,
-            base / "llama.cpp" / "build" / "bin" / executable,
-            base / "llama.cpp-cuda" / executable,
-        ]
-    )
+    # a binary we downloaded/installed (recorded in installed.json) wins
+    record = read_installed_llama()
+    if record and record.binary:
+        recorded = Path(record.binary)
+        if recorded.exists():
+            return recorded
+    base = app_base_dir()
+    llama = default_llama_dir()
+    candidates: list[Path] = [
+        base / executable,
+        base / "tools" / executable,
+        base / "llama.cpp" / executable,
+        base / "llama.cpp" / "build" / "bin" / executable,
+        base / "llama.cpp-cuda" / executable,
+        # dedicated managed location (downloaded prebuilts unpack here)
+        llama / executable,
+        llama / "bin" / executable,
+    ]
     for candidate in candidates:
         if candidate.exists():
             return candidate
+    # finally, fall back to the system PATH (e.g. a user-installed llama-server)
+    on_path = shutil.which(executable)
+    if on_path:
+        return Path(on_path)
     return None
+
+
+@dataclass(frozen=True)
+class GpuInfo:
+    """Best-effort GPU description used to pick a llama.cpp backend/asset.
+
+    `vendor`/`name`/`sm` are whatever detection could read off the machine — never
+    hardcoded — and `backend` is the recommended default ('cuda'|'vulkan'|'cpu').
+    """
+    vendor: str = "none"          # "nvidia" | "none"
+    name: str = ""                # e.g. "NVIDIA GeForce RTX 5090" (as reported)
+    compute_cap: str = ""         # e.g. "12.0" (NVIDIA only)
+    sm: str = ""                  # e.g. "120" (NVIDIA only)
+    backend: str = "vulkan"       # recommended backend
+    vram_total_gb: float | None = None   # total VRAM in GB (NVIDIA only)
+
+    @property
+    def summary(self) -> str:
+        if self.vendor == "nvidia" and self.name:
+            bits = []
+            if self.sm:
+                bits.append(f"sm{self.sm}")
+            if self.vram_total_gb:
+                bits.append(f"{self.vram_total_gb:.0f}GB")
+            paren = f" ({', '.join(bits)})" if bits else ""
+            return f"{self.name}{paren} \u2192 CUDA"
+        if self.vendor == "nvidia":
+            return "NVIDIA GPU \u2192 CUDA"
+        return f"No NVIDIA GPU detected \u2192 {self.backend.upper()}"
+
+
+def _sm_from_compute_cap(compute_cap: str) -> str:
+    """'12.0' -> '120', '8.6' -> '86'. Empty string if it doesn't parse."""
+    match = re.match(r"\s*(\d+)\.(\d+)\s*$", compute_cap)
+    if not match:
+        return ""
+    return str(int(match.group(1)) * 10 + int(match.group(2)))
+
+
+def detect_gpu() -> GpuInfo:
+    """Probe the machine for a GPU. Never raises.
+
+    NVIDIA is detected via nvidia-smi (giving us the exact compute capability we
+    need to match a CUDA build). Anything else falls back to a Vulkan
+    recommendation — broad GPU support — with CPU left as a manual override.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,compute_cap,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            first = result.stdout.strip().splitlines()[0]
+            parts = [p.strip() for p in first.split(",")]
+            name = parts[0] if parts else ""
+            compute_cap = parts[1] if len(parts) > 1 else ""
+            vram_gb = None
+            if len(parts) > 2:
+                try:
+                    vram_gb = round(float(parts[2]) / 1024.0, 1)
+                except ValueError:
+                    vram_gb = None
+            return GpuInfo(
+                vendor="nvidia",
+                name=name,
+                compute_cap=compute_cap,
+                sm=_sm_from_compute_cap(compute_cap),
+                backend="cuda",
+                vram_total_gb=vram_gb,
+            )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    # No NVIDIA GPU found (or no nvidia-smi): Vulkan covers most other hardware.
+    return GpuInfo(vendor="none", backend="vulkan")
+
+
+# ---- lightweight resource monitor (RAM always; VRAM/GPU% on NVIDIA) -----------
+
+@dataclass
+class ResourceSample:
+    ram_percent: float | None = None
+    ram_used_gb: float | None = None
+    ram_total_gb: float | None = None
+    vram_used_gb: float | None = None
+    vram_total_gb: float | None = None
+    gpu_percent: float | None = None
+
+
+def _read_ram() -> tuple[float | None, float | None]:
+    """(used_gb, total_gb) without a third-party dependency. Linux reads
+    /proc/meminfo; Windows uses GlobalMemoryStatusEx. Anything else -> (None, None)."""
+    try:
+        if sys.platform.startswith("linux"):
+            info = {}
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                key, _, rest = line.partition(":")
+                info[key.strip()] = rest.strip().split()[0] if rest.strip() else "0"
+            total_kb = float(info["MemTotal"])
+            avail_kb = float(info.get("MemAvailable", info.get("MemFree", "0")))
+            gb = 1024.0 * 1024.0
+            return (total_kb - avail_kb) / gb, total_kb / gb
+        if os.name == "nt":
+            import ctypes
+
+            class _MemStatus(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = _MemStatus()
+            stat.dwLength = ctypes.sizeof(_MemStatus)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            gb = 1000.0 ** 3
+            return (stat.ullTotalPhys - stat.ullAvailPhys) / gb, stat.ullTotalPhys / gb
+    except Exception:
+        return None, None
+    return None, None
+
+
+def _parse_gpu_usage(text: str) -> tuple[float | None, float | None, float | None]:
+    """Parse one CSV row of `memory.used,memory.total,utilization.gpu` (in MiB, MiB,
+    %) into (vram_used_gb, vram_total_gb, gpu_percent)."""
+    try:
+        row = text.strip().splitlines()[0]
+        used_mb, total_mb, util = [p.strip() for p in row.split(",")]
+        return float(used_mb) / 1024.0, float(total_mb) / 1024.0, float(util)
+    except (ValueError, IndexError):
+        return None, None, None
+
+
+def _read_gpu_usage() -> tuple[float | None, float | None, float | None]:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=memory.used,memory.total,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return _parse_gpu_usage(result.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None, None, None
+
+
+def sample_resources() -> ResourceSample:
+    used, total = _read_ram()
+    percent = (used / total * 100.0) if (used is not None and total) else None
+    vram_used, vram_total, gpu_pct = _read_gpu_usage()
+    return ResourceSample(
+        ram_percent=percent, ram_used_gb=used, ram_total_gb=total,
+        vram_used_gb=vram_used, vram_total_gb=vram_total, gpu_percent=gpu_pct,
+    )
+
+
+def format_resources(sample: ResourceSample) -> str:
+    """Compact one-line readout, omitting any part we couldn't measure."""
+    parts = []
+    if sample.ram_percent is not None:
+        parts.append(f"RAM {sample.ram_percent:.0f}%")
+    if sample.vram_used_gb is not None and sample.vram_total_gb:
+        parts.append(f"VRAM {sample.vram_used_gb:.1f}/{sample.vram_total_gb:.0f} GB")
+    if sample.gpu_percent is not None:
+        parts.append(f"GPU {sample.gpu_percent:.0f}%")
+    return "  \u00b7  ".join(parts)
+
+
+# ---- managed llama.cpp binary: version model + asset resolution ---------------
+
+# Default/floor build baked into the app. llama.cpp releases continuously (a new
+# build every few hours), so a freshly-pinned number goes "stale" almost
+# immediately — the update flag means "a newer build exists", not "you're behind".
+PINNED_LLAMA_BUILD = 9828
+
+# Where each backend's prebuilt binaries come from. Official llama.cpp ships
+# Windows (CUDA/Vulkan/CPU), macOS (Metal) and Linux (Vulkan/CPU) — but NOT Linux
+# CUDA, which comes from a community builder.
+LLAMA_REPO_OFFICIAL = "ggml-org/llama.cpp"
+LLAMA_REPO_LINUX_CUDA = "keypaa/llamaup"
+
+
+def llama_repo_for(system: str, backend: str) -> str:
+    if system.lower().startswith("linux") and backend == "cuda":
+        return LLAMA_REPO_LINUX_CUDA
+    return LLAMA_REPO_OFFICIAL
+
+
+def current_platform() -> tuple[str, str]:
+    """(system, arch) normalised to the tokens release assets use."""
+    system = platform.system()  # 'Windows' | 'Linux' | 'Darwin'
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64", "x64"):
+        arch = "x64"
+    elif machine in ("arm64", "aarch64"):
+        arch = "arm64"
+    else:
+        arch = machine
+    return system, arch
+
+
+def parse_build_number(text: str) -> int | None:
+    """Pull the bNNNN build number out of a tag or asset name."""
+    match = re.search(r"b(\d{3,})", text or "")
+    return int(match.group(1)) if match else None
+
+
+def is_update_available(installed_build: int | None, latest_build: int | None) -> bool:
+    if installed_build is None or latest_build is None:
+        return False
+    return latest_build > installed_build
+
+
+def _asset_name(asset) -> str:
+    name = asset.get("name") if isinstance(asset, dict) else getattr(asset, "name", "")
+    return (name or "").lower()
+
+
+def _highest_cuda(candidates: list) -> object | None:
+    """Pick the asset with the newest CUDA version token (newest works on the
+    widest range of GPUs, including the latest architectures)."""
+    best = None
+    best_ver = (-1, -1)
+    for asset in candidates:
+        match = re.search(r"cuda-?(\d+)\.(\d+)", _asset_name(asset))
+        ver = (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+        if ver > best_ver:
+            best_ver = ver
+            best = asset
+    return best
+
+
+def select_llama_assets(assets: list, *, system: str, arch: str, backend: str, sm: str = "") -> tuple:
+    """From a release's asset list, choose the binary (and any runtime companion)
+    for this platform/backend. Token-matched against the live names so it survives
+    filename drift. Returns a tuple of matching assets, or () if nothing fits."""
+    arch = arch.lower()
+    sysl = system.lower()
+
+    def hit(*needles, exclude=()):
+        out = []
+        for asset in assets:
+            n = _asset_name(asset)
+            if all(x in n for x in needles) and not any(x in n for x in exclude):
+                out.append(asset)
+        return out
+
+    if sysl.startswith("win"):
+        if backend == "cuda":
+            main = _highest_cuda(hit("win", "cuda", arch, ".zip", exclude=("cudart",)))
+            runtime = _highest_cuda(hit("cudart", "win", "cuda", arch, ".zip"))
+            return tuple(a for a in (main, runtime) if a is not None)
+        if backend == "vulkan":
+            found = hit("win", "vulkan", arch, ".zip")
+            return (found[0],) if found else ()
+        found = hit("win", "cpu", arch, ".zip") or hit(
+            "win", arch, ".zip", exclude=("cuda", "vulkan", "hip", "cudart")
+        )
+        return (found[0],) if found else ()
+
+    if sysl.startswith("darwin") or sysl == "macos":
+        found = hit("macos", arch, ".tar.gz")
+        return (found[0],) if found else ()
+
+    # Linux
+    if backend == "cuda" and sm:
+        found = hit("linux", "cuda", f"sm{sm}", arch, ".tar.gz")
+        return (found[0],) if found else ()
+    found = hit("ubuntu", arch, ".tar.gz")  # official Vulkan/CPU build
+    return (found[0],) if found else ()
+
+
+@dataclass
+class InstalledLlama:
+    """What's actually on disk in the managed llama dir (installed.json)."""
+    source: str = ""        # repo the binary came from
+    build: int = 0          # bNNNN as int
+    backend: str = ""       # cuda | vulkan | cpu | metal
+    sm: str = ""            # GPU sm it was matched for (cuda only)
+    asset: str = ""         # primary asset filename
+    sha256: str = ""        # verified digest of the primary asset
+    binary: str = ""        # path to the llama-server executable
+    published_at: str = ""  # release date of the build we installed (ISO)
+    installed_at: str = ""  # when we installed it (ISO)
+
+
+# A build older than this many days earns a gentle "update recommended". Age, not
+# build count, is the meaningful unit: llama.cpp ships ~6 builds/day, so a build
+# delta is noise, but "your binary is a month old" is a real signal.
+LLAMA_UPDATE_RECOMMENDED_DAYS = 30
+
+# llama.cpp errors loudly when a model needs a newer build than you have; this is
+# the strongest update signal (it blocks work), so we watch for it on job failures.
+_ARCH_ERROR_MARKERS = (
+    "unknown model architecture",
+    "unsupported model architecture",
+    "unknown architecture",
+    "unsupported architecture",
+)
+
+
+def is_model_arch_error(message: str) -> bool:
+    text = (message or "").lower()
+    return any(marker in text for marker in _ARCH_ERROR_MARKERS)
+
+
+def _parse_iso(timestamp: str) -> datetime | None:
+    if not timestamp:
+        return None
+    cleaned = timestamp.strip().replace("Z", "+00:00")
+    for candidate in (cleaned, cleaned[:10]):
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    return None
+
+
+def build_age_days(record: InstalledLlama | None, now: datetime | None = None) -> int | None:
+    if record is None:
+        return None
+    when = _parse_iso(record.published_at)
+    if when is None:
+        return None
+    now = now or datetime.now(timezone.utc)
+    return max(0, (now - when).days)
+
+
+def update_state(installed: InstalledLlama | None, latest_build: int | None,
+                 now: datetime | None = None) -> dict:
+    """Classify the managed binary: 'none' (not installed), 'up_to_date',
+    'available' (a newer build exists — informational), or 'recommended' (old
+    enough to nudge). Age drives 'recommended' even if 'latest' can't be fetched."""
+    if installed is None:
+        return {"state": "none", "age_days": None, "installed_build": None, "latest_build": latest_build}
+    age = build_age_days(installed, now=now)
+    newer = is_update_available(installed.build, latest_build)
+    if age is not None and age >= LLAMA_UPDATE_RECOMMENDED_DAYS:
+        state = "recommended"
+    elif newer:
+        state = "available"
+    else:
+        state = "up_to_date"
+    return {"state": state, "age_days": age, "installed_build": installed.build, "latest_build": latest_build}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def installed_record_path() -> Path:
+    return default_llama_dir() / "installed.json"
+
+
+def read_installed_llama() -> InstalledLlama | None:
+    path = installed_record_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    valid = {f.name for f in fields(InstalledLlama)}
+    return InstalledLlama(**{k: v for k, v in data.items() if k in valid})
+
+
+def write_installed_llama(record: InstalledLlama) -> Path:
+    path = installed_record_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(asdict(record), indent=2), encoding="utf-8")
+    return path
+
+
+# ---- release fetch + download/verify/unpack/swap ------------------------------
+
+GITHUB_API = "https://api.github.com"
+
+
+@dataclass(frozen=True)
+class ReleaseAsset:
+    name: str
+    url: str
+    sha256: str = ""   # from the asset's API digest, when present
+    size: int = 0
+
+
+@dataclass(frozen=True)
+class ReleaseInfo:
+    repo: str
+    tag: str
+    build: int | None
+    published_at: str
+    assets: tuple
+
+
+def _github_get(url: str, timeout: float = 10.0):
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "ideogram-captioner"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def fetch_release(repo: str, tag: str | None = None, timeout: float = 10.0) -> ReleaseInfo | None:
+    """Metadata-only fetch of a release (a pinned tag, or latest). Best-effort:
+    any failure returns None so callers stay silent rather than erroring."""
+    suffix = f"tags/{tag}" if tag else "latest"
+    try:
+        data = _github_get(f"{GITHUB_API}/repos/{repo}/releases/{suffix}", timeout=timeout)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    assets = []
+    for asset in data.get("assets", []) or []:
+        if not isinstance(asset, dict):
+            continue
+        digest = asset.get("digest") or ""
+        sha = digest.split(":", 1)[1] if isinstance(digest, str) and digest.startswith("sha256:") else ""
+        assets.append(ReleaseAsset(
+            name=asset.get("name", "") or "",
+            url=asset.get("browser_download_url", "") or "",
+            sha256=sha,
+            size=int(asset.get("size", 0) or 0),
+        ))
+    tag_name = data.get("tag_name", "") or ""
+    return ReleaseInfo(
+        repo=repo,
+        tag=tag_name,
+        build=parse_build_number(tag_name),
+        published_at=data.get("published_at", "") or "",
+        assets=tuple(assets),
+    )
+
+
+def verify_sha256(path: Path, expected_hex: str) -> bool:
+    if not expected_hex:
+        return False
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest().lower() == expected_hex.strip().lower()
+
+
+def download_file(url: str, dest: Path, progress: ProgressCallback | None = None, timeout: float = 120.0) -> Path:
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    request = urllib.request.Request(url, headers={"User-Agent": "ideogram-captioner"})
+    with urllib.request.urlopen(request, timeout=timeout) as response, open(dest, "wb") as out:
+        total = int(response.headers.get("Content-Length", 0) or 0)
+        done = 0
+        while True:
+            chunk = response.read(1 << 20)
+            if not chunk:
+                break
+            out.write(chunk)
+            done += len(chunk)
+            if progress and total:
+                progress(f"Downloading {dest.name}\u2026 {done * 100 // total}%")
+    return dest
+
+
+def _is_within(base: Path, target: Path) -> bool:
+    try:
+        target.resolve().relative_to(base.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def extract_archive(archive_path: Path, dest_dir: Path) -> None:
+    """Extract a .zip or .tar.gz into dest_dir, refusing entries that would
+    escape it (path-traversal guard) even though the source is a trusted release."""
+    archive_path = Path(archive_path)
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    name = archive_path.name.lower()
+    if name.endswith(".zip"):
+        with zipfile.ZipFile(archive_path) as zf:
+            for member in zf.namelist():
+                if not _is_within(dest_dir, dest_dir / member):
+                    raise AutoCaptionError(f"Unsafe path in archive: {member}")
+            zf.extractall(dest_dir)
+    elif name.endswith(".tar.gz") or name.endswith(".tgz"):
+        with tarfile.open(archive_path, "r:gz") as tf:
+            for member in tf.getmembers():
+                if not _is_within(dest_dir, dest_dir / member.name):
+                    raise AutoCaptionError(f"Unsafe path in archive: {member.name}")
+            try:
+                tf.extractall(dest_dir, filter="data")   # py3.12+: strips unsafe metadata
+            except TypeError:
+                tf.extractall(dest_dir)                   # py3.10/3.11: manual guard above
+    else:
+        raise AutoCaptionError(f"Unsupported archive type: {archive_path.name}")
+
+
+def find_server_in_dir(dirpath: Path) -> Path | None:
+    executable = "llama-server.exe" if os.name == "nt" else "llama-server"
+    for found in Path(dirpath).rglob(executable):
+        return found
+    return None
+
+
+def _managed_llama_paths() -> tuple[Path, Path, Path, Path]:
+    base = default_llama_dir()
+    return base, base / "bin", base / ".staging", base / ".backup"
+
+
+def install_llama_release(
+    release: ReleaseInfo,
+    assets: tuple,
+    *,
+    backend: str,
+    sm: str = "",
+    progress: ProgressCallback | None = None,
+    downloader: Callable[..., Path] = download_file,
+) -> InstalledLlama:
+    """Download + verify + unpack the chosen assets, then swap them into place
+    keeping the previous binary in .backup for rollback. The current binary is
+    only touched after every download has verified, so a failure never clobbers
+    a working install."""
+    if not assets:
+        raise AutoCaptionError("No matching llama.cpp asset to install.")
+    base, bindir, staging, backup = _managed_llama_paths()
+    shutil.rmtree(staging, ignore_errors=True)
+    extracted = staging / "extract"
+    extracted.mkdir(parents=True, exist_ok=True)
+
+    for asset in assets:
+        archive = staging / asset.name
+        if progress:
+            progress(f"Downloading {asset.name}\u2026")
+        downloader(asset.url, archive, progress=progress)
+        if asset.sha256:
+            if progress:
+                progress(f"Verifying {asset.name}\u2026")
+            if not verify_sha256(archive, asset.sha256):
+                shutil.rmtree(staging, ignore_errors=True)
+                raise AutoCaptionError(f"Checksum mismatch for {asset.name}; install aborted.")
+        extract_archive(archive, extracted)
+
+    server = find_server_in_dir(extracted)
+    if server is None:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise AutoCaptionError("Downloaded archive did not contain llama-server.")
+
+    # Swap: back up the current bin (single backup kept for rollback), move the new
+    # tree into place. Done only after downloads verified, so it can't half-clobber.
+    if bindir.exists():
+        shutil.rmtree(backup, ignore_errors=True)
+        shutil.move(str(bindir), str(backup))
+    shutil.move(str(extracted), str(bindir))
+    final_server = find_server_in_dir(bindir)
+    if final_server is None:
+        raise AutoCaptionError("llama-server vanished during install.")
+    try:
+        os.chmod(final_server, 0o755)
+    except OSError:
+        pass
+
+    record = InstalledLlama(
+        source=release.repo,
+        build=release.build or 0,
+        backend=backend,
+        sm=sm or "",
+        asset=assets[0].name,
+        sha256=assets[0].sha256,
+        binary=str(final_server),
+        published_at=release.published_at,
+        installed_at=_now_iso(),
+    )
+    write_installed_llama(record)
+    shutil.rmtree(staging, ignore_errors=True)
+    return record
+
+
+def has_llama_backup() -> bool:
+    _base, _bindir, _staging, backup = _managed_llama_paths()
+    return backup.exists() and find_server_in_dir(backup) is not None
+
+
+def rollback_llama() -> bool:
+    """Restore the previous binary from .backup (used when a fresh install fails
+    its first launch). Returns True if a backup was restored."""
+    base, bindir, staging, backup = _managed_llama_paths()
+    if not (backup.exists() and find_server_in_dir(backup) is not None):
+        return False
+    shutil.rmtree(bindir, ignore_errors=True)
+    shutil.move(str(backup), str(bindir))
+    server = find_server_in_dir(bindir)
+    if server is not None:
+        existing = read_installed_llama()
+        if existing is not None:
+            existing.binary = str(server)
+            write_installed_llama(existing)
+    return True
+
+
+@dataclass(frozen=True)
+class LlamaPlan:
+    release: ReleaseInfo
+    assets: tuple
+    backend: str
+    sm: str
+    gpu: GpuInfo
+    system: str
+    arch: str
+    repo: str
+
+    @property
+    def total_size(self) -> int:
+        return sum(getattr(a, "size", 0) for a in self.assets)
+
+    @property
+    def description(self) -> str:
+        size_mb = self.total_size / (1024 * 1024) if self.total_size else 0
+        size = f"~{size_mb:.0f} MB " if size_mb else ""
+        who = self.gpu.name if (self.gpu.vendor == "nvidia" and self.gpu.name) else "your system"
+        build = f"b{self.release.build}" if self.release.build else (self.release.tag or "latest")
+        return f"{size}{self.backend.upper()} build ({build}) for {who}"
+
+
+def resolve_backend(settings, gpu: GpuInfo) -> str:
+    hint = (getattr(settings, "llama_backend_hint", "auto") or "auto").lower()
+    if hint in ("cuda", "vulkan", "cpu"):
+        return hint
+    return gpu.backend
+
+
+def plan_llama_acquisition(settings, *, latest: bool = False, fetch=None):
+    """Detect GPU, choose a backend + source repo, fetch a release (the pinned
+    build, or the latest), and resolve matching assets. Returns None when offline
+    or when no prebuilt fits this platform (caller falls back to manual/build)."""
+    fetch = fetch or fetch_release
+    gpu = detect_gpu()
+    system, arch = current_platform()
+    backend = resolve_backend(settings, gpu)
+    repo = llama_repo_for(system, backend)
+    release = None
+    if not latest:
+        release = fetch(repo, f"b{PINNED_LLAMA_BUILD}")
+    if release is None:
+        release = fetch(repo, None)   # latest — also the pinned-not-found fallback
+    if release is None:
+        return None
+    sm = gpu.sm if backend == "cuda" else ""
+    assets = select_llama_assets(release.assets, system=system, arch=arch, backend=backend, sm=sm)
+    if not assets:
+        return None
+    return LlamaPlan(release=release, assets=assets, backend=backend, sm=sm,
+                     gpu=gpu, system=system, arch=arch, repo=repo)
 
 
 DEFAULT_PROFILE_DATA: dict[str, Any] = {
     "profiles": [
         {
-            "id": "llmfan46-gemma4-31b-qat-heretic-q4_0",
-            "label": "Download: Gemma 4 31B IT QAT Uncensored Heretic Q4_0 (18GB)",
-            "tasks": ["caption", "bbox"],
-            "kind": "hf",
-            "api_model": "gemma4-31b-heretic",
-            "hf_repo": "llmfan46/gemma-4-31B-it-qat-q4_0-uncensored-heretic-GGUF",
-            "model_filename": "gemma-4-31B-it-qat-Q4_0.gguf",
-            "mmproj_filename": "gemma-4-31B-it-uncensored-heretic-BF16.gguf",
-        },
-        {
-            "id": "llmfan46-gemma4-12b-qat-heretic-q4_0",
-            "label": "Download: Gemma 4 12B IT QAT Uncensored Heretic Q4_0 (8GB)",
-            "tasks": ["caption", "bbox"],
-            "kind": "hf",
-            "api_model": "gemma4-12b-heretic",
-            "hf_repo": "llmfan46/gemma-4-12B-it-qat-q4_0-uncensored-heretic-GGUF",
-            "model_filename": "gemma-4-12B-it-qat-q4_0-uncensored-heretic-Q4_0.gguf",
-            "mmproj_filename": "gemma-4-12B-it-qat-q4_0-uncensored-heretic-mmproj-BF16.gguf",
-        },
-        {
-            "id": "unsloth-qwen25vl-7b-q4",
-            "label": "Download: Qwen2.5-VL 7B Q4 (recommended)",
-            "tasks": ["caption", "bbox"],
-            "kind": "hf",
-            "api_model": "qwen25vl",
-            "hf_repo": "unsloth/Qwen2.5-VL-7B-Instruct-GGUF",
-            "model_filename": "Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf",
-            "mmproj_filename": "mmproj-BF16.gguf",
-        },
-        {
             "id": "unsloth-qwen3vl-30b-q4",
-            "label": "Download: Unsloth Qwen3-VL 30B Q4",
+            "label": "Download: Unsloth Qwen3-VL 30B-A3B Q4 (recommended, ~20GB)",
             "tasks": ["caption", "bbox"],
             "kind": "hf",
             "api_model": "unsloth-qwen3vl-30b",
             "hf_repo": "unsloth/Qwen3-VL-30B-A3B-Instruct-GGUF",
             "model_filename": "Qwen3-VL-30B-A3B-Instruct-UD-Q4_K_XL.gguf",
             "mmproj_filename": "mmproj-BF16.gguf",
+            "vram_gb": 20,
+        },
+        {
+            "id": "unsloth-qwen3vl-8b-q4",
+            "label": "Download: Qwen3-VL 8B Q4 \u2014 Ideogram 4 text encoder (~8GB)",
+            "tasks": ["caption", "bbox"],
+            "kind": "hf",
+            "api_model": "unsloth-qwen3vl-8b",
+            "hf_repo": "unsloth/Qwen3-VL-8B-Instruct-GGUF",
+            "model_filename": "Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf",
+            "mmproj_filename": "mmproj-F16.gguf",
+            "vram_gb": 8,
+            "note": "Ideogram 4 uses Qwen3-VL-8B as its text encoder. This is a 'native' model choice, however higher parameter models from Qwen or Gemma may result in better captioning accuracy.",
+        },
+        {
+            "id": "llmfan46-gemma4-31b-qat-heretic-q4_0",
+            "label": "Download: Gemma 4 31B IT QAT Uncensored Heretic Q4_0 (~22GB)",
+            "tasks": ["caption", "bbox"],
+            "kind": "hf",
+            "api_model": "gemma4-31b-heretic",
+            "hf_repo": "llmfan46/gemma-4-31B-it-qat-q4_0-uncensored-heretic-GGUF",
+            "model_filename": "gemma-4-31B-it-qat-Q4_0.gguf",
+            "mmproj_filename": "gemma-4-31B-it-uncensored-heretic-BF16.gguf",
+            "vram_gb": 22,
+        },
+        {
+            "id": "llmfan46-gemma4-12b-qat-heretic-q4_0",
+            "label": "Download: Gemma 4 12B IT QAT Uncensored Heretic Q4_0 (~11GB)",
+            "tasks": ["caption", "bbox"],
+            "kind": "hf",
+            "api_model": "gemma4-12b-heretic",
+            "hf_repo": "llmfan46/gemma-4-12B-it-qat-q4_0-uncensored-heretic-GGUF",
+            "model_filename": "gemma-4-12B-it-qat-q4_0-uncensored-heretic-Q4_0.gguf",
+            "mmproj_filename": "gemma-4-12B-it-qat-q4_0-uncensored-heretic-mmproj-BF16.gguf",
+            "vram_gb": 11,
         },
         {
             "id": "hauhaucs-qwen35-9b-aggressive-q6k",
-            "label": "Download: Qwen3.5-9B Uncensored HauhauCS Aggressive Q6_K (7GB)",
+            "label": "Download: Qwen3.5-9B Uncensored HauhauCS Aggressive Q6_K (~10GB)",
             "tasks": ["caption", "bbox"],
             "kind": "hf",
             "api_model": "hauhaucs-qwen35-9b",
             "hf_repo": "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive",
             "model_filename": "Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q6_K.gguf",
             "mmproj_filename": "mmproj-Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-BF16.gguf",
+            "vram_gb": 10,
         },
         {
             "id": "hauhaucs-gemma4-26b-balanced-q4km",
-            "label": "Download: Gemma4-26B A4B Uncensored HauhauCS-Balanced Q4_K_M (17GB)",
+            "label": "Download: Gemma4-26B A4B Uncensored HauhauCS-Balanced Q4_K_M (~20GB)",
             "tasks": ["caption", "bbox"],
             "kind": "hf",
             "api_model": "gemma4-26b-balanced",
             "hf_repo": "HauhauCS/Gemma4-26B-A4B-Uncensored-HauhauCS-Balanced",
             "model_filename": "Gemma4-26B-A4B-Uncensored-HauhauCS-Balanced-Q4_K_M.gguf",
             "mmproj_filename": "mmproj-Gemma4-26B-A4B-Uncensored-HauhauCS-Balanced-f16.gguf",
+            "vram_gb": 20,
         },
         {
             "id": "huihui-qwen3vl-30b-abliterated-i1-q4ks",
-            "label": "Download: Huihui Qwen3-VL 30B abliterated i1 Q4_K_S (17GB)",
+            "label": "Download: Huihui Qwen3-VL 30B abliterated i1 Q4_K_S (~20GB)",
             "tasks": ["caption", "bbox"],
             "kind": "hf",
             "api_model": "huihui-qwen3vl-30b",
@@ -200,16 +902,18 @@ DEFAULT_PROFILE_DATA: dict[str, Any] = {
             "mmproj_repo": "mradermacher/Huihui-Qwen3-VL-30B-A3B-Instruct-abliterated-GGUF",
             "model_filename": "Huihui-Qwen3-VL-30B-A3B-Instruct-abliterated.i1-Q4_K_S.gguf",
             "mmproj_filename": "Huihui-Qwen3-VL-30B-A3B-Instruct-abliterated.mmproj-f16.gguf",
+            "vram_gb": 20,
         },
         {
             "id": "davidau-qwen36-27b-heretic-q6k",
-            "label": "Download: DavidAU Qwen3.6 27B Heretic Q6_K (22GB)",
+            "label": "Download: DavidAU Qwen3.6 27B Heretic Q6_K (~26GB)",
             "tasks": ["caption", "bbox"],
             "kind": "hf",
             "api_model": "davidau-qwen36-27b-heretic",
             "hf_repo": "DavidAU/Qwen3.6-27B-Heretic-Uncensored-FINETUNE-NEO-CODE-Di-IMatrix-MAX-GGUF",
             "model_filename": "Qwen3.6-27B-NEO-CODE-HERE-2T-OT-Q6_K.gguf",
             "mmproj_filename": "mmproj-F16.gguf",
+            "vram_gb": 26,
         },
         {
             "id": "server-qwen3vl",
@@ -244,6 +948,11 @@ def _profile_from_dict(raw: dict[str, Any]) -> ModelProfile | None:
     if kind not in {"hf", "server", "local"}:
         return None
 
+    try:
+        vram_gb = float(raw.get("vram_gb", 0) or 0)
+    except (TypeError, ValueError):
+        vram_gb = 0.0
+
     return ModelProfile(
         id=profile_id,
         label=label,
@@ -255,6 +964,8 @@ def _profile_from_dict(raw: dict[str, Any]) -> ModelProfile | None:
         mmproj_filename=str(raw.get("mmproj_filename", "")).strip(),
         local_model_path=str(raw.get("local_model_path", "")).strip(),
         local_mmproj_path=str(raw.get("local_mmproj_path", "")).strip(),
+        vram_gb=vram_gb,
+        note=str(raw.get("note", "")).strip(),
     )
 
 
@@ -318,23 +1029,31 @@ def load_model_profiles(path: Path | None = None) -> dict[str, tuple[ModelProfil
     return {task: tuple(profiles) for task, profiles in profiles_by_task.items()}
 
 
+# Where downloaded model files land. The shared HF cache is the location other
+# Hugging Face tools (ai-toolkit, transformers, etc.) read from and write to.
+MODEL_TARGET_APP = "App models folder"
+MODEL_TARGET_HF = "Shared Hugging Face cache"
+
+
 @dataclass
 class CaptioningSettings:
     base_url: str = "http://127.0.0.1:8000/v1"
     api_key: str = "dummy"
     hf_token: str = ""
     models_dir: str = ""
+    model_download_target: str = MODEL_TARGET_APP
+    extra_model_dirs: str = ""   # newline/`;`-separated extra folders to search
 
-    caption_profile_id: str = "unsloth-qwen25vl-7b-q4"
-    caption_model: str = "qwen25vl"
+    caption_profile_id: str = "unsloth-qwen3vl-30b-q4"
+    caption_model: str = "unsloth-qwen3vl-30b"
     caption_hf_repo: str = ""
     caption_model_filename: str = ""
     caption_mmproj_filename: str = ""
     caption_local_model_path: str = ""
     caption_local_mmproj_path: str = ""
 
-    bbox_profile_id: str = "unsloth-qwen25vl-7b-q4"
-    bbox_model: str = "qwen25vl"
+    bbox_profile_id: str = "unsloth-qwen3vl-30b-q4"
+    bbox_model: str = "unsloth-qwen3vl-30b"
     bbox_hf_repo: str = ""
     bbox_model_filename: str = ""
     bbox_mmproj_filename: str = ""
@@ -359,10 +1078,11 @@ class CaptioningSettings:
     server_start_mode: str = "local"
     auto_start_server: bool = True
     llama_server_path: str = ""
-    llama_context: int = 32768
-    llama_gpu_layers: int = 999
+    llama_context: int = 16384
+    llama_gpu_layers: int = -1
     llama_batch: int = 2048
-    llama_ubatch: int = 2048
+    llama_ubatch: int = 512
+    llama_parallel: int = 1
     llama_threads: int = 0
     llama_extra_args: str = "-fa on"
     llama_reasoning_budget: int = 2048
@@ -370,6 +1090,9 @@ class CaptioningSettings:
     bbox_server_command: str = ""
     server_startup_timeout: float = 120.0
     stop_server_after_job: bool = False
+    # Managed llama.cpp binary acquisition.
+    llama_backend_hint: str = "auto"        # auto | cuda | vulkan | cpu
+    llama_auto_update_check: bool = True     # background, once-a-day, metadata-only
 
     # Appearance (applied at startup). Empty font family = auto-detect an installed font.
     ui_font_family: str = ""
@@ -400,6 +1123,75 @@ class CaptioningSettings:
 
 def profile_labels(task: str) -> list[str]:
     return [profile.label for profile in profiles_for_task(task)]
+
+
+def model_size_tier(vram_gb: float) -> str:
+    """Coarse size class for a model's VRAM need (independent of the user's card)."""
+    if vram_gb <= 0:
+        return ""
+    if vram_gb <= 8:
+        return "Small"
+    if vram_gb <= 16:
+        return "Medium"
+    if vram_gb <= 26:
+        return "Large"
+    return "XL"
+
+
+def estimate_gguf_vram_gb(model_path, mmproj_path=None) -> float:
+    """Rough VRAM estimate for a local GGUF, read from file size(s) only (no model
+    load, no metadata parse). On-disk weights dominate VRAM use; we add the vision
+    projector when present, then a small headroom for KV cache and compute buffers.
+    This is a byte-size approximation — actual VRAM also depends on context length.
+    Returns 0.0 if the size can't be read."""
+    try:
+        total = Path(model_path).stat().st_size
+    except (OSError, ValueError, TypeError):
+        return 0.0
+    if mmproj_path:
+        try:
+            total += Path(mmproj_path).stat().st_size
+        except (OSError, ValueError, TypeError):
+            pass
+    gb = total / (1024 ** 3)
+    if gb <= 0:
+        return 0.0
+    return round(gb * 1.12 + 0.8, 1)   # ~12% buffers + ~0.8GB fixed headroom
+
+
+def vram_fit(estimate_gb: float, total_gb: float | None, reserve_gb: float = 2.5) -> str:
+    """Verdict for a model's estimated need against a card's total VRAM:
+    'fits' (comfortable), 'tight' (will load but little headroom), 'too_big'
+    (likely OOM without CPU offload), or 'unknown' (no estimate / no VRAM read).
+    A reserve is held back for the OS/desktop/other apps."""
+    if not estimate_gb or estimate_gb <= 0 or not total_gb or total_gb <= 0:
+        return "unknown"
+    usable = total_gb - reserve_gb
+    if usable <= 0:
+        return "too_big"
+    if estimate_gb <= usable * 0.85:
+        return "fits"
+    if estimate_gb <= usable:
+        return "tight"
+    return "too_big"
+
+
+def recommend_profile_for_vram(task: str, total_gb: float | None) -> "ModelProfile | None":
+    """Pick a downloadable model suited to the card. Prefers the curated default
+    (first profile) when it comfortably fits; otherwise the largest that fits; if
+    none fit, the smallest (least likely to OOM). With VRAM unknown, returns the
+    smallest as a safe default. Server/custom profiles are skipped."""
+    candidates = [p for p in profiles_for_task(task) if p.kind == "hf" and p.vram_gb > 0]
+    if not candidates:
+        return None
+    if not total_gb or total_gb <= 0:
+        return min(candidates, key=lambda p: p.vram_gb)
+    fitting = [p for p in candidates if vram_fit(p.vram_gb, total_gb) == "fits"]
+    if fitting:
+        if candidates[0] in fitting:   # the curated flagship fits — prefer it
+            return candidates[0]
+        return max(fitting, key=lambda p: p.vram_gb)
+    return min(candidates, key=lambda p: p.vram_gb)
 
 
 def profiles_for_task(task: str) -> tuple[ModelProfile, ...]:
@@ -491,6 +1283,58 @@ def runtime_config_for_task(settings: CaptioningSettings, task: str) -> ModelRun
     )
 
 
+def has_model_config(settings: CaptioningSettings, task: str = "caption") -> bool:
+    """True if a model is at least specified for `task` (a local GGUF path or an HF
+    repo) — used to decide whether the local server can be started, or whether the
+    user should be sent to the Models page first."""
+    try:
+        config = runtime_config_for_task(settings, task)
+    except Exception:
+        return False
+    return bool((config.local_model_path or "").strip() or (config.hf_repo or "").strip())
+
+
+def _looks_foreign_home(path_str: str) -> bool:
+    """True if an absolute path lives under some *other* user's home directory
+    (e.g. a build-machine '/home/claude/...' path on a machine whose home is
+    '/home/ace'). Used to discard paths that leaked into a shipped or stale
+    settings file so they don't crash the app with permission errors."""
+    if not path_str or not path_str.strip():
+        return False
+    try:
+        p = Path(path_str.strip()).expanduser()
+        home = Path.home()
+    except Exception:
+        return False
+    if not p.is_absolute():
+        return False
+    home_parent = home.parent                      # /home  ·  /Users  ·  C:\Users
+    if home_parent.name.lower() not in ("home", "users"):
+        return False                               # unusual home (e.g. /root); don't guess
+    try:
+        rel = p.relative_to(home_parent)
+    except ValueError:
+        return False                               # not under the home container at all
+    first = rel.parts[0] if rel.parts else ""
+    return bool(first) and first.lower() != home.name.lower()
+
+
+def _sanitize_foreign_paths(s: "CaptioningSettings") -> "CaptioningSettings":
+    """Drop build-machine / other-user paths that leaked into settings, replacing
+    the models dir with this machine's default and clearing foreign file paths."""
+    if _looks_foreign_home(s.models_dir):
+        s.models_dir = str(default_models_dir())
+    for attr in ("llama_server_path", "caption_local_model_path", "caption_local_mmproj_path",
+                 "bbox_local_model_path", "bbox_local_mmproj_path"):
+        if _looks_foreign_home(getattr(s, attr, "")):
+            setattr(s, attr, "")
+    if s.extra_model_dirs:
+        kept = [ln for ln in re.split(r"[\r\n;]+", s.extra_model_dirs)
+                if ln.strip() and not _looks_foreign_home(ln)]
+        s.extra_model_dirs = "\n".join(kept)
+    return s
+
+
 def load_settings(path: Path | None = None) -> CaptioningSettings:
     path = path or default_settings_path()
     defaults = CaptioningSettings()
@@ -508,7 +1352,7 @@ def load_settings(path: Path | None = None) -> CaptioningSettings:
         for key, value in raw.items():
             if key in allowed:
                 values[key] = value
-    return CaptioningSettings(**values)
+    return _sanitize_foreign_paths(CaptioningSettings(**values))
 
 
 def save_settings(settings: CaptioningSettings, path: Path | None = None) -> Path:
@@ -521,6 +1365,188 @@ def save_settings(settings: CaptioningSettings, path: Path | None = None) -> Pat
 def safe_repo_dir(repo_id: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "__", repo_id.strip())
     return cleaned.strip("._") or "custom_model"
+
+
+def hf_hub_cache_dir() -> Path:
+    """Resolved Hugging Face hub cache dir, honoring HF_HUB_CACHE / HF_HOME, else
+    the standard ~/.cache/huggingface/hub. This is the shared cache other HF tools
+    (ai-toolkit, transformers, etc.) read from and write to."""
+    env = os.environ.get("HF_HUB_CACHE")
+    if env:
+        return Path(env).expanduser()
+    home = os.environ.get("HF_HOME")
+    if home:
+        return Path(home).expanduser() / "hub"
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE as _hub_cache
+        return Path(_hub_cache)
+    except Exception:
+        return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def lmstudio_models_dir() -> Path:
+    """Default LM Studio models folder. LM Studio stores GGUFs under
+    ~/.lmstudio/models/<author>/<model>/<file>.gguf."""
+    return Path.home() / ".lmstudio" / "models"
+
+
+def known_server_model_dirs() -> list[Path]:
+    """Default model folders for the local servers this app supports, across
+    Linux/macOS/Windows. Only existing dirs are returned (de-duplicated).
+
+    Notes on what actually yields loadable GGUFs:
+    - LM Studio: ~/.lmstudio/models holds .gguf files (findable on all OSes; on
+      Windows Path.home() resolves to C:\\Users\\<user>).
+    - llama.cpp: the legacy -hf cache (~/.cache/llama.cpp or $LLAMA_CACHE /
+      $XDG_CACHE_HOME) holds flat <repo>_<file>.gguf files; recent builds migrate
+      these into the shared HF cache, which is searched separately.
+    - vLLM: downloads into the shared HF cache (searched separately), no own dir.
+    - Ollama: stores sha256 blobs + manifests (no .gguf extension), so a *.gguf
+      scan won't surface loadable models there; the folder is still listed for
+      completeness and in case a user dropped raw GGUFs in.
+    """
+    home = Path.home()
+    cands: list[Path] = [home / ".lmstudio" / "models"]            # LM Studio
+
+    env_llama = os.environ.get("LLAMA_CACHE")                       # llama.cpp -hf
+    if env_llama:
+        cands.append(Path(env_llama).expanduser())
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    if xdg:
+        cands.append(Path(xdg).expanduser() / "llama.cpp")
+    cands.append(home / ".cache" / "llama.cpp")
+
+    env_ollama = os.environ.get("OLLAMA_MODELS")                    # Ollama
+    if env_ollama:
+        cands.append(Path(env_ollama).expanduser())
+    cands.append(home / ".ollama" / "models")
+    cands.append(Path("/usr/share/ollama/.ollama/models"))         # Linux service
+
+    out: list[Path] = []
+    seen: set[str] = set()
+    for p in cands:
+        try:
+            if not p.exists():
+                continue
+            key = str(p.resolve())
+        except (OSError, ValueError):
+            continue
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
+def model_search_roots(settings: "CaptioningSettings") -> list[Path]:
+    """All folders to search for local GGUF models, de-duplicated. Order: the app
+    models_dir, the user's Extra folders, the shared Hugging Face cache (also used
+    by vLLM and recent llama.cpp), then the other built-in servers' default
+    folders. Non-existent roots are kept here and skipped by the callers."""
+    roots: list[Path] = [Path(settings.models_dir).expanduser()]
+    roots.extend(_parse_dir_lines(getattr(settings, "extra_model_dirs", "")))
+    roots.append(hf_hub_cache_dir())
+    roots.extend(known_server_model_dirs())
+    out: list[Path] = []
+    seen: set[str] = set()
+    for r in roots:
+        try:
+            key = str(r.resolve())
+        except (OSError, ValueError):
+            key = str(r)
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+
+def _parse_dir_lines(value: str) -> list[Path]:
+    out: list[Path] = []
+    for line in re.split(r"[\r\n;]+", value or ""):
+        line = line.strip()
+        if line:
+            out.append(Path(line).expanduser())
+    return out
+
+
+def _find_in_dir(root: Path, filename: str) -> Path | None:
+    """First file named `filename` under root (checked directly, then recursively)."""
+    try:
+        if not root.exists():
+            return None
+        direct = root / filename
+        if direct.is_file():
+            return direct
+        for hit in root.rglob(filename):
+            if hit.is_file():
+                return hit
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def locate_existing_model_file(settings: "CaptioningSettings", repo: str, filename: str) -> Path | None:
+    """Find an already-downloaded copy of (repo, filename) so we can skip the
+    download. Checks, in order: the app's per-repo folder, the shared Hugging Face
+    cache (try_to_load_from_cache), then any Extra model folders (recursive match
+    by filename — covers LM Studio's author/model/file layout)."""
+    if not filename:
+        return None
+    if repo:
+        flat = Path(settings.models_dir).expanduser() / safe_repo_dir(repo) / filename
+        if flat.is_file():
+            return flat
+        try:
+            from huggingface_hub import try_to_load_from_cache
+            cached = try_to_load_from_cache(repo_id=repo, filename=filename)
+            if isinstance(cached, str) and Path(cached).is_file():
+                return Path(cached)
+        except Exception:
+            pass
+    extra = _parse_dir_lines(getattr(settings, "extra_model_dirs", ""))
+    for root in extra + known_server_model_dirs():
+        hit = _find_in_dir(root, filename)
+        if hit is not None:
+            return hit
+    return None
+
+
+def discover_local_gguf_models(settings: "CaptioningSettings") -> tuple[list[Path], list[Path]]:
+    """Scan the model folders for .gguf files: the app models_dir, the user's Extra
+    folders, the shared HF cache (also vLLM + recent llama.cpp), and the other
+    built-in servers' default folders (LM Studio, llama.cpp legacy cache, Ollama),
+    across Linux/macOS/Windows. Returns (models, mmprojs): files whose name
+    contains 'mmproj' are treated as vision projectors and kept separate so the
+    model list stays clean and we can auto-pair a projector on selection."""
+    roots = model_search_roots(settings)
+    seen: set[str] = set()
+    models: list[Path] = []
+    mmprojs: list[Path] = []
+    for root in roots:
+        try:
+            if not root.exists():
+                continue
+            for path in root.rglob("*.gguf"):
+                if not path.is_file():
+                    continue
+                key = str(path.resolve())
+                if key in seen:
+                    continue
+                seen.add(key)
+                (mmprojs if "mmproj" in path.name.lower() else models).append(path)
+        except (OSError, ValueError):
+            continue
+    models.sort(key=lambda p: p.name.lower())
+    mmprojs.sort(key=lambda p: p.name.lower())
+    return models, mmprojs
+
+
+def guess_mmproj_for(model_path: Path, mmprojs: list[Path]) -> Path | None:
+    """Best-guess vision projector for a chosen model file: prefer one sitting in
+    the same folder (LM Studio and HF snapshots keep the pair together)."""
+    same_dir = [m for m in mmprojs if m.parent == model_path.parent]
+    if same_dir:
+        return same_dir[0]
+    return None
 
 
 def server_host_port(base_url: str) -> tuple[str, int]:
@@ -571,25 +1597,34 @@ def ensure_model_assets(
     mmproj_repo = config.mmproj_repo or config.hf_repo
     model_dir = models_root / safe_repo_dir(model_repo)
     mmproj_dir = models_root / safe_repo_dir(mmproj_repo)
-    model_dir.mkdir(parents=True, exist_ok=True)
-    mmproj_dir.mkdir(parents=True, exist_ok=True)
+    use_hf_cache = (getattr(settings, "model_download_target", MODEL_TARGET_APP) == MODEL_TARGET_HF)
+    if not use_hf_cache:
+        model_dir.mkdir(parents=True, exist_ok=True)
+        mmproj_dir.mkdir(parents=True, exist_ok=True)
     token = settings.hf_token.strip() or None
 
     def download_file(repo_id: str, filename: str, local_dir: Path) -> Path:
-        target = local_dir / filename
-        if target.exists():
+        # Reuse an existing copy anywhere we know to look (app folder, the shared
+        # HF cache, or an Extra model folder like LM Studio) before downloading.
+        existing = locate_existing_model_file(settings, repo_id, filename)
+        if existing is not None:
             if progress:
-                progress(f"Using cached model file: {target.name}")
-            return target
+                progress(f"Using existing model file: {existing.name}")
+            return existing
         if progress:
-            progress(f"Downloading {filename} from {repo_id}...")
+            dest = "Hugging Face cache" if use_hf_cache else "models folder"
+            progress(f"Downloading {filename} from {repo_id} to the {dest}...")
         try:
-            path = hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                local_dir=str(local_dir),
-                token=token,
-            )
+            if use_hf_cache:
+                # No local_dir → lands in the shared cache, returns the resolved path.
+                path = hf_hub_download(repo_id=repo_id, filename=filename, token=token)
+            else:
+                path = hf_hub_download(
+                    repo_id=repo_id,
+                    filename=filename,
+                    local_dir=str(local_dir),
+                    token=token,
+                )
         except Exception as exc:  # pragma: no cover - depends on network/HF
             raise AutoCaptionError(f"Could not download {filename} from {repo_id}: {exc}") from exc
         return Path(path)
@@ -600,6 +1635,31 @@ def ensure_model_assets(
     model_path = downloaded_models[0] if downloaded_models else None
     mmproj_path = downloaded_mmproj[0] if downloaded_mmproj else None
     return ModelAssets(model_path=model_path, mmproj_path=mmproj_path)
+
+
+def missing_model_files(settings: CaptioningSettings, task: str = "caption") -> list[str]:
+    """Filenames the launcher would download from Hugging Face because they aren't
+    present locally yet — used for the pre-download confirmation. Empty when
+    nothing needs downloading (user-provided local files, or already cached)."""
+    try:
+        config = runtime_config_for_task(settings, task)
+    except Exception:
+        return []
+    if config.local_model_path:
+        return []  # user pointed at local files; nothing for us to download
+    filenames = _split_filenames(config.model_filename)
+    mmproj_filenames = _split_filenames(config.mmproj_filename)
+    if not config.hf_repo or not filenames:
+        return []
+    mmproj_repo = config.mmproj_repo or config.hf_repo
+    missing: list[str] = []
+    for filename in filenames:
+        if locate_existing_model_file(settings, config.hf_repo, filename) is None:
+            missing.append(filename)
+    for filename in mmproj_filenames:
+        if locate_existing_model_file(settings, mmproj_repo, filename) is None:
+            missing.append(filename)
+    return missing
 
 
 def format_server_command(
@@ -634,15 +1694,175 @@ def _split_extra_args(value: str) -> list[str]:
     return shlex.split(value)
 
 
-def build_llama_server_command(settings: CaptioningSettings, task: str, assets: ModelAssets) -> str:
-    server_path = Path(settings.llama_server_path).expanduser() if settings.llama_server_path.strip() else find_llama_server()
+def resolve_llama_server_path(settings: CaptioningSettings) -> Path | None:
+    """The llama-server we'll launch: an explicit user path wins, else auto-detect
+    (which prefers the managed binary)."""
+    raw = settings.llama_server_path.strip()
+    if raw:
+        return Path(raw).expanduser()
+    return find_llama_server()
+
+
+def find_nccl_lib_dir() -> Path | None:
+    """Locate a directory containing libnccl.so.2 (Linux only).
+
+    From build b8738 onward, llama.cpp's CUDA prebuilt binaries dynamically link
+    NCCL but the release archive doesn't bundle libnccl.so.2, so on a machine with
+    no system NCCL the server fails to even load. PyTorch (and most CUDA Python
+    envs) ship NCCL via the nvidia-nccl-cu12 wheel or in torch/lib, so we find that
+    copy and put its folder on the loader path — no system install needed."""
+    if os.name == "nt" or sys.platform == "darwin":
+        return None
+    soname = "libnccl.so.2"
+    # 1) the nvidia-nccl wheel, located without importing it (cheap, no CUDA init)
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("nvidia.nccl")
+        for loc in (spec.submodule_search_locations or []) if spec else []:
+            lib = Path(loc) / "lib"
+            if (lib / soname).exists():
+                return lib
+    except Exception:
+        pass
+    # 2) scan site-packages for the wheel's or torch's bundled copy
+    try:
+        import site
+        import sysconfig
+        roots: set[Path] = set()
+        try:
+            roots.update(Path(p) for p in site.getsitepackages())
+        except Exception:
+            pass
+        user = getattr(site, "getusersitepackages", lambda: None)()
+        if user:
+            roots.add(Path(user))
+        for key in ("purelib", "platlib"):
+            try:
+                roots.add(Path(sysconfig.get_paths()[key]))
+            except Exception:
+                pass
+        for root in roots:
+            for rel in ("nvidia/nccl/lib", "torch/lib"):
+                lib = root / rel
+                if (lib / soname).exists():
+                    return lib
+    except Exception:
+        pass
+    return None
+
+
+def server_launch_env(binary_path: Path | None) -> dict:
+    """A child-process environment that lets a launched server find shared libs
+    sitting beside its binary (and in sibling lib/ dirs).
+
+    llama.cpp prebuilts bundle their ggml/CUDA libraries next to the executable,
+    but the system linker won't always look there (only if the binary was built
+    with an $ORIGIN rpath). Prepending those dirs to the loader path makes the
+    launch robust regardless of the user's working directory or linker config —
+    and keeps any bundled runtime entirely inside the managed folder, so nothing
+    in the system, conda, or venv environment has to be touched.
+
+    One exception: recent CUDA builds need libnccl.so.2, which the release does
+    not ship. We locate the copy already present in the Python env (PyTorch's) and
+    add its folder too, so single-GPU users aren't blocked by a missing NCCL.
+    """
+    env = os.environ.copy()
+    if binary_path is None:
+        return env
+    try:
+        bin_dir = Path(binary_path).expanduser().resolve().parent
+    except (OSError, RuntimeError):
+        return env
+    candidates = [bin_dir]
+    for base in (bin_dir, bin_dir.parent):
+        for sub in ("lib", "lib64"):
+            sibling = base / sub
+            if sibling.is_dir():
+                candidates.append(sibling)
+    nccl_dir = find_nccl_lib_dir()
+    if nccl_dir is not None:
+        candidates.append(nccl_dir)
+    seen: set[str] = set()
+    dirs: list[str] = []
+    for cand in candidates:
+        text = str(cand)
+        if text not in seen:
+            seen.add(text)
+            dirs.append(text)
+    if os.name == "nt":
+        var = "PATH"
+    elif sys.platform == "darwin":
+        var = "DYLD_LIBRARY_PATH"
+    else:
+        var = "LD_LIBRARY_PATH"
+    existing = env.get(var, "")
+    env[var] = os.pathsep.join(dirs + ([existing] if existing else []))
+    return env
+
+
+_ROUTER_SUPPORT: dict[str, bool] = {}
+
+
+def llama_server_supports_router(binary_path: Path | None) -> bool:
+    """Whether this llama-server build can start model-less (router mode), detected
+    from --help and cached per binary. Router flag names have shifted across
+    versions, so we look for any of the known ones. Never raises."""
+    if binary_path is None:
+        return False
+    key = str(binary_path)
+    if key in _ROUTER_SUPPORT:
+        return _ROUTER_SUPPORT[key]
+    supported = False
+    try:
+        result = subprocess.run(
+            [str(binary_path), "--help"], capture_output=True, text=True, timeout=10
+        )
+        text = (result.stdout or "") + (result.stderr or "")
+        supported = any(flag in text for flag in ("--models-dir", "--models-preset", "--model-dir"))
+        if not supported and re.search(r"--models(\s|,|\b)", text):
+            supported = True
+    except (OSError, ValueError, subprocess.SubprocessError):
+        supported = False
+    _ROUTER_SUPPORT[key] = supported
+    return supported
+
+
+def build_llama_server_command(settings: CaptioningSettings, task: str, assets: ModelAssets,
+                               *, model_less: bool = False) -> str:
+    server_path = resolve_llama_server_path(settings)
     if server_path is None or not server_path.exists():
-        raise AutoCaptionError("Choose llama-server.exe in Preferences before using local captioning.")
+        exe = "llama-server.exe" if os.name == "nt" else "llama-server"
+        raise AutoCaptionError(
+            f"No {exe} found. Use \u201cGet llama.cpp\u201d in Preferences to install "
+            "one, or set a llama-server path."
+        )
+
+    host, port = server_host_port(settings.base_url)
+
+    if model_less:
+        # Start the server with no model resident (router mode) so it can be
+        # health-checked before committing to a download/load. Build-dependent.
+        if not llama_server_supports_router(server_path):
+            raise AutoCaptionError(
+                "This llama-server build can't start without a model (no router "
+                "mode). Update llama.cpp, or load a model to start the server."
+            )
+        models_dir = Path(settings.models_dir).expanduser()
+        try:
+            models_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        args = [str(server_path), "--host", host, "--port", str(port),
+                "--models-dir", str(models_dir)]
+        args.extend(_split_extra_args(settings.llama_extra_args))
+        if os.name == "nt":
+            return subprocess.list2cmdline(args)
+        import shlex
+        return shlex.join(args)
 
     if assets.model_path is None:
         raise AutoCaptionError("Local llama.cpp mode needs a downloadable or local GGUF model profile.")
 
-    host, port = server_host_port(settings.base_url)
     config = runtime_config_for_task(settings, task)
     args = [
         str(server_path),
@@ -656,13 +1876,18 @@ def build_llama_server_command(settings: CaptioningSettings, task: str, assets: 
         config.api_model or "captioner-model",
         "-c",
         str(max(512, int(settings.llama_context))),
-        "-ngl",
-        str(max(0, int(settings.llama_gpu_layers))),
         "-b",
         str(max(1, int(settings.llama_batch))),
         "-ub",
         str(max(1, int(settings.llama_ubatch))),
+        "-np",
+        str(max(1, int(settings.llama_parallel))),
     ]
+    # Negative = auto: omit -ngl so llama.cpp's fitter places as many layers as fit
+    # in free VRAM (and spills the rest to CPU) instead of OOM-aborting. A concrete
+    # value (incl. 0 for CPU-only) is passed through and disables the fitter.
+    if int(settings.llama_gpu_layers) >= 0:
+        args.extend(["-ngl", str(int(settings.llama_gpu_layers))])
     if assets.mmproj_path is not None:
         args.extend(["--mmproj", str(assets.mmproj_path)])
     if settings.llama_threads > 0:
@@ -727,6 +1952,7 @@ def start_server_process(
     name: str,
     startup_timeout: float,
     progress: ProgressCallback | None = None,
+    env: dict | None = None,
 ) -> subprocess.Popen:
     if not command.strip():
         raise AutoCaptionError("Server auto-start is enabled, but no server command is configured.")
@@ -744,6 +1970,12 @@ def start_server_process(
         stdout=log_file,
         stderr=subprocess.STDOUT,
         creationflags=creationflags,
+        env=env,
+        # shell=True means our handle is the shell; llama-server is its child. Put
+        # the shell in its own session/group so stop_server_process can signal the
+        # whole group and actually kill llama-server (and free its VRAM) instead of
+        # orphaning it. Windows uses CREATE_NEW_PROCESS_GROUP + taskkill /T instead.
+        start_new_session=(os.name != "nt"),
     )
     process._captioner_log_file = log_file  # type: ignore[attr-defined]
 
@@ -751,7 +1983,8 @@ def start_server_process(
     while time.time() < deadline:
         if process.poll() is not None:
             close_process_log(process)
-            raise AutoCaptionError(f"{name} server exited during startup. See {log_path}.")
+            hint = _server_startup_hint(log_path)
+            raise AutoCaptionError(f"{name} server exited during startup.{hint} See {log_path}.")
         if is_server_ready(base_url, api_key=api_key, timeout=3.0):
             if progress:
                 progress(f"{name} server is ready.")
@@ -762,6 +1995,26 @@ def start_server_process(
     raise AutoCaptionError(f"{name} server did not become ready within {startup_timeout:.0f} seconds.")
 
 
+def _server_startup_hint(log_path: Path) -> str:
+    """Turn a known fatal startup log line into an actionable hint. Today that's
+    mainly the missing-shared-library case (libnccl.so.2 on recent CUDA builds)."""
+    try:
+        tail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+    except OSError:
+        return ""
+    m = re.search(r"error while loading shared libraries:\s*([^\s:]+)", tail)
+    if not m:
+        return ""
+    lib = m.group(1)
+    if "nccl" in lib.lower():
+        return (f" The CUDA build can't find {lib}. Recent llama.cpp CUDA releases "
+                "need NVIDIA NCCL, which the download doesn't bundle. Install it in "
+                "this environment with:  pip install nvidia-nccl-cu12  (or "
+                "conda install -c conda-forge nccl), then start the server again.")
+    return (f" The server can't find the shared library {lib}. Install it or add its "
+            "folder to your library path, then try again.")
+
+
 def close_process_log(process: subprocess.Popen) -> None:
     try:
         log_file = getattr(process, "_captioner_log_file", None)
@@ -769,6 +2022,22 @@ def close_process_log(process: subprocess.Popen) -> None:
             log_file.close()
     except Exception:
         pass
+
+
+def _posix_signal_group(process: subprocess.Popen, sig: int) -> bool:
+    """Signal the process group led by the launched shell so its llama-server child
+    is hit too. Returns False if the group couldn't be resolved/signalled."""
+    try:
+        pgid = os.getpgid(process.pid)
+    except (ProcessLookupError, OSError):
+        return False
+    try:
+        os.killpg(pgid, sig)
+        return True
+    except ProcessLookupError:
+        return True  # already gone
+    except OSError:
+        return False
 
 
 def stop_server_process(process: subprocess.Popen | None) -> None:
@@ -784,17 +2053,61 @@ def stop_server_process(process: subprocess.Popen | None) -> None:
                     check=False,
                 )
             else:
-                process.terminate()
+                # Terminate the whole group (shell + llama-server). Fall back to the
+                # single process if the group can't be resolved.
+                if not _posix_signal_group(process, signal.SIGTERM):
+                    process.terminate()
                 try:
                     process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
-                    process.kill()
+                    if not _posix_signal_group(process, signal.SIGKILL):
+                        process.kill()
         try:
             process.wait(timeout=10)
         except Exception:
             pass
     finally:
         close_process_log(process)
+
+
+def ensure_server_running(
+    settings: CaptioningSettings,
+    task: str,
+    progress: ProgressCallback | None = None,
+    *,
+    model_less: bool = False,
+) -> subprocess.Popen | None:
+    """Make sure a server is available for `task` when configured to run one locally.
+
+    Only acts when start mode is 'local' and auto-start is on. Downloads the
+    model/mmproj if needed, launches llama-server, and waits for it to answer.
+    With model_less=True it launches in router mode with no model resident (for a
+    quick 'is the server up?' check). Returns the launched process, or None when
+    nothing was started — existing/custom mode, auto-start off, or already up.
+    """
+    if settings.server_start_mode != "local" or not settings.auto_start_server:
+        return None
+    # already answering (a server we launched earlier, or one the user started)
+    if is_server_ready(settings.base_url, api_key=settings.api_key, timeout=3.0):
+        return None
+
+    if model_less:
+        command = build_llama_server_command(settings, task, ModelAssets(), model_less=True)
+    else:
+        assets = ensure_model_assets(settings, task, progress=progress)
+        command = build_llama_server_command(settings, task, assets)
+    launch_env = server_launch_env(resolve_llama_server_path(settings))
+    log_dir = Path(settings.models_dir).expanduser().resolve() / "server_logs"
+    return start_server_process(
+        command,
+        base_url=settings.base_url,
+        api_key=settings.api_key,
+        log_dir=log_dir,
+        name="llama-server",
+        startup_timeout=settings.server_startup_timeout,
+        progress=progress,
+        env=launch_env,
+    )
 
 
 def image_to_data_url(path: Path, vision_image_format: str = "auto") -> str:

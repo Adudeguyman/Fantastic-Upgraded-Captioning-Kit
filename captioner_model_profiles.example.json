@@ -1,104 +1,135 @@
 {
   "profiles": [
     {
+      "id": "unsloth-qwen3vl-30b-q4",
+      "label": "Download: Unsloth Qwen3-VL 30B-A3B Q4 (recommended, ~20GB)",
+      "tasks": [
+        "caption",
+        "bbox"
+      ],
+      "kind": "hf",
+      "api_model": "unsloth-qwen3vl-30b",
+      "hf_repo": "unsloth/Qwen3-VL-30B-A3B-Instruct-GGUF",
+      "model_filename": "Qwen3-VL-30B-A3B-Instruct-UD-Q4_K_XL.gguf",
+      "mmproj_filename": "mmproj-BF16.gguf",
+      "vram_gb": 20
+    },
+    {
+      "id": "unsloth-qwen3vl-8b-q4",
+      "label": "Download: Qwen3-VL 8B Q4 \u2014 Ideogram 4 text encoder (~8GB)",
+      "tasks": [
+        "caption",
+        "bbox"
+      ],
+      "kind": "hf",
+      "api_model": "unsloth-qwen3vl-8b",
+      "hf_repo": "unsloth/Qwen3-VL-8B-Instruct-GGUF",
+      "model_filename": "Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf",
+      "mmproj_filename": "mmproj-F16.gguf",
+      "vram_gb": 8,
+      "note": "Ideogram 4 uses Qwen3-VL-8B as its text encoder. This is a 'native' model choice, however higher parameter models from Qwen or Gemma may result in better captioning accuracy."
+    },
+    {
       "id": "llmfan46-gemma4-31b-qat-heretic-q4_0",
-      "label": "Download: Gemma 4 31B IT QAT Uncensored Heretic Q4_0 (18GB)",
-      "tasks": ["caption", "bbox"],
+      "label": "Download: Gemma 4 31B IT QAT Uncensored Heretic Q4_0 (~22GB)",
+      "tasks": [
+        "caption",
+        "bbox"
+      ],
       "kind": "hf",
       "api_model": "gemma4-31b-heretic",
       "hf_repo": "llmfan46/gemma-4-31B-it-qat-q4_0-uncensored-heretic-GGUF",
       "model_filename": "gemma-4-31B-it-qat-Q4_0.gguf",
-      "mmproj_filename": "gemma-4-31B-it-uncensored-heretic-BF16.gguf"
+      "mmproj_filename": "gemma-4-31B-it-uncensored-heretic-BF16.gguf",
+      "vram_gb": 22
     },
     {
       "id": "llmfan46-gemma4-12b-qat-heretic-q4_0",
-      "label": "Download: Gemma 4 12B IT QAT Uncensored Heretic Q4_0 (8GB)",
-      "tasks": ["caption", "bbox"],
+      "label": "Download: Gemma 4 12B IT QAT Uncensored Heretic Q4_0 (~11GB)",
+      "tasks": [
+        "caption",
+        "bbox"
+      ],
       "kind": "hf",
       "api_model": "gemma4-12b-heretic",
       "hf_repo": "llmfan46/gemma-4-12B-it-qat-q4_0-uncensored-heretic-GGUF",
       "model_filename": "gemma-4-12B-it-qat-q4_0-uncensored-heretic-Q4_0.gguf",
-      "mmproj_filename": "gemma-4-12B-it-qat-q4_0-uncensored-heretic-mmproj-BF16.gguf"
+      "mmproj_filename": "gemma-4-12B-it-qat-q4_0-uncensored-heretic-mmproj-BF16.gguf",
+      "vram_gb": 11
     },
     {
       "id": "hauhaucs-qwen35-9b-aggressive-q6k",
-      "label": "Download: Qwen3.5-9B Uncensored HauhauCS Aggressive Q6_K (7GB)",
-      "tasks": ["caption", "bbox"],
+      "label": "Download: Qwen3.5-9B Uncensored HauhauCS Aggressive Q6_K (~10GB)",
+      "tasks": [
+        "caption",
+        "bbox"
+      ],
       "kind": "hf",
       "api_model": "hauhaucs-qwen35-9b",
       "hf_repo": "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive",
       "model_filename": "Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q6_K.gguf",
-      "mmproj_filename": "mmproj-Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-BF16.gguf"
+      "mmproj_filename": "mmproj-Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-BF16.gguf",
+      "vram_gb": 10
     },
     {
       "id": "hauhaucs-gemma4-26b-balanced-q4km",
-      "label": "Download: Gemma4-26B A4B Uncensored HauhauCS-Balanced Q4_K_M (17GB)",
-      "tasks": ["caption", "bbox"],
+      "label": "Download: Gemma4-26B A4B Uncensored HauhauCS-Balanced Q4_K_M (~20GB)",
+      "tasks": [
+        "caption",
+        "bbox"
+      ],
       "kind": "hf",
       "api_model": "gemma4-26b-balanced",
       "hf_repo": "HauhauCS/Gemma4-26B-A4B-Uncensored-HauhauCS-Balanced",
       "model_filename": "Gemma4-26B-A4B-Uncensored-HauhauCS-Balanced-Q4_K_M.gguf",
-      "mmproj_filename": "mmproj-Gemma4-26B-A4B-Uncensored-HauhauCS-Balanced-f16.gguf"
+      "mmproj_filename": "mmproj-Gemma4-26B-A4B-Uncensored-HauhauCS-Balanced-f16.gguf",
+      "vram_gb": 20
     },
     {
       "id": "huihui-qwen3vl-30b-abliterated-i1-q4ks",
-      "label": "Download: Huihui Qwen3-VL 30B abliterated i1 Q4_K_S (17GB)",
-      "tasks": ["caption", "bbox"],
+      "label": "Download: Huihui Qwen3-VL 30B abliterated i1 Q4_K_S (~20GB)",
+      "tasks": [
+        "caption",
+        "bbox"
+      ],
       "kind": "hf",
       "api_model": "huihui-qwen3vl-30b",
       "hf_repo": "mradermacher/Huihui-Qwen3-VL-30B-A3B-Instruct-abliterated-i1-GGUF",
       "mmproj_repo": "mradermacher/Huihui-Qwen3-VL-30B-A3B-Instruct-abliterated-GGUF",
       "model_filename": "Huihui-Qwen3-VL-30B-A3B-Instruct-abliterated.i1-Q4_K_S.gguf",
-      "mmproj_filename": "Huihui-Qwen3-VL-30B-A3B-Instruct-abliterated.mmproj-f16.gguf"
+      "mmproj_filename": "Huihui-Qwen3-VL-30B-A3B-Instruct-abliterated.mmproj-f16.gguf",
+      "vram_gb": 20
     },
     {
       "id": "davidau-qwen36-27b-heretic-q6k",
-      "label": "Download: DavidAU Qwen3.6 27B Heretic Q6_K (22GB)",
-      "tasks": ["caption", "bbox"],
+      "label": "Download: DavidAU Qwen3.6 27B Heretic Q6_K (~26GB)",
+      "tasks": [
+        "caption",
+        "bbox"
+      ],
       "kind": "hf",
       "api_model": "davidau-qwen36-27b-heretic",
       "hf_repo": "DavidAU/Qwen3.6-27B-Heretic-Uncensored-FINETUNE-NEO-CODE-Di-IMatrix-MAX-GGUF",
       "model_filename": "Qwen3.6-27B-NEO-CODE-HERE-2T-OT-Q6_K.gguf",
-      "mmproj_filename": "mmproj-F16.gguf"
-    },
-    {
-      "id": "unsloth-qwen25vl-7b-q4",
-      "label": "Download: Qwen2.5-VL 7B Q4",
-      "tasks": ["caption", "bbox"],
-      "kind": "hf",
-      "api_model": "qwen25vl",
-      "hf_repo": "unsloth/Qwen2.5-VL-7B-Instruct-GGUF",
-      "model_filename": "Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf",
-      "mmproj_filename": "mmproj-BF16.gguf"
-    },
-    {
-      "id": "unsloth-qwen3vl-30b-q4",
-      "label": "Download: Unsloth Qwen3-VL 30B Q4",
-      "tasks": ["caption", "bbox"],
-      "kind": "hf",
-      "api_model": "unsloth-qwen3vl-30b",
-      "hf_repo": "unsloth/Qwen3-VL-30B-A3B-Instruct-GGUF",
-      "model_filename": "Qwen3-VL-30B-A3B-Instruct-UD-Q4_K_XL.gguf",
-      "mmproj_filename": "mmproj-BF16.gguf"
-    },
-    {
-      "id": "local-model",
-      "label": "Existing server alias: local-model",
-      "tasks": ["caption", "bbox"],
-      "kind": "server",
-      "api_model": "local-model"
+      "mmproj_filename": "mmproj-F16.gguf",
+      "vram_gb": 26
     },
     {
       "id": "server-qwen3vl",
       "label": "Existing server alias: qwen3vl",
-      "tasks": ["caption", "bbox"],
+      "tasks": [
+        "caption",
+        "bbox"
+      ],
       "kind": "server",
       "api_model": "qwen3vl"
     },
     {
       "id": "server-gemma-vl",
       "label": "Existing server alias: gemma-vl",
-      "tasks": ["caption"],
+      "tasks": [
+        "caption"
+      ],
       "kind": "server",
       "api_model": "gemma-vl"
     }

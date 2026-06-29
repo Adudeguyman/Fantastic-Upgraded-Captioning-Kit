@@ -26,6 +26,7 @@ captioner_settings.json
 captioner_model_profiles.json
 captioner_prompts/
 models/
+llama/
 server_logs/
 standaloneCaptioningStuff/
 *.caption_failed.json

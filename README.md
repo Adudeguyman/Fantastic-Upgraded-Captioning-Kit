@@ -67,11 +67,11 @@ If you just want to run the app, use the bundled auto-launcher. On its first run
 it creates a local `.venv`, installs the requirements, and starts the app; every
 run after that launches straight away.
 
-- **Windows:** double-click `run_captioner.bat`, or run it from a terminal.
+- **Windows:** double-click `run_captioner_venv.bat`, or run it from a terminal.
 - **Linux / macOS:**
   ```bash
-  chmod +x run_captioner.sh   # once
-  ./run_captioner.sh
+  chmod +x run_captioner_venv.sh   # once
+  ./run_captioner_venv.sh
   ```
 
 Prefer to manage the environment yourself? Set it up manually with venv or conda
@@ -104,6 +104,20 @@ pip install -r requirements.txt
 PySide6 installs cleanly with pip inside the conda env, so there's no need to
 chase it down on a conda channel.
 
+### Optional — CUDA acceleration for the built-in server (NVIDIA, Linux)
+
+If you let the app download and run `llama-server` on an NVIDIA GPU, recent
+llama.cpp CUDA builds link NVIDIA's NCCL library (`libnccl.so.2`) but don't
+bundle it. If your environment already has PyTorch, you're covered — the app
+reuses the NCCL it ships. Otherwise, add it once:
+
+```bash
+pip install -r requirements-cuda.txt        # or:  pip install ".[cuda]"
+```
+
+This is a no-op on Windows/macOS and on non-NVIDIA setups (the Vulkan/CPU
+backends and external servers like LM Studio don't need it).
+
 ## Launching
 
 With your environment activated (venv or conda), launch the app with:
@@ -118,13 +132,18 @@ or equivalently:
 python run_captioner.py
 ```
 
-**conda convenience launcher (Linux / macOS):** `run_captioner_qt.sh` activates
-the `id4caption` environment for you, then starts the app:
+**conda convenience launchers:** `run_captioner_conda.sh` (Linux / macOS) and
+`run_captioner_conda.bat` (Windows) activate the `id4caption` environment for
+you, then start the app:
 
 ```bash
-chmod +x run_captioner_qt.sh   # once
-./run_captioner_qt.sh
+chmod +x run_captioner_conda.sh   # once
+./run_captioner_conda.sh
 ```
+
+On Windows, double-click `run_captioner_conda.bat` (or run it from a terminal).
+It prefers the env's `python.exe` directly and falls back to `call conda
+activate id4caption`.
 
 ## Basic use
 
@@ -195,6 +214,7 @@ accident:
 - `Ctrl+,` — open Preferences
 - Arrow keys — nudge the selected box by one unit when the canvas has focus
   (hold `Shift` for ×10); step between images when the filmstrip has focus
+- `Delete` / `Backspace` — remove the selected box when the canvas has focus
 - `Tab` / `Shift+Tab` — move between fields
 - Hold `Space` (or middle-drag) — pan the canvas
 - `F11` — toggle fullscreen
@@ -210,6 +230,14 @@ accident:
 - **Connection error during captioning** — the endpoint isn't reachable or the
   local server failed to start; check the URL in Preferences and any
   `server_logs/` output.
+- **Built-in server won't start: `libnccl.so.2: cannot open shared object`** —
+  the CUDA `llama-server` needs NVIDIA NCCL. Install it with
+  `pip install -r requirements-cuda.txt` (or `pip install ".[cuda]"`); see the
+  CUDA note under Installation.
+- **Built-in server fails with CUDA out of memory** — another process is holding
+  VRAM (often LM Studio with a model still loaded). Close it, or pick a smaller
+  model. GPU layers default to auto-fit, so a slightly oversized model spills to
+  CPU rather than aborting; set a fixed value in Preferences to override.
 - **Empty output or `finish_reason=length`** — raise the context size / output
   tokens, lower the reasoning budget, or try a smaller image or model.
 - **JSON errors after generation** — filter to failed captions and use

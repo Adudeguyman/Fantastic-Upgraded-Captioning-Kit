@@ -1,0 +1,12 @@
+# Optional NVIDIA NCCL runtime for the CUDA llama.cpp backend.
+#
+# The prebuilt CUDA llama-server (build b8738+) dynamically links libnccl.so.2 but
+# the release archive does not ship it, so a CUDA launch fails on a machine with no
+# NCCL. The app auto-discovers any libnccl.so.2 already present in this environment
+# (PyTorch bundles one); install this only if a clean env has none.
+#
+#   pip install -r requirements-cuda.txt
+#
+# Linux x86_64 only — there is no Windows/macOS NCCL wheel, and the Vulkan/CPU
+# llama.cpp backends do not need NCCL.
+nvidia-nccl-cu12; sys_platform == "linux" and platform_machine == "x86_64"

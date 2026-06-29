@@ -2,3 +2,6 @@ Pillow>=10.0
 openai>=1.0
 huggingface_hub>=0.23
 PySide6>=6.6
+# CUDA llama.cpp backend also needs NVIDIA NCCL (libnccl.so.2), which the llama.cpp
+# release doesn't bundle. Optional, Linux x86_64 only — see requirements-cuda.txt.
+

@@ -22,6 +22,15 @@ classifiers = [
     "Topic :: Multimedia :: Graphics",
 ]
 
+# Optional: NVIDIA NCCL runtime for the CUDA llama.cpp backend. From build b8738,
+# llama.cpp's prebuilt CUDA llama-server links libnccl.so.2 but the release does
+# not bundle it, so a CUDA launch fails on machines without NCCL. The app finds
+# any libnccl.so.2 already in the env (e.g. PyTorch's), but a clean env may have
+# none — `pip install ideogram-captioner[cuda]` supplies it. Linux x86_64 only:
+# there is no Windows/macOS NCCL wheel, and Vulkan/CPU backends don't need it.
+[project.optional-dependencies]
+cuda = ["nvidia-nccl-cu12; sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
 [project.scripts]
 ideogram-captioner = "ideogram_captioner.app:main"
 

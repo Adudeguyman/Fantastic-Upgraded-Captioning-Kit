@@ -1,4 +1,6 @@
 import unittest
+import os
+import shutil
 import tempfile
 import json
 from unittest.mock import patch
@@ -16,6 +18,7 @@ from ideogram_captioner.llm_captioning import (
     chat_text,
     chat_vision,
     ensure_model_assets,
+    ensure_server_running,
     extract_json,
     format_prompt,
     generate_json_refinement,
@@ -182,8 +185,8 @@ class LlmCaptioningTests(unittest.TestCase):
 
     def test_default_profile_is_downloadable_local_model(self):
         config = runtime_config_for_task(CaptioningSettings(), "caption")
-        self.assertEqual(config.hf_repo, "unsloth/Qwen2.5-VL-7B-Instruct-GGUF")
-        self.assertEqual(config.model_filename, "Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf")
+        self.assertEqual(config.hf_repo, "unsloth/Qwen3-VL-30B-A3B-Instruct-GGUF")
+        self.assertEqual(config.model_filename, "Qwen3-VL-30B-A3B-Instruct-UD-Q4_K_XL.gguf")
 
     def test_loads_profiles_from_json_file(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -370,8 +373,27 @@ class LlmCaptioningTests(unittest.TestCase):
         self.assertIn("--port 8111", command)
         self.assertIn("--alias caption-model", command)
         self.assertIn("-b 2048", command)
-        self.assertIn("-ub 2048", command)
+        self.assertIn("-ub 512", command)
+        self.assertIn("-np 1", command)
+        # -1 (auto) GPU layers: -ngl is omitted so llama.cpp's fitter decides
+        self.assertNotIn("-ngl", command)
         self.assertIn("--reasoning off", command)
+
+    def test_explicit_gpu_layers_passes_ngl(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            server = folder / "llama-server.exe"
+            model = folder / "model.gguf"
+            server.write_text("x", encoding="utf-8")
+            model.write_text("x", encoding="utf-8")
+            settings = CaptioningSettings(
+                llama_server_path=str(server),
+                base_url="http://127.0.0.1:8111/v1",
+                caption_model="caption-model",
+                llama_gpu_layers=24,
+            )
+            command = build_llama_server_command(settings, "caption", ModelAssets(model, None))
+        self.assertIn("-ngl 24", command)
 
     def test_can_limit_llama_reasoning_budget_when_thinking_is_enabled(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -496,6 +518,559 @@ class LlmCaptioningTests(unittest.TestCase):
 
     def test_safe_repo_dir(self):
         self.assertEqual(safe_repo_dir("org/model name"), "org__model__name")
+
+
+class EnsureServerRunningTests(unittest.TestCase):
+    def _settings(self, **over):
+        s = CaptioningSettings()
+        base = dict(
+            server_start_mode="local",
+            auto_start_server=True,
+            base_url="http://127.0.0.1:8000/v1",
+            api_key="x",
+            server_startup_timeout=5.0,
+        )
+        for k, v in {**base, **over}.items():
+            setattr(s, k, v)
+        return s
+
+    def test_skips_when_not_local_or_autostart_off(self):
+        import ideogram_captioner.llm_captioning as L
+        with patch.object(L, "start_server_process") as start:
+            self.assertIsNone(ensure_server_running(self._settings(server_start_mode="existing"), "caption"))
+            self.assertIsNone(ensure_server_running(self._settings(auto_start_server=False), "caption"))
+            start.assert_not_called()
+
+    def test_skips_launch_when_already_ready(self):
+        import ideogram_captioner.llm_captioning as L
+        with patch.object(L, "is_server_ready", return_value=True), \
+             patch.object(L, "start_server_process") as start:
+            self.assertIsNone(ensure_server_running(self._settings(), "caption"))
+            start.assert_not_called()
+
+    def test_launches_when_local_and_not_ready(self):
+        import ideogram_captioner.llm_captioning as L
+        with patch.object(L, "is_server_ready", return_value=False), \
+             patch.object(L, "ensure_model_assets", return_value=ModelAssets(Path("m.gguf"), Path("mm.gguf"))), \
+             patch.object(L, "build_llama_server_command", return_value="llama-server -m m.gguf") as cmd, \
+             patch.object(L, "start_server_process", return_value="PROC") as start:
+            proc = ensure_server_running(self._settings(), "caption")
+            self.assertEqual(proc, "PROC")
+            cmd.assert_called_once()
+            start.assert_called_once()
+
+
+class FindLlamaServerTests(unittest.TestCase):
+    def test_default_llama_dir_is_independent_of_models_dir(self):
+        import ideogram_captioner.llm_captioning as L
+        self.assertEqual(L.default_llama_dir(), L.app_base_dir() / "llama")
+        self.assertNotEqual(L.default_llama_dir(), L.default_models_dir())
+
+    def test_finds_binary_in_managed_llama_dir(self):
+        import ideogram_captioner.llm_captioning as L
+        with tempfile.TemporaryDirectory() as tmp:
+            llama = Path(tmp) / "llama"
+            (llama / "bin").mkdir(parents=True)
+            exe = "llama-server.exe" if os.name == "nt" else "llama-server"
+            target = llama / "bin" / exe
+            target.write_text("#!/bin/sh\n")
+            with patch.object(L, "default_llama_dir", return_value=llama), \
+                 patch.object(L, "app_base_dir", return_value=Path(tmp) / "app"), \
+                 patch.object(L.shutil, "which", return_value=None):
+                self.assertEqual(L.find_llama_server(), target)
+
+    def test_falls_back_to_path(self):
+        import ideogram_captioner.llm_captioning as L
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(L, "default_llama_dir", return_value=Path(tmp) / "llama"), \
+                 patch.object(L, "app_base_dir", return_value=Path(tmp) / "app"), \
+                 patch.object(L.shutil, "which", return_value="/usr/bin/llama-server"):
+                self.assertEqual(L.find_llama_server(), Path("/usr/bin/llama-server"))
+
+    def test_returns_none_when_nothing_found(self):
+        import ideogram_captioner.llm_captioning as L
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(L, "default_llama_dir", return_value=Path(tmp) / "llama"), \
+                 patch.object(L, "app_base_dir", return_value=Path(tmp) / "app"), \
+                 patch.object(L.shutil, "which", return_value=None):
+                self.assertIsNone(L.find_llama_server())
+
+
+class DetectGpuTests(unittest.TestCase):
+    def test_sm_from_compute_cap(self):
+        from ideogram_captioner.llm_captioning import _sm_from_compute_cap
+        self.assertEqual(_sm_from_compute_cap("12.0"), "120")
+        self.assertEqual(_sm_from_compute_cap("8.6"), "86")
+        self.assertEqual(_sm_from_compute_cap("8.9"), "89")
+        self.assertEqual(_sm_from_compute_cap("garbage"), "")
+
+    def test_detects_nvidia_from_smi(self):
+        import ideogram_captioner.llm_captioning as L
+        import subprocess as sp
+        cp = sp.CompletedProcess(args=[], returncode=0, stdout="NVIDIA GeForce RTX 5090, 12.0\n")
+        with patch.object(L.subprocess, "run", return_value=cp):
+            info = L.detect_gpu()
+        self.assertEqual(info.vendor, "nvidia")
+        self.assertEqual(info.name, "NVIDIA GeForce RTX 5090")
+        self.assertEqual(info.compute_cap, "12.0")
+        self.assertEqual(info.sm, "120")
+        self.assertEqual(info.backend, "cuda")
+        self.assertIn("sm120", info.summary)
+
+    def test_falls_back_to_vulkan_without_nvidia(self):
+        import ideogram_captioner.llm_captioning as L
+        with patch.object(L.subprocess, "run", side_effect=FileNotFoundError()):
+            info = L.detect_gpu()
+        self.assertEqual(info.vendor, "none")
+        self.assertEqual(info.backend, "vulkan")
+        self.assertIn("VULKAN", info.summary)
+
+
+class LlamaAssetResolverTests(unittest.TestCase):
+    OFFICIAL = [
+        {"name": "llama-b9828-bin-win-cuda-13.3-x64.zip"},
+        {"name": "llama-b9828-bin-win-cuda-12.4-x64.zip"},
+        {"name": "cudart-llama-bin-win-cuda-13.3-x64.zip"},
+        {"name": "cudart-llama-bin-win-cuda-12.4-x64.zip"},
+        {"name": "llama-b9828-bin-win-vulkan-x64.zip"},
+        {"name": "llama-b9828-bin-win-cpu-x64.zip"},
+        {"name": "llama-b9828-bin-macos-arm64.tar.gz"},
+        {"name": "llama-b9828-bin-macos-x64.tar.gz"},
+        {"name": "llama-b9828-bin-ubuntu-x64.tar.gz"},
+        {"name": "llama-b9828-bin-ubuntu-arm64.tar.gz"},
+    ]
+    LLAMAUP = [
+        {"name": "llama-b9800-linux-cuda12.8-sm120-x64.tar.gz"},
+        {"name": "llama-b9800-linux-cuda12.6-sm89-x64.tar.gz"},
+    ]
+
+    def names(self, assets):
+        from ideogram_captioner.llm_captioning import _asset_name
+        return [_asset_name(a) for a in assets]
+
+    def test_windows_cuda_picks_newest_plus_cudart(self):
+        from ideogram_captioner.llm_captioning import select_llama_assets
+        got = select_llama_assets(self.OFFICIAL, system="Windows", arch="x64", backend="cuda")
+        names = self.names(got)
+        self.assertEqual(len(got), 2)
+        self.assertTrue(any("win-cuda-13.3" in n for n in names))   # newest cuda
+        self.assertTrue(any("cudart" in n and "13.3" in n for n in names))  # runtime companion
+        self.assertFalse(any("12.4" in n for n in names))
+
+    def test_windows_vulkan_and_cpu(self):
+        from ideogram_captioner.llm_captioning import select_llama_assets
+        v = select_llama_assets(self.OFFICIAL, system="Windows", arch="x64", backend="vulkan")
+        c = select_llama_assets(self.OFFICIAL, system="Windows", arch="x64", backend="cpu")
+        self.assertEqual(self.names(v), ["llama-b9828-bin-win-vulkan-x64.zip"])
+        self.assertEqual(self.names(c), ["llama-b9828-bin-win-cpu-x64.zip"])
+
+    def test_macos_arch_specific(self):
+        from ideogram_captioner.llm_captioning import select_llama_assets
+        got = select_llama_assets(self.OFFICIAL, system="Darwin", arch="arm64", backend="metal")
+        self.assertEqual(self.names(got), ["llama-b9828-bin-macos-arm64.tar.gz"])
+
+    def test_linux_cuda_matches_sm(self):
+        from ideogram_captioner.llm_captioning import select_llama_assets
+        got = select_llama_assets(self.LLAMAUP, system="Linux", arch="x64", backend="cuda", sm="120")
+        self.assertEqual(self.names(got), ["llama-b9800-linux-cuda12.8-sm120-x64.tar.gz"])
+        # unknown sm -> no match (caller falls back to build/vulkan)
+        self.assertEqual(select_llama_assets(self.LLAMAUP, system="Linux", arch="x64", backend="cuda", sm="61"), ())
+
+    def test_linux_vulkan_uses_official_ubuntu(self):
+        from ideogram_captioner.llm_captioning import select_llama_assets
+        got = select_llama_assets(self.OFFICIAL, system="Linux", arch="x64", backend="vulkan")
+        self.assertEqual(self.names(got), ["llama-b9828-bin-ubuntu-x64.tar.gz"])
+
+    def test_no_match_returns_empty(self):
+        from ideogram_captioner.llm_captioning import select_llama_assets
+        self.assertEqual(select_llama_assets([{"name": "readme.txt"}], system="Windows", arch="x64", backend="cuda"), ())
+
+    def test_build_number_parsing_and_staleness(self):
+        from ideogram_captioner.llm_captioning import parse_build_number, is_update_available
+        self.assertEqual(parse_build_number("llama-b9828-bin-win-cpu-x64.zip"), 9828)
+        self.assertIsNone(parse_build_number("v3.18.0"))
+        self.assertTrue(is_update_available(9828, 9900))
+        self.assertFalse(is_update_available(9900, 9828))
+        self.assertFalse(is_update_available(None, 9900))
+
+    def test_installed_record_roundtrip(self):
+        import ideogram_captioner.llm_captioning as L
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(L, "default_llama_dir", return_value=Path(tmp) / "llama"):
+                self.assertIsNone(L.read_installed_llama())  # nothing yet
+                rec = L.InstalledLlama(source="ggml-org/llama.cpp", build=9828, backend="cuda",
+                                       sm="120", asset="llama-b9828-bin-win-cuda-13.3-x64.zip",
+                                       sha256="abc", binary="/x/llama-server.exe", installed_at="2026-06-28")
+                L.write_installed_llama(rec)
+                back = L.read_installed_llama()
+                self.assertEqual(back.build, 9828)
+                self.assertEqual(back.backend, "cuda")
+                self.assertEqual(back.asset, "llama-b9828-bin-win-cuda-13.3-x64.zip")
+
+
+class LlamaUpdateStateTests(unittest.TestCase):
+    def _rec(self, published, build=9000):
+        from ideogram_captioner.llm_captioning import InstalledLlama
+        return InstalledLlama(build=build, published_at=published)
+
+    def test_arch_error_detection(self):
+        from ideogram_captioner.llm_captioning import is_model_arch_error
+        self.assertTrue(is_model_arch_error("error: unknown model architecture: 'glm5'"))
+        self.assertTrue(is_model_arch_error("unsupported model architecture"))
+        self.assertFalse(is_model_arch_error("CUDA out of memory"))
+        self.assertFalse(is_model_arch_error(""))
+
+    def test_build_age_days(self):
+        import ideogram_captioner.llm_captioning as L
+        from datetime import datetime, timezone
+        now = datetime(2026, 6, 28, tzinfo=timezone.utc)
+        self.assertEqual(L.build_age_days(self._rec("2026-06-28T00:00:00Z"), now=now), 0)
+        self.assertEqual(L.build_age_days(self._rec("2026-05-01T00:00:00Z"), now=now), 58)
+        self.assertIsNone(L.build_age_days(self._rec(""), now=now))
+
+    def test_update_state_classification(self):
+        import ideogram_captioner.llm_captioning as L
+        from datetime import datetime, timezone
+        now = datetime(2026, 6, 28, tzinfo=timezone.utc)
+        self.assertEqual(L.update_state(None, 9100)["state"], "none")
+        # newer exists but binary is recent -> informational only
+        self.assertEqual(L.update_state(self._rec("2026-06-20T00:00:00Z", 9000), 9100, now=now)["state"], "available")
+        # no newer / not older -> up to date
+        self.assertEqual(L.update_state(self._rec("2026-06-25T00:00:00Z", 9100), 9100, now=now)["state"], "up_to_date")
+        # old enough -> recommended (even though only ~100 builds behind)
+        old = L.update_state(self._rec("2026-05-01T00:00:00Z", 9000), 9100, now=now)
+        self.assertEqual(old["state"], "recommended")
+        self.assertGreaterEqual(old["age_days"], 30)
+        # recommended on age even if 'latest' couldn't be fetched (network down)
+        self.assertEqual(L.update_state(self._rec("2026-05-01T00:00:00Z", 9000), None, now=now)["state"], "recommended")
+
+
+class LlamaFetchAndInstallTests(unittest.TestCase):
+    def test_fetch_release_parses_assets(self):
+        import ideogram_captioner.llm_captioning as L
+        payload = {
+            "tag_name": "b9828",
+            "published_at": "2026-06-27T23:18:43Z",
+            "assets": [
+                {"name": "llama-b9828-bin-ubuntu-x64.tar.gz", "browser_download_url": "http://x/a",
+                 "size": 123, "digest": "sha256:deadbeef"},
+                {"name": "other.txt", "browser_download_url": "http://x/b", "size": 1},
+            ],
+        }
+        with patch.object(L, "_github_get", return_value=payload):
+            info = L.fetch_release("ggml-org/llama.cpp")
+        self.assertEqual(info.build, 9828)
+        self.assertEqual(info.published_at[:4], "2026")
+        self.assertEqual(len(info.assets), 2)
+        self.assertEqual(info.assets[0].sha256, "deadbeef")
+        with patch.object(L, "_github_get", side_effect=OSError("boom")):
+            self.assertIsNone(L.fetch_release("x/y"))
+
+    def test_verify_sha256(self):
+        import ideogram_captioner.llm_captioning as L
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "blob"
+            f.write_bytes(b"hello world")
+            good = hashlib.sha256(b"hello world").hexdigest()
+            self.assertTrue(L.verify_sha256(f, good))
+            self.assertFalse(L.verify_sha256(f, "00" * 32))
+            self.assertFalse(L.verify_sha256(f, ""))
+
+    def _make_archive(self, path: Path):
+        # a tar.gz with a nested llama-server + a sibling lib, like a real release
+        import tarfile, io
+        with tarfile.open(path, "w:gz") as tf:
+            for name, body in (("dist/llama-server", b"#!/bin/sh\necho hi\n"),
+                               ("dist/libggml.so", b"\x00lib")):
+                data = body
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+
+    def test_install_unpack_swap_and_rollback(self):
+        import ideogram_captioner.llm_captioning as L
+        with tempfile.TemporaryDirectory() as tmp:
+            llama_dir = Path(tmp) / "llama"
+            fixture = Path(tmp) / "fixture.tar.gz"
+            self._make_archive(fixture)
+
+            def fake_downloader(url, dest, progress=None):
+                shutil.copy(fixture, dest)
+                return Path(dest)
+
+            assets = (L.ReleaseAsset(name="llama-b9828-bin-ubuntu-x64.tar.gz", url="http://x", sha256=""),)
+            release = L.ReleaseInfo(repo="ggml-org/llama.cpp", tag="b9828", build=9828,
+                                    published_at="2026-06-27T23:18:43Z", assets=assets)
+            with patch.object(L, "default_llama_dir", return_value=llama_dir):
+                rec = L.install_llama_release(release, assets, backend="vulkan", downloader=fake_downloader)
+                self.assertEqual(rec.build, 9828)
+                self.assertEqual(rec.backend, "vulkan")
+                self.assertEqual(rec.published_at, "2026-06-27T23:18:43Z")
+                self.assertTrue(Path(rec.binary).exists())
+                # installed.json round-trips and find_llama_server prefers it
+                self.assertEqual(L.read_installed_llama().build, 9828)
+                self.assertEqual(L.find_llama_server(), Path(rec.binary))
+                self.assertFalse(L.has_llama_backup())
+                # second install creates a backup we can roll back to
+                rec2 = L.install_llama_release(release, assets, backend="vulkan", downloader=fake_downloader)
+                self.assertTrue(L.has_llama_backup())
+                self.assertTrue(L.rollback_llama())
+                self.assertTrue(Path(L.read_installed_llama().binary).exists())
+
+
+class LlamaPlanTests(unittest.TestCase):
+    def test_resolve_backend_hint_overrides_detection(self):
+        import ideogram_captioner.llm_captioning as L
+        gpu = L.GpuInfo(vendor="nvidia", backend="cuda", sm="120", name="X")
+        s = L.CaptioningSettings()
+        self.assertEqual(L.resolve_backend(s, gpu), "cuda")          # auto -> detected
+        s.llama_backend_hint = "vulkan"
+        self.assertEqual(L.resolve_backend(s, gpu), "vulkan")        # hint wins
+
+    def test_plan_resolves_and_handles_offline(self):
+        import ideogram_captioner.llm_captioning as L
+        rel = L.ReleaseInfo(repo="ggml-org/llama.cpp", tag="b9828", build=9828,
+                            published_at="2026-06-27T00:00:00Z",
+                            assets=(L.ReleaseAsset(name="llama-b9828-bin-ubuntu-x64.tar.gz",
+                                                   url="http://x", sha256="", size=12_000_000),))
+        s = L.CaptioningSettings()
+        s.llama_backend_hint = "vulkan"   # deterministic regardless of test host GPU
+        plan = L.plan_llama_acquisition(s, fetch=lambda repo, tag=None: rel)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.backend, "vulkan")
+        self.assertEqual(len(plan.assets), 1)
+        self.assertIn("VULKAN", plan.description)
+        # offline / no release -> None
+        self.assertIsNone(L.plan_llama_acquisition(s, fetch=lambda *a, **k: None))
+
+
+class ResourceMonitorTests(unittest.TestCase):
+    def test_parse_gpu_usage(self):
+        import ideogram_captioner.llm_captioning as L
+        vu, vt, gp = L._parse_gpu_usage("18342, 32768, 73")
+        self.assertAlmostEqual(vu, 17.91, places=1)
+        self.assertAlmostEqual(vt, 32.0, places=1)
+        self.assertEqual(gp, 73.0)
+        self.assertEqual(L._parse_gpu_usage("garbage"), (None, None, None))
+        self.assertEqual(L._parse_gpu_usage(""), (None, None, None))
+
+    def test_format_resources_omits_missing(self):
+        import ideogram_captioner.llm_captioning as L
+        full = L.ResourceSample(ram_percent=41.0, vram_used_gb=18.3, vram_total_gb=32.0, gpu_percent=73.0)
+        self.assertEqual(L.format_resources(full), "RAM 41%  \u00b7  VRAM 18.3/32 GB  \u00b7  GPU 73%")
+        self.assertEqual(L.format_resources(L.ResourceSample(ram_percent=55.0)), "RAM 55%")
+        self.assertEqual(L.format_resources(L.ResourceSample()), "")
+
+    def test_read_ram_live(self):
+        import ideogram_captioner.llm_captioning as L
+        used, total = L._read_ram()
+        # this host is Linux, so we expect a real reading
+        self.assertIsNotNone(total)
+        self.assertTrue(0 < used <= total)
+
+
+class HasModelConfigTests(unittest.TestCase):
+    def test_has_model_config(self):
+        import ideogram_captioner.llm_captioning as L
+        from types import SimpleNamespace
+        cfg = lambda local="", hf="": SimpleNamespace(local_model_path=local, hf_repo=hf)
+        s = L.CaptioningSettings()
+        with patch.object(L, "runtime_config_for_task", return_value=cfg(hf="org/repo")):
+            self.assertTrue(L.has_model_config(s))
+        with patch.object(L, "runtime_config_for_task", return_value=cfg(local="/x/m.gguf")):
+            self.assertTrue(L.has_model_config(s))
+        with patch.object(L, "runtime_config_for_task", return_value=cfg()):
+            self.assertFalse(L.has_model_config(s))
+        with patch.object(L, "runtime_config_for_task", side_effect=RuntimeError):
+            self.assertFalse(L.has_model_config(s))
+
+
+class ServerLaunchEnvTests(unittest.TestCase):
+    def _var(self):
+        import os, sys
+        if os.name == "nt":
+            return "PATH"
+        return "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+
+    def test_prepends_binary_and_lib_dirs(self):
+        import os
+        import ideogram_captioner.llm_captioning as L
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = Path(tmp) / "bin"
+            (bindir / "lib").mkdir(parents=True)
+            binp = bindir / ("llama-server.exe" if os.name == "nt" else "llama-server")
+            binp.write_text("x")
+            (bindir / "lib" / "libggml.so").write_text("x")
+            env = L.server_launch_env(binp)
+            value = env[self._var()]
+            self.assertIn(str(bindir), value)
+            self.assertIn(str(bindir / "lib"), value)
+
+    def test_none_returns_untouched_copy(self):
+        import ideogram_captioner.llm_captioning as L
+        env = L.server_launch_env(None)
+        self.assertIsInstance(env, dict)
+
+    def test_resolver_prefers_explicit_path(self):
+        import ideogram_captioner.llm_captioning as L
+        s = L.CaptioningSettings()
+        s.llama_server_path = "/custom/llama-server"
+        self.assertEqual(str(L.resolve_llama_server_path(s)), "/custom/llama-server")
+        s.llama_server_path = ""
+        with patch.object(L, "find_llama_server", return_value=Path("/auto/llama-server")):
+            self.assertEqual(str(L.resolve_llama_server_path(s)), "/auto/llama-server")
+
+
+class MissingModelFilesTests(unittest.TestCase):
+    def test_missing_then_cached(self):
+        import ideogram_captioner.llm_captioning as L
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            s = L.CaptioningSettings()
+            s.models_dir = tmp
+            cfg = SimpleNamespace(local_model_path="", hf_repo="org/repo", mmproj_repo="",
+                                  model_filename="m.gguf", mmproj_filename="mm.gguf")
+            with patch.object(L, "runtime_config_for_task", return_value=cfg):
+                missing = L.missing_model_files(s)
+                self.assertIn("m.gguf", missing)
+                self.assertIn("mm.gguf", missing)
+                d = Path(tmp) / L.safe_repo_dir("org/repo")
+                d.mkdir(parents=True, exist_ok=True)
+                (d / "m.gguf").write_text("x")
+                missing2 = L.missing_model_files(s)
+                self.assertNotIn("m.gguf", missing2)
+                self.assertIn("mm.gguf", missing2)
+
+    def test_local_path_needs_no_download(self):
+        import ideogram_captioner.llm_captioning as L
+        from types import SimpleNamespace
+        cfg = SimpleNamespace(local_model_path="/x/m.gguf", hf_repo="", mmproj_repo="",
+                              model_filename="", mmproj_filename="")
+        with patch.object(L, "runtime_config_for_task", return_value=cfg):
+            self.assertEqual(L.missing_model_files(L.CaptioningSettings()), [])
+
+
+class ModelLessLaunchTests(unittest.TestCase):
+    def test_router_detection_cached(self):
+        import ideogram_captioner.llm_captioning as L
+        with tempfile.TemporaryDirectory() as tmp:
+            binp = Path(tmp) / "llama-server"
+            binp.write_text("x")
+            L._ROUTER_SUPPORT.clear()
+            R = lambda out: type("R", (), {"stdout": out, "stderr": "", "returncode": 0})()
+            with patch.object(L.subprocess, "run", return_value=R("  --models-dir DIR\n")):
+                self.assertTrue(L.llama_server_supports_router(binp))
+            L._ROUTER_SUPPORT.clear()
+            with patch.object(L.subprocess, "run", return_value=R("  -m FILE  model path\n")):
+                self.assertFalse(L.llama_server_supports_router(binp))
+
+    def test_model_less_command_and_error(self):
+        import ideogram_captioner.llm_captioning as L
+        with tempfile.TemporaryDirectory() as tmp:
+            binp = Path(tmp) / "llama-server"
+            binp.write_text("x")
+            s = L.CaptioningSettings()
+            s.llama_server_path = str(binp)
+            s.models_dir = str(Path(tmp) / "models")
+            L._ROUTER_SUPPORT[str(binp)] = True
+            cmd = L.build_llama_server_command(s, "caption", L.ModelAssets(), model_less=True)
+            self.assertIn("--models-dir", cmd)
+            self.assertNotIn(" -m ", cmd)
+            self.assertNotIn("--mmproj", cmd)
+            L._ROUTER_SUPPORT[str(binp)] = False
+            with self.assertRaises(L.AutoCaptionError):
+                L.build_llama_server_command(s, "caption", L.ModelAssets(), model_less=True)
+
+
+class ModelDiscoveryTests(unittest.TestCase):
+    def test_locate_app_and_extra_dirs(self):
+        import ideogram_captioner.llm_captioning as L
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            app = tmp / "app"
+            (app / L.safe_repo_dir("org/repo")).mkdir(parents=True)
+            (app / L.safe_repo_dir("org/repo") / "m.gguf").write_text("x")
+            lm = tmp / "lmstudio" / "models" / "author" / "model"
+            lm.mkdir(parents=True)
+            (lm / "vision.gguf").write_text("y")
+            s = L.CaptioningSettings()
+            s.models_dir = str(app)
+            s.extra_model_dirs = f"{tmp/'lmstudio'/'models'}\n{tmp/'missing'}"
+            self.assertEqual(L.locate_existing_model_file(s, "org/repo", "m.gguf").name, "m.gguf")
+            self.assertEqual(L.locate_existing_model_file(s, "v/repo", "vision.gguf").name, "vision.gguf")
+            self.assertIsNone(L.locate_existing_model_file(s, "x/y", "absent.gguf"))
+
+    def test_missing_model_files_uses_discovery(self):
+        import ideogram_captioner.llm_captioning as L
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            lm = tmp / "lm"
+            lm.mkdir()
+            (lm / "present.gguf").write_text("z")
+            s = L.CaptioningSettings()
+            s.models_dir = str(tmp / "app")
+            s.extra_model_dirs = str(lm)
+            s.caption_profile_id = "custom"
+            s.caption_hf_repo = "org/repo"
+            s.caption_model_filename = "present.gguf;absent.gguf"
+            s.caption_mmproj_filename = ""
+            missing = L.missing_model_files(s, "caption")
+            self.assertNotIn("present.gguf", missing)
+            self.assertIn("absent.gguf", missing)
+
+
+    def test_discover_and_pair_mmproj(self):
+        import ideogram_captioner.llm_captioning as L
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            d = tmp / "models" / "org__repo"
+            d.mkdir(parents=True)
+            (d / "model-Q4.gguf").write_text("x")
+            (d / "model-mmproj.gguf").write_text("m")
+            other = tmp / "lm" / "a"
+            other.mkdir(parents=True)
+            (other / "plain-Q5.gguf").write_text("y")
+            s = L.CaptioningSettings()
+            s.models_dir = str(tmp / "models")
+            s.extra_model_dirs = str(tmp / "lm")
+            models, mmprojs = L.discover_local_gguf_models(s)
+            names = {p.name for p in models}
+            self.assertIn("model-Q4.gguf", names)
+            self.assertIn("plain-Q5.gguf", names)
+            self.assertNotIn("model-mmproj.gguf", names)
+            paired = L.guess_mmproj_for(d / "model-Q4.gguf", mmprojs)
+            self.assertIsNotNone(paired)
+            self.assertIn("mmproj", paired.name)
+            # a model with no sibling projector pairs to nothing
+            self.assertIsNone(L.guess_mmproj_for(other / "plain-Q5.gguf", mmprojs))
+
+
+    def test_vram_fit_and_recommendation(self):
+        import ideogram_captioner.llm_captioning as L
+        self.assertEqual(L.vram_fit(20, 32), "fits")
+        self.assertEqual(L.vram_fit(26, 32), "tight")
+        self.assertEqual(L.vram_fit(30, 32), "too_big")
+        self.assertEqual(L.vram_fit(20, None), "unknown")
+        self.assertEqual(L.vram_fit(0, 32), "unknown")
+        # tiers
+        self.assertEqual(L.model_size_tier(7), "Small")
+        self.assertEqual(L.model_size_tier(11), "Medium")
+        self.assertEqual(L.model_size_tier(20), "Large")
+        self.assertEqual(L.model_size_tier(30), "XL")
+        # big card -> curated flagship; tiny/unknown -> smallest
+        self.assertEqual(L.recommend_profile_for_vram("caption", 32).id, "unsloth-qwen3vl-30b-q4")
+        smallest = min(p.vram_gb for p in L.profiles_for_task("caption") if p.kind == "hf" and p.vram_gb > 0)
+        self.assertEqual(L.recommend_profile_for_vram("caption", 6).vram_gb, smallest)
+        self.assertEqual(L.recommend_profile_for_vram("caption", None).vram_gb, smallest)
+
+    def test_qwen25_dropped_and_migration(self):
+        import ideogram_captioner.llm_captioning as L
+        ids = [p.id for p in L.profiles_for_task("caption")]
+        self.assertFalse(any("qwen25" in i for i in ids))
+        self.assertEqual(ids[0], "unsloth-qwen3vl-30b-q4")
+        # a saved selection pointing at the dropped profile falls back to the default
+        self.assertEqual(L._profile_by_id("caption", "unsloth-qwen25vl-7b-q4").id, "unsloth-qwen3vl-30b-q4")
 
 
 if __name__ == "__main__":

@@ -11,8 +11,10 @@ import difflib
 import html
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 import webbrowser
 from dataclasses import replace
 from pathlib import Path
@@ -91,9 +93,38 @@ from .llm_captioning import (
     profiles_for_task,
     profile_labels,
     profile_id_from_label,
+    discover_local_gguf_models,
+    estimate_gguf_vram_gb,
+    guess_mmproj_for,
+    CUSTOM_LOCAL_PROFILE,
     profile_label_from_id,
     is_server_ready,
     server_model_ids,
+    ensure_server_running,
+    stop_server_process,
+    find_llama_server,
+    detect_gpu,
+    recommend_profile_for_vram,
+    vram_fit,
+    model_size_tier,
+    has_model_config,
+    missing_model_files,
+    lmstudio_models_dir,
+    known_server_model_dirs,
+    hf_hub_cache_dir,
+    MODEL_TARGET_APP,
+    MODEL_TARGET_HF,
+    llama_server_supports_router,
+    sample_resources,
+    format_resources,
+    plan_llama_acquisition,
+    install_llama_release,
+    rollback_llama,
+    has_llama_backup,
+    read_installed_llama,
+    update_state,
+    fetch_release,
+    is_model_arch_error,
     default_profiles_path,
     default_models_dir,
     profile_seed_data,
@@ -469,6 +500,7 @@ FLAG_ROLE = int(Qt.UserRole) + 4     # per-item flag: user manually flagged for 
 FLAG_COLOR = "#E5484D"               # red flag — "you flagged this for manual review"
 
 SERVER_PING_INTERVAL_MS = 2000  # how often the background monitor re-checks the server
+RESOURCE_SAMPLE_INTERVAL_MS = 2000  # how often the status-bar resource readout refreshes
 SERVER_PING_TIMEOUT = 1.0  # per-check network timeout (short so the loop stays responsive)
 
 
@@ -757,6 +789,11 @@ class CanvasView(QGraphicsView):
                 self.viewport().setCursor(Qt.OpenHandCursor)
             event.accept()
             return
+        # Delete / Backspace removes the selected box (same path as the delete tool).
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            if self.controller.delete_selected_box():
+                event.accept()
+            return
         # Arrow keys nudge the selected box (Shift = ×10). Falls through to the
         # default view behaviour (scroll) when no box is selected.
         arrows = {Qt.Key_Left: (-1, 0), Qt.Key_Right: (1, 0),
@@ -817,7 +854,13 @@ class CanvasView(QGraphicsView):
             event.accept()
             return
         if self.mode == "delete" and event.button() == Qt.LeftButton:
-            self.controller.delete_box_at(self._scene_pos(event))
+            # One-shot action on the current selection (not a hit-test at the click,
+            # which would grab a larger overlapping box). Delete the selected box,
+            # then drop back to the select tool so the next click selects again.
+            self.controller.delete_selected_box()
+            revert = getattr(self.controller, "_activate_tool", None)
+            if revert is not None:
+                revert("select")
             event.accept()
             return
         # A click on a box's header pill should focus AND let you drag that box,
@@ -887,6 +930,7 @@ class AiJobThread(QThread):
     progress = Signal(str)
     done = Signal(object)
     error = Signal(str)
+    server_started = Signal(object)
 
     def __init__(self, operation, settings, image_path, caption, guidance, source_caption, instructions):
         super().__init__()
@@ -903,6 +947,12 @@ class AiJobThread(QThread):
             self.progress.emit(msg)
 
         try:
+            # In local mode this downloads the model (first time) and launches
+            # llama-server; a no-op for existing/custom servers or if one is up.
+            task = "bbox" if self.operation == "bboxes" else "caption"
+            proc = ensure_server_running(self.settings, task, progress=prog)
+            if proc is not None:
+                self.server_started.emit(proc)
             op = self.operation
             if op == "json_image":
                 caption = generate_json_from_image(
@@ -946,6 +996,7 @@ class BatchCaptionThread(QThread):
     item_done = Signal(str, object)         # image path str, caption
     item_error = Signal(str, str)           # image path str, error message
     batch_finished = Signal(int, int, bool)  # success, fail, cancelled
+    server_started = Signal(object)         # launched llama-server process
 
     def __init__(self, settings, items, delay_ms: int = 0):
         super().__init__()
@@ -965,6 +1016,20 @@ class BatchCaptionThread(QThread):
         fail = 0
         cancelled = False
         total = len(self.items)
+        # Bring up a local server once for the whole run (download + launch on the
+        # first run only). If this fails, fail the batch cleanly rather than erroring
+        # on every image.
+        try:
+            proc = ensure_server_running(
+                self.settings, "caption",
+                progress=lambda m: self.item_progress.emit(0, total, m),
+            )
+            if proc is not None:
+                self.server_started.emit(proc)
+        except Exception as exc:
+            self.item_error.emit("", f"Could not start the server: {exc}")
+            self.batch_finished.emit(0, 0, False)
+            return
         for i, (image_path, guidance) in enumerate(self.items, start=1):
             if self.isInterruptionRequested():
                 cancelled = True
@@ -991,6 +1056,61 @@ class BatchCaptionThread(QThread):
             if self.delay_ms and i < total:
                 self._interruptible_sleep(self.delay_ms)
         self.batch_finished.emit(success, fail, cancelled)
+
+
+class ClickableLabel(QLabel):
+    """A QLabel that emits `clicked` on left-press — used for the status-bar server
+    indicator so it can open the connection settings."""
+
+    clicked = Signal()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class LlamaInstallThread(QThread):
+    """Downloads + verifies + installs a llama.cpp build off the GUI thread.
+    The plan (assets, backend, sm) is resolved on the main thread first."""
+
+    progress = Signal(str)
+    done = Signal(object)   # InstalledLlama
+    error = Signal(str)
+
+    def __init__(self, plan):
+        super().__init__()
+        self.plan = plan
+
+    def run(self) -> None:
+        try:
+            record = install_llama_release(
+                self.plan.release,
+                self.plan.assets,
+                backend=self.plan.backend,
+                sm=self.plan.sm,
+                progress=lambda m: self.progress.emit(m),
+            )
+            self.done.emit(record)
+        except Exception as exc:  # surfaced to the UI as a readable message
+            self.error.emit(str(exc))
+
+
+class LlamaUpdateCheckThread(QThread):
+    """Metadata-only 'is there a newer build?' check, off the GUI thread."""
+
+    result = Signal(int)   # latest build number, or -1 on failure
+
+    def __init__(self, repo: str):
+        super().__init__()
+        self.repo = repo
+
+    def run(self) -> None:
+        try:
+            info = fetch_release(self.repo, None)
+            self.result.emit(info.build if info and info.build else -1)
+        except Exception:
+            self.result.emit(-1)
 
 
 class ServerStatusMonitor(QThread):
@@ -1028,6 +1148,161 @@ class ServerStatusMonitor(QThread):
                 waited += 50
 
 
+class ResourceMonitor(QThread):
+    """Samples RAM (+ VRAM/GPU% on NVIDIA) off the GUI thread, ~every 2s, for the
+    status-bar readout. Loops sequentially like the server monitor so a slow
+    nvidia-smi can't stack up overlapping samples."""
+
+    sampled = Signal(str)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.interval_ms = RESOURCE_SAMPLE_INTERVAL_MS
+
+    def run(self) -> None:
+        while not self.isInterruptionRequested():
+            try:
+                text = format_resources(sample_resources())
+            except Exception:
+                text = ""
+            self.sampled.emit(text)
+            waited = 0
+            while waited < self.interval_ms and not self.isInterruptionRequested():
+                self.msleep(50)
+                waited += 50
+
+
+class LlamaServerThread(QThread):
+    """Brings a local llama-server up off the GUI thread (resolve model, launch,
+    wait for readiness). Emits the launched process, or None if one was already up."""
+
+    progress = Signal(str)
+    started_proc = Signal(object)   # subprocess.Popen | None
+    error = Signal(str)
+
+    def __init__(self, settings, model_less: bool = False):
+        super().__init__()
+        self.settings = settings
+        self.model_less = model_less
+
+    def run(self) -> None:
+        try:
+            proc = ensure_server_running(self.settings, "caption",
+                                         progress=lambda m: self.progress.emit(m),
+                                         model_less=self.model_less)
+            self.started_proc.emit(proc)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class ServerPopover(QWidget):
+    """Small popover above the status-bar server indicator: a status line, a
+    'Server settings…' link, and — in local mode — a Start/Stop button. Matches
+    the filmstrip preview's rounded dark card, with the pointer beneath."""
+
+    _BORDER = "#0f848a"
+    _ARROW = 12
+
+    def __init__(self, theme, *, on_settings, on_start, on_stop, on_start_nomodel=None, parent=None) -> None:
+        super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self._t = theme
+        self._margin = 16
+        self._on_start = on_start
+        self._on_stop = on_stop
+        self._on_start_nomodel = on_start_nomodel
+        self._running = False
+
+        self.card = QWidget(self)
+        self.card.setObjectName("ServerPopCard")
+        self.card.setMinimumWidth(208)
+        self.card.setStyleSheet(
+            f"#ServerPopCard {{ background: {theme.surface_2};"
+            f" border: 1px solid {self._BORDER}; border-radius: 8px; }}"
+        )
+        shadow = QGraphicsDropShadowEffect(self.card)
+        shadow.setBlurRadius(28)
+        shadow.setXOffset(0)
+        shadow.setYOffset(10)
+        shadow.setColor(QColor(0, 0, 0, 140))
+        self.card.setGraphicsEffect(shadow)
+
+        lay = QVBoxLayout(self.card)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(9)
+
+        self.status = QLabel(self.card)
+        self.status.setTextFormat(Qt.RichText)
+        lay.addWidget(self.status)
+
+        self.startstop = QPushButton(self.card)
+        self.startstop.setObjectName("Primary")
+        self.startstop.setCursor(Qt.PointingHandCursor)
+        self.startstop.clicked.connect(self._toggle)
+        lay.addWidget(self.startstop)
+
+        self.startnomodel = QPushButton("Start without model", self.card)
+        self.startnomodel.setCursor(Qt.PointingHandCursor)
+        self.startnomodel.setToolTip("Launch the server with no model loaded, just to check it runs.")
+        self.startnomodel.clicked.connect(self._do_nomodel)
+        lay.addWidget(self.startnomodel)
+
+        link = QLabel(
+            f'<a href="#" style="color:{self._BORDER}; text-decoration:none;">Server settings…</a>',
+            self.card,
+        )
+        link.setCursor(Qt.PointingHandCursor)
+        link.linkActivated.connect(lambda _=None: (self.hide(), on_settings()))
+        lay.addWidget(link)
+
+        self.card.move(self._margin, self._margin)
+
+    def _toggle(self) -> None:
+        self.hide()
+        (self._on_stop if self._running else self._on_start)()
+
+    def _do_nomodel(self) -> None:
+        self.hide()
+        if callable(self._on_start_nomodel):
+            self._on_start_nomodel()
+
+    def configure(self, *, status_html: str, show_startstop: bool, running: bool,
+                  show_nomodel: bool = False) -> None:
+        self.status.setText(status_html)
+        self._running = running
+        self.startstop.setVisible(show_startstop)
+        if show_startstop:
+            self.startstop.setText("Stop server" if running else "Start server")
+        self.startnomodel.setVisible(show_nomodel)
+        self.card.adjustSize()
+        self.resize(self.card.width() + 2 * self._margin,
+                    self.card.height() + 2 * self._margin + self._ARROW)
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        half = self._ARROW / 2
+        cx = self.width() / 2
+        cy = float(self._margin + self.card.height())   # bottom edge of the card
+        top = QPointF(cx, cy - half)
+        right = QPointF(cx + half, cy)
+        bottom = QPointF(cx, cy + half)
+        left = QPointF(cx - half, cy)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(self._t.surface_2))
+        p.drawPolygon(QPolygonF([top, right, bottom, left]))
+        pen = QPen(QColor(self._BORDER))
+        pen.setWidth(1)
+        p.setPen(pen)
+        p.drawLine(right, bottom)
+        p.drawLine(bottom, left)
+
+    def show_above(self, anchor) -> None:
+        center = anchor.mapToGlobal(QPoint(anchor.width() // 2, 0))
+        self.move(center.x() - self.width() // 2, center.y() - self.height())
+        self.show()
+
+
 class PreferencesDialog(QDialog):
     """Settings dialog with left-sidebar category navigation (groups) and the
     matching parameters on the right. Config-driven from the field spec below.
@@ -1044,22 +1319,27 @@ class PreferencesDialog(QDialog):
 
     GROUPS = (
         ("Connection/Server", (
+            (None, "Local server", "_serverpanel", None),
             (None, "Quick preset", "_preset", None),
             (None, "Connection", "_section", None),
             ("base_url", "Server URL", "text", None),
             ("api_key", "API key", "text", None),
             ("hf_token", "Hugging Face token", "password", None),
-            ("models_dir", "Models directory", "browse_dir", None),
             (None, "", "_testserver", None),
             (None, "", "_divider", None),
             (None, "Server", "_section", None),
+            (None, "Detected GPU", "_gpustatus", None),
+            (None, "llama.cpp", "_llamastatus", None),
+            ("llama_backend_hint", "Backend (auto-detect override)", "choice", ("auto", "cuda", "vulkan", "cpu")),
+            ("llama_auto_update_check", "Auto-check for llama.cpp updates", "bool", None),
             ("server_start_mode", "Server start mode", "choice", ("local", "existing", "custom")),
             ("auto_start_server", "Auto-start server", "bool", None),
-            ("llama_server_path", "llama-server path", "browse_file", None),
+            ("llama_server_path", "llama-server path (optional)", "browse_file", None),
             ("llama_context", "llama context size", "int", (0, 2000000)),
-            ("llama_gpu_layers", "GPU layers", "int", (0, 10000)),
+            ("llama_gpu_layers", "GPU layers (-1 = auto)", "int", (-1, 10000)),
             ("llama_batch", "Batch size", "int", (0, 1000000)),
             ("llama_ubatch", "Micro-batch size", "int", (0, 1000000)),
+            ("llama_parallel", "Parallel slots", "int", (1, 64)),
             ("llama_threads", "Threads (0 = auto)", "int", (0, 1024)),
             ("llama_extra_args", "Extra llama args", "text", None),
             ("llama_reasoning_budget", "Reasoning budget", "int", (0, 1000000)),
@@ -1098,7 +1378,9 @@ class PreferencesDialog(QDialog):
         "base_url": "Base URL of the OpenAI-compatible server requests are sent to (e.g. http://localhost:1234/v1).",
         "api_key": "API key sent with each request. Local servers like LM Studio usually accept any value.",
         "hf_token": "Hugging Face access token, used when downloading gated models.",
-        "models_dir": "Folder where downloaded GGUF models are stored and discovered.",
+        "models_dir": "Folder where this app downloads GGUF models (when download location is the app folder). Files already in the Hugging Face cache or your Extra model folders are discovered and reused.",
+        "model_download_target": "Where new downloads land. \u201cShared Hugging Face cache\u201d puts them where ai-toolkit and other HF tools read/write, so models are shared across tools.",
+        "extra_model_dirs": "Extra read-only folders to scan for already-downloaded GGUFs (e.g. your LM Studio models folder). One per line.",
         # Pipeline
         "creative_json": "On: JSON may interpret and embellish freely. Off (faithful): stays close to what is literally visible.",
         "disable_thinking": "Suppress the model's chain-of-thought, returning only the final answer. Faster / fewer tokens on models that support it.",
@@ -1115,11 +1397,12 @@ class PreferencesDialog(QDialog):
         # Server
         "server_start_mode": "How a server is obtained: 'local' launches llama-server, 'existing' connects to one you already run (e.g. LM Studio), 'custom' uses your command.",
         "auto_start_server": "Automatically start the server (per the start mode) when the app launches or a job needs it.",
-        "llama_server_path": "Path to the llama-server executable, used when the start mode launches a local server.",
+        "llama_server_path": "Optional. Leave blank to auto-detect the managed install (Get llama.cpp) or a llama-server on your PATH. Set this only to force a specific binary.",
         "llama_context": "Context window (tokens) llama-server is launched with. 0 uses the model/server default.",
-        "llama_gpu_layers": "Model layers offloaded to the GPU when launching llama-server. Higher uses more VRAM.",
+        "llama_gpu_layers": "Model layers offloaded to the GPU. -1 = auto: llama.cpp fits as many layers as your free VRAM allows (and spills the rest to CPU) instead of failing if a model is slightly too big. A set value forces exactly that many (0 = CPU-only).",
         "llama_batch": "llama-server batch size (prompt tokens processed per pass). 0 = default.",
-        "llama_ubatch": "llama-server micro-batch size. 0 = default.",
+        "llama_ubatch": "llama-server micro-batch size; the main driver of compute-buffer VRAM. 512 is plenty for captioning.",
+        "llama_parallel": "Concurrent request slots (-np). Captioning runs one image at a time, so 1 keeps VRAM lowest; raise it only if you drive the server from elsewhere too.",
         "llama_threads": "CPU threads for llama-server. 0 = auto-detect.",
         "llama_extra_args": "Extra command-line arguments appended when launching llama-server.",
         "llama_reasoning_budget": "Token budget allotted to model reasoning/thinking when supported. 0 = default.",
@@ -1137,7 +1420,8 @@ class PreferencesDialog(QDialog):
     def __init__(self, parent, settings, bbox_same_as_caption: bool = False, default_tags=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Preferences")
-        self.resize(720, 560)
+        self.resize(960, 640)
+        self.setMinimumWidth(920)
         self.settings = settings
         self.result = None
         self.bbox_same_as_caption = bbox_same_as_caption
@@ -1205,6 +1489,65 @@ class PreferencesDialog(QDialog):
                         test_btn.clicked.connect(self._test_server)
                         form.addRow("", test_btn)
                         continue
+                    if kind == "_serverpanel":
+                        self._srv_panel_label = QLabel()
+                        self._srv_panel_btn = QPushButton()
+                        self._srv_panel_btn.setObjectName("Primary")
+                        self._srv_panel_btn.setCursor(Qt.PointingHandCursor)
+                        self._srv_panel_btn.clicked.connect(self._toggle_local_server_from_prefs)
+                        self._srv_panel_nomodel_btn = QPushButton("Start without model")
+                        self._srv_panel_nomodel_btn.setCursor(Qt.PointingHandCursor)
+                        self._srv_panel_nomodel_btn.setToolTip(
+                            "Launch the server with no model loaded, just to check it runs.")
+                        self._srv_panel_nomodel_btn.clicked.connect(self._start_nomodel_from_prefs)
+                        prow = QHBoxLayout()
+                        prow.setContentsMargins(0, 0, 0, 0)
+                        prow.addWidget(self._srv_panel_label, 1)
+                        prow.addWidget(self._srv_panel_nomodel_btn, 0)
+                        prow.addWidget(self._srv_panel_btn, 0)
+                        pholder = QWidget()
+                        pholder.setLayout(prow)
+                        form.addRow(QLabel(label), pholder)
+                        self._refresh_server_panel()
+                        continue
+                    if kind == "_gpustatus":
+                        try:
+                            summary = detect_gpu().summary
+                        except Exception:
+                            summary = "detection unavailable"
+                        status = QLabel(summary)
+                        status.setObjectName("GpuStatus")
+                        status.setWordWrap(True)
+                        status.setStyleSheet("color: #9aa3ad; font-style: italic;")
+                        status.setToolTip(
+                            "GPU detected on this machine. Determines which llama.cpp "
+                            "build (CUDA / Vulkan / CPU) the app would download for local mode."
+                        )
+                        form.addRow(QLabel(label), status)
+                        continue
+                    if kind == "_llamastatus":
+                        self._llama_status_label = QLabel("…")
+                        self._llama_status_label.setObjectName("LlamaStatus")
+                        self._llama_status_label.setWordWrap(True)
+                        self._llama_action_btn = QPushButton("Get llama.cpp")
+                        self._llama_action_btn.clicked.connect(self._acquire_llama)
+                        lrow = QHBoxLayout()
+                        lrow.setContentsMargins(0, 0, 0, 0)
+                        lrow.addWidget(self._llama_status_label, 1)
+                        lrow.addWidget(self._llama_action_btn, 0)
+                        self._llama_progress = QProgressBar()
+                        self._llama_progress.setTextVisible(True)
+                        self._llama_progress.setVisible(False)
+                        lcol = QVBoxLayout()
+                        lcol.setContentsMargins(0, 0, 0, 0)
+                        lcol.setSpacing(6)
+                        lcol.addLayout(lrow)
+                        lcol.addWidget(self._llama_progress)
+                        lholder = QWidget()
+                        lholder.setLayout(lcol)
+                        form.addRow(QLabel(label), lholder)
+                        self._refresh_llama_status()
+                        continue
                     field = self._make_field(key, kind, extra, families)
                     lbl = QLabel(label)
                     help_text = self.FIELD_HELP.get(key)
@@ -1218,11 +1561,23 @@ class PreferencesDialog(QDialog):
             scroll.setWidget(page)
             self.stack.addWidget(scroll)
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.nav.currentRowChanged.connect(self._on_page_changed)
         self.nav.setCurrentRow(0)
+        # Keep the Local server panel in sync with the live start-mode selection.
+        if "server_start_mode" in self.widgets:
+            self.widgets["server_start_mode"][1].currentTextChanged.connect(
+                lambda *_: self._refresh_server_panel()
+            )
+        self._refresh_llama_path_placeholder()
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Save | QDialogButtonBox.Apply | QDialogButtonBox.Cancel
+        )
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
+        self._apply_btn = buttons.button(QDialogButtonBox.Apply)
+        self._apply_btn.setToolTip("Apply these settings now without closing this window.")
+        self._apply_btn.clicked.connect(self._apply)
         outer.addWidget(buttons)
         self.setStyleSheet(build_stylesheet(settings))
 
@@ -1272,6 +1627,31 @@ class PreferencesDialog(QDialog):
             w.setFixedHeight(90)
             self.widgets[key] = ("multiline", w)
             return w
+        if kind == "dirlist":
+            cont = QWidget()
+            v = QVBoxLayout(cont)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(6)
+            edit = QPlainTextEdit(str(value))
+            edit.setPlaceholderText("One folder per line \u2014 e.g. your LM Studio models folder")
+            edit.setFixedHeight(64)
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            browse = QPushButton("Browse\u2026")
+            browse.clicked.connect(lambda _c, e=edit: self._append_model_dir(e))
+            detect = QPushButton("Detect model folders")
+            detect.setToolTip("Add the default model folders for LM Studio, llama.cpp, "
+                              "and Ollama (whichever exist on this machine).")
+            detect.clicked.connect(lambda _c, e=edit: self._detect_server_dirs(e))
+            row.addWidget(browse)
+            row.addWidget(detect)
+            row.addStretch(1)
+            v.addWidget(edit)
+            v.addLayout(row)
+            # Register under "multiline" so _save reads it back with toPlainText().
+            self.widgets[key] = ("multiline", edit)
+            return cont
         if kind == "choice":
             w = QComboBox()
             w.addItems(list(extra))
@@ -1330,6 +1710,23 @@ class PreferencesDialog(QDialog):
         self._picker_host = {}
         self._server_picker = {}
         self._picker_hint = {}
+        self._model_sel_label = {}
+        self._model_row = {}
+        self._discovered_mmprojs = []
+
+        # Model files & folders — where models download to and where we look for
+        # already-downloaded GGUFs (the HF cache, your LM Studio folder, etc.).
+        folders_head = QLabel("Model files & folders")
+        folders_head.setObjectName("SectionLabel")
+        lay.addWidget(folders_head)
+        folders_form = QFormLayout()
+        folders_form.setContentsMargins(0, 0, 0, 0)
+        self._add_models_field(folders_form, "models_dir", "Models directory", "browse_dir", None)
+        self._add_models_field(folders_form, "model_download_target", "Model download location",
+                               "choice", (MODEL_TARGET_APP, MODEL_TARGET_HF))
+        self._add_models_field(folders_form, "extra_model_dirs", "Extra model folders", "dirlist", None)
+        lay.addLayout(folders_form)
+        lay.addSpacing(10)
 
         for task, title in (("caption", "Caption / JSON model"), ("bbox", "BBox VLM")):
             head_row = QHBoxLayout()
@@ -1339,9 +1736,9 @@ class PreferencesDialog(QDialog):
             head_row.addWidget(section)
             head_row.addStretch(1)
             if task == "caption":
-                rec_btn = QPushButton("Recommended VLMs…")
-                rec_btn.setToolTip("Browse known-good vision models with Hugging Face links.")
-                rec_btn.clicked.connect(self._open_recommended_dialog)
+                rec_btn = QPushButton("Browse models\u2026")
+                rec_btn.setToolTip("Browse all models with VRAM fit estimates for your card.")
+                rec_btn.clicked.connect(lambda: self._open_model_picker("caption"))
                 head_row.addWidget(rec_btn, 0, Qt.AlignRight)
             lay.addLayout(head_row)
 
@@ -1377,20 +1774,40 @@ class PreferencesDialog(QDialog):
                     widget.setToolTip(models_help[text])
                 form_layout.addRow(lbl, widget)
 
-            # Profile dropdown — download/local modes only (hidden when pointing at an existing server)
+            # Model picker — a current-selection display (with VRAM fit badge) plus
+            # a "Choose model…" button that opens the VRAM-aware picker pop-up. The
+            # combo is kept as the canonical selection state but hidden.
             profile_host = QWidget()
             pf = QFormLayout(profile_host)
             pf.setContentsMargins(0, 0, 0, 0)
-            combo = QComboBox()
+            combo = QComboBox(profile_host)
             combo.addItems(profile_labels(task))
             cur = profile_label_from_id(task, getattr(self.settings, f"{task}_profile_id"))
             idx = combo.findText(cur)
             combo.setCurrentIndex(idx if idx >= 0 else 0)
             combo.currentTextChanged.connect(lambda _t, tk=task: self._on_profile_changed(tk))
+            combo.currentTextChanged.connect(lambda _t, tk=task: self._refresh_model_label(tk))
+            combo.hide()
             self._profile_combos[task] = combo
-            _row(pf, "Profile", combo)
+
+            sel_row = QWidget()
+            srl = QHBoxLayout(sel_row)
+            srl.setContentsMargins(0, 0, 0, 0)
+            srl.setSpacing(8)
+            sel_label = QLabel()
+            sel_label.setTextFormat(Qt.RichText)
+            sel_label.setWordWrap(True)
+            self._model_sel_label[task] = sel_label
+            choose = QPushButton("Choose model\u2026")
+            choose.setCursor(Qt.PointingHandCursor)
+            choose.clicked.connect(lambda _c, tk=task: self._open_model_picker(tk))
+            srl.addWidget(sel_label, 1)
+            srl.addWidget(choose, 0)
+            self._model_row[task] = sel_row
+            _row(pf, "Model", sel_row)
             lay.addWidget(profile_host)
             self._profile_host[task] = profile_host
+            self._refresh_model_label(task)
 
             # Server-model picker — existing-server mode only
             picker_host = QWidget()
@@ -1414,6 +1831,11 @@ class PreferencesDialog(QDialog):
             hint.setWordWrap(True)
             pk.addRow("", hint)
             self._picker_hint[task] = hint
+            warn = QLabel("\u26a0 The model name must match a model currently loaded in your "
+                          "external server, or requests will fail.")
+            warn.setWordWrap(True)
+            warn.setStyleSheet("color: #E0A33B;")
+            pk.addRow("", warn)
             lay.addWidget(picker_host)
             self._picker_host[task] = picker_host
 
@@ -1470,7 +1892,7 @@ class PreferencesDialog(QDialog):
         # React to Connection/Server start-mode: server picker vs download UI.
         if "server_start_mode" in self.widgets:
             self.widgets["server_start_mode"][1].currentTextChanged.connect(
-                lambda *_: self._apply_models_mode()
+                lambda *_: self._on_server_mode_changed()
             )
         self._apply_models_mode()
 
@@ -1544,6 +1966,8 @@ class PreferencesDialog(QDialog):
         self._local_group["bbox"].setEnabled(enabled)
         if "bbox" in self._picker_host:
             self._picker_host["bbox"].setEnabled(enabled)
+        if "bbox" in self._model_row:
+            self._model_row["bbox"].setEnabled(enabled)
         # Dim the text of the locked fields so it reads as inactive.
         dim = "" if enabled else "color: #7f8694;"
         for key in ("bbox_model", "bbox_hf_repo", "bbox_model_filename", "bbox_mmproj_filename",
@@ -1592,15 +2016,35 @@ class PreferencesDialog(QDialog):
         # named/server/local profiles auto-fill the API model name; custom_hf is user-typed
         if profile.kind != "custom_hf":
             self.widgets[f"{task}_model"][1].setText(profile.api_model)
-        # a server-alias profile implies "connect to existing server"
-        if profile.kind == "server" and "server_start_mode" in self.widgets:
-            combo = self.widgets["server_start_mode"][1]
-            i = combo.findText("existing")
-            if i >= 0:
-                combo.setCurrentIndex(i)
         self._update_profile_visibility(task)
         if task == "caption" and getattr(self, "bbox_same_as_caption", False):
             self._mirror_caption_to_bbox()
+
+    def _on_page_changed(self, row: int) -> None:
+        """Stage cross-page changes live: when arriving on the Models page, re-sync
+        its server-mode-dependent UI from the current Connection/Server selections,
+        so the user never has to Apply just to see the right model fields."""
+        item = self.nav.item(row) if (row is not None and row >= 0) else None
+        if item is not None and item.text() == "Models" and self._profile_combos:
+            self._apply_models_mode()
+
+    def _on_server_mode_changed(self) -> None:
+        """Server mode is the source of truth. When the user leaves external mode
+        (e.g. switches the preset to llama.cpp), a leftover server-alias profile
+        must not drag the app back to 'existing' — reset it to the default model.
+        Then re-sync the Models page UI."""
+        if self._current_server_mode() != "existing":
+            for task in ("caption", "bbox"):
+                combo = self._profile_combos.get(task)
+                if combo is None:
+                    continue
+                prof = self._profile_for_label(task, combo.currentText())
+                if prof.kind == "server":
+                    default = profiles_for_task(task)[0]
+                    i = combo.findText(default.label)
+                    if i >= 0:
+                        combo.setCurrentIndex(i)
+        self._apply_models_mode()
 
     def _current_server_mode(self) -> str:
         if "server_start_mode" in self.widgets:
@@ -1675,49 +2119,312 @@ class PreferencesDialog(QDialog):
         if task == "caption" and getattr(self, "bbox_same_as_caption", False):
             self._mirror_caption_to_bbox()
 
-    def _open_recommended_dialog(self) -> None:
-        recommended = [
-            p for p in profiles_for_task("caption")
-            if p.kind == "hf" and p.hf_repo
-        ]
+    def _add_models_field(self, form, key, label, kind, extra) -> None:
+        """Build a generic settings field (registered in self.widgets so _save
+        picks it up) and add it to a form on the Models page with its help text."""
+        widget = self._make_field(key, kind, extra, None)
+        lbl = QLabel(label)
+        help_text = self.FIELD_HELP.get(key)
+        if help_text:
+            lbl.setToolTip(help_text)
+            widget.setToolTip(help_text)
+        form.addRow(lbl, widget)
+
+    def _short_dir(self, path: Path) -> str:
+        text = str(path)
+        home = str(Path.home())
+        if text.startswith(home):
+            text = "~" + text[len(home):]
+        return text
+
+    def _settings_with_current_dirs(self):
+        """Snapshot of settings reflecting the folder fields as currently typed
+        (so Detect uses edits the user hasn't saved yet)."""
+        md = self.settings.models_dir
+        ex = getattr(self.settings, "extra_model_dirs", "")
+        if "models_dir" in self.widgets:
+            md = self.widgets["models_dir"][1].text().strip() or md
+        if "extra_model_dirs" in self.widgets:
+            ex = self.widgets["extra_model_dirs"][1].toPlainText()
+        return replace(self.settings, models_dir=md, extra_model_dirs=ex)
+
+    def _use_local_gguf(self, task: str, model_path, dlg) -> None:
+        """Apply a discovered local GGUF (chosen in the model picker): switch to the
+        custom-local profile, fill the local path, auto-pair an mmproj if one sits
+        alongside it, and mirror to bbox when locked."""
+        pcombo = self._profile_combos.get(task)
+        if pcombo is not None:
+            i = pcombo.findText(CUSTOM_LOCAL_PROFILE.label)
+            if i >= 0:
+                pcombo.setCurrentIndex(i)
+        if f"{task}_local_model_path" in self.widgets:
+            self.widgets[f"{task}_local_model_path"][1].setText(str(model_path))
+        mm = guess_mmproj_for(Path(model_path), getattr(self, "_discovered_mmprojs", []))
+        if mm is not None and f"{task}_local_mmproj_path" in self.widgets:
+            self.widgets[f"{task}_local_mmproj_path"][1].setText(str(mm))
+        self._update_profile_visibility(task)
+        if task == "caption" and getattr(self, "bbox_same_as_caption", False):
+            self._mirror_caption_to_bbox()
+        self._refresh_model_label(task)
+        dlg.accept()
+
+    def _refresh_model_label(self, task: str) -> None:
+        lbl = self._model_sel_label.get(task)
+        combo = self._profile_combos.get(task)
+        if lbl is None or combo is None:
+            return
+        name = combo.currentText()
+        prof = self._profile_for_label(task, name)
+        # Custom-local: show the chosen file's name rather than the generic label.
+        if prof.kind == "custom_local":
+            w = self.widgets.get(f"{task}_local_model_path")
+            chosen = w[1].text().strip() if w else ""
+            if chosen:
+                lbl.setText(f"<b>Local: {Path(chosen).name}</b>")
+                return
+        short = name.split(":", 1)[1].strip() if name.lower().startswith("download:") else name
+        badge = ""
+        if prof.kind == "hf" and prof.vram_gb > 0:
+            vram = self._detected_vram()
+            if vram:
+                fit = vram_fit(prof.vram_gb, vram)
+                colors = {"fits": "#3ddc84", "tight": "#E0A33B", "too_big": "#ff5a52", "unknown": "#9aa4b6"}
+                texts = {"fits": "Fits", "tight": "Tight", "too_big": "Too big", "unknown": ""}
+                if texts[fit]:
+                    badge = f'&nbsp;&nbsp;<span style="color:{colors[fit]}">[{texts[fit]}]</span>'
+        lbl.setText(f"<b>{short}</b>{badge}")
+
+    def _open_model_picker(self, task: str) -> None:
+        """Model picker. In local (app-managed llama.cpp) mode it lists the
+        recommended/download profiles with VRAM fit badges plus the GGUFs already
+        on disk, and choosing one configures the app. In external-server mode the
+        app can't fetch or load models for the server, so it shows the models
+        already on disk (top) and the recommended models with Hugging Face links
+        (below), with a note to download/configure those in the server."""
+        vram = self._detected_vram()
+        rec = recommend_profile_for_vram(task, vram)
+        rec_id = rec.id if rec else None
         local_mode = self._current_server_mode() != "existing"
+
+        badge_colors = {"fits": "#3ddc84", "tight": "#E0A33B", "too_big": "#ff5a52", "unknown": "#9aa4b6"}
+        badge_text = {"fits": "Fits", "tight": "Tight", "too_big": "Too big", "unknown": "\u2014"}
+        rank = {"fits": 0, "tight": 1, "too_big": 2, "unknown": 3}
+        CONTENT_W = 660
+
         dlg = QDialog(self)
-        dlg.setWindowTitle("Recommended VLMs")
-        dlg.resize(500, 400)
+        dlg.setWindowTitle("Choose a model")
+        dlg.resize(720, 560)
+        dlg.setMinimumWidth(700)
         lay = QVBoxLayout(dlg)
-        sub = QLabel(
-            "Vision models known to work well. "
-            + ("Pick one to load it as a profile, or open it on Hugging Face."
-               if local_mode else
-               "Open one on Hugging Face to download or load it on your server.")
-        )
-        sub.setObjectName("Hint")
-        sub.setWordWrap(True)
-        lay.addWidget(sub)
+
+        if vram:
+            gpu_name = detect_gpu().name or "your GPU"
+            header = f"Detected {gpu_name} \u2014 about {vram:.0f}GB VRAM."
+            if rec:
+                rname = rec.label.split(":", 1)[1].strip() if rec.label.lower().startswith("download:") else rec.label
+                header += f"  Recommended: {rname}."
+        else:
+            header = "Couldn't read your VRAM \u2014 showing all models without fit estimates."
+        head = QLabel(header)
+        head.setObjectName("Hint")
+        head.setWordWrap(True)
+        lay.addWidget(head)
+
+        if not local_mode:
+            ext = QLabel(
+                "You're using an external server. The app can't download or load models "
+                "into it \u2014 download and configure these in your server (e.g. LM Studio "
+                "or Ollama), then pick the model from its list or enter its name."
+            )
+            ext.setWordWrap(True)
+            ext.setStyleSheet("color: #E0A33B;")
+            lay.addWidget(ext)
 
         listing = QListWidget()
+        listing.setWordWrap(True)
+        listing.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         lay.addWidget(listing, 1)
-        for p in recommended:
+
+        def add_row(row):
+            row.setFixedWidth(CONTENT_W)
+            row.ensurePolished()
+            h = row.sizeHint().height()
+            lay_ = row.layout()
+            if lay_ is not None and lay_.hasHeightForWidth():
+                h = max(h, lay_.heightForWidth(CONTENT_W))
+            h = max(h, 42)            # never shorter than a Use/HF button row
+            item = QListWidgetItem(listing)
+            item.setSizeHint(QSize(CONTENT_W, h))
+            listing.addItem(item)
+            listing.setItemWidget(item, row)
+
+        def add_section(text):
+            hdr = QLabel(text)
+            hdr.setObjectName("SectionLabel")
+            hdr.setContentsMargins(8, 10, 8, 2)
+            item = QListWidgetItem(listing)
+            item.setFlags(Qt.NoItemFlags)
+            item.setSizeHint(QSize(CONTENT_W, hdr.sizeHint().height() + 8))
+            listing.addItem(item)
+            listing.setItemWidget(item, hdr)
+
+        def add_hint(text):
+            e = QLabel(text)
+            e.setObjectName("Hint")
+            e.setWordWrap(True)
+            e.setContentsMargins(8, 2, 8, 6)
+            e.setFixedWidth(CONTENT_W - 4)
+            h = e.heightForWidth(CONTENT_W - 4)
+            if h <= 0:
+                h = e.sizeHint().height()
+            item = QListWidgetItem(listing)
+            item.setFlags(Qt.NoItemFlags)
+            item.setSizeHint(QSize(CONTENT_W, h + 4))
+            listing.addItem(item)
+            listing.setItemWidget(item, e)
+
+        def make_profile_row(p, *, allow_use, show_link=False):
             name = p.label.split(":", 1)[1].strip() if p.label.lower().startswith("download:") else p.label
+            row = QWidget()
+            outer = QVBoxLayout(row)
+            outer.setContentsMargins(8, 6, 8, 6)
+            outer.setSpacing(2)
+            top = QHBoxLayout()
+            top.setContentsMargins(0, 0, 0, 0)
+            top.setSpacing(8)
+            star = "\u2605 " if p.id == rec_id else ""
+            title = QLabel(f"{star}{name}")
+            title.setWordWrap(True)
+            title.setMaximumWidth(300)
+            top.addWidget(title, 1)
+            if p.kind == "hf" and p.vram_gb > 0:
+                tier = model_size_tier(p.vram_gb)
+                chip = QLabel(f"{tier} \u00b7 ~{p.vram_gb:.0f}GB")
+                chip.setStyleSheet("color:#9aa4b6;border:1px solid #2a2f3a;border-radius:6px;padding:1px 6px;")
+                top.addWidget(chip, 0)
+                if vram:
+                    fit = vram_fit(p.vram_gb, vram)
+                    badge = QLabel(badge_text[fit])
+                    badge.setStyleSheet(
+                        f"color:{badge_colors[fit]};border:1px solid {badge_colors[fit]};"
+                        "border-radius:6px;padding:1px 8px;font-weight:600;"
+                    )
+                    top.addWidget(badge, 0)
+            if allow_use:
+                use_btn = QPushButton("Use")
+                use_btn.setCursor(Qt.PointingHandCursor)
+                use_btn.clicked.connect(lambda _c, prof=p: self._pick_model(task, prof, dlg))
+                top.addWidget(use_btn, 0)
+            if p.kind == "hf" and p.hf_repo and not show_link:
+                hf_btn = QPushButton("HF")
+                hf_btn.setToolTip(f"https://huggingface.co/{p.hf_repo}")
+                hf_btn.clicked.connect(lambda _c, repo=p.hf_repo: webbrowser.open(f"https://huggingface.co/{repo}"))
+                top.addWidget(hf_btn, 0)
+            outer.addLayout(top)
+            if show_link and p.kind == "hf" and p.hf_repo:
+                link = QLabel(f'<a href="https://huggingface.co/{p.hf_repo}" style="color:#6cb6ff;">huggingface.co/{p.hf_repo}</a>')
+                link.setOpenExternalLinks(True)
+                link.setObjectName("Hint")
+                link.setMaximumWidth(CONTENT_W - 20)
+                outer.addWidget(link)
+            if p.note:
+                note = QLabel(p.note)
+                note.setObjectName("Hint")
+                note.setWordWrap(True)
+                note.setStyleSheet("color:#A78BFA;")
+                note.setMaximumWidth(CONTENT_W - 20)
+                outer.addWidget(note)
+            return row
+
+        def make_detected_row(path):
             row = QWidget()
             rl = QHBoxLayout(row)
             rl.setContentsMargins(8, 6, 8, 6)
             rl.setSpacing(8)
-            text = QLabel(name)
-            text.setWordWrap(True)
-            rl.addWidget(text, 1)
+            col = QVBoxLayout()
+            col.setContentsMargins(0, 0, 0, 0)
+            col.setSpacing(0)
+            fname = QLabel(path.name)
+            fname.setWordWrap(True)
+            fname.setMaximumWidth(CONTENT_W - 250)
+            where = QLabel(self._short_dir(path.parent))
+            where.setObjectName("Hint")
+            where.setWordWrap(True)
+            where.setMaximumWidth(CONTENT_W - 250)
+            col.addWidget(fname)
+            col.addWidget(where)
+            rl.addLayout(col, 1)
+            # estimated VRAM from file size (+ paired projector), shown like the
+            # recommended rows but flagged with "~" since it's a size approximation.
+            est = estimate_gguf_vram_gb(path, guess_mmproj_for(path, self._discovered_mmprojs))
+            if est > 0:
+                tier = model_size_tier(est)
+                chip = QLabel(f"{tier} \u00b7 ~{est:.0f}GB")
+                chip.setToolTip("Estimated from file size (weights + projector + headroom); "
+                                "actual VRAM also depends on context length.")
+                chip.setStyleSheet("color:#9aa4b6;border:1px solid #2a2f3a;border-radius:6px;padding:1px 6px;")
+                rl.addWidget(chip, 0)
+                if vram:
+                    fit = vram_fit(est, vram)
+                    badge = QLabel("~" + badge_text[fit])
+                    badge.setToolTip("Estimated fit on your card.")
+                    badge.setStyleSheet(
+                        f"color:{badge_colors[fit]};border:1px solid {badge_colors[fit]};"
+                        "border-radius:6px;padding:1px 8px;font-weight:600;"
+                    )
+                    rl.addWidget(badge, 0)
+            use = QPushButton("Use")
+            use.setCursor(Qt.PointingHandCursor)
             if local_mode:
-                use_btn = QPushButton("Use this profile")
-                use_btn.clicked.connect(lambda _c, prof=p: self._use_recommended_profile(prof, dlg))
-                rl.addWidget(use_btn)
-            hf_btn = QPushButton("Hugging Face")
-            hf_btn.setToolTip(f"https://huggingface.co/{p.hf_repo}")
-            hf_btn.clicked.connect(lambda _c, repo=p.hf_repo: webbrowser.open(f"https://huggingface.co/{repo}"))
-            rl.addWidget(hf_btn)
-            item = QListWidgetItem(listing)
-            item.setSizeHint(row.sizeHint())
-            listing.addItem(item)
-            listing.setItemWidget(item, row)
+                use.clicked.connect(lambda _c, p=path: self._use_local_gguf(task, p, dlg))
+            else:
+                use.clicked.connect(lambda _c, p=path: self._use_detected_external(task, p, dlg))
+            rl.addWidget(use, 0)
+            return row
+
+        try:
+            found, mmprojs = discover_local_gguf_models(self._settings_with_current_dirs())
+        except Exception:
+            found, mmprojs = [], []
+        self._discovered_mmprojs = mmprojs
+
+        hf_profiles = [p for p in profiles_for_task(task) if p.kind == "hf"]
+        hf_profiles.sort(key=lambda p: (0 if p.id == rec_id else 1,
+                                        rank[vram_fit(p.vram_gb, vram)], -p.vram_gb))
+
+        if local_mode:
+            # 1) Models already on disk — the usual pick when running local llama.cpp
+            add_section("Downloaded in your folders")
+            if not found:
+                add_hint("No downloaded GGUF files found. Add folders on the Models page "
+                         "(Browse\u2026 / Detect model folders), or download one below.")
+            else:
+                for path in found:
+                    add_row(make_detected_row(path))
+            # 2) Custom / existing-server options (secondary)
+            others = [p for p in profiles_for_task(task)
+                      if p.kind in ("server", "custom_hf", "custom_local")]
+            if others:
+                add_section("Custom & server options")
+                for p in others:
+                    add_row(make_profile_row(p, allow_use=True))
+            # 3) Recommended models to download (heaviest action) at the bottom
+            add_section("Recommended to download")
+            for p in hf_profiles:
+                add_row(make_profile_row(p, allow_use=True))
+        else:
+            add_section("Detected models")
+            if not found:
+                add_hint("No downloaded GGUF files found. Add your server's model folders on "
+                         "the Models page (Browse\u2026 / Detect model folders).")
+            else:
+                for path in found:
+                    add_row(make_detected_row(path))
+            add_section("Recommended models")
+            add_hint("Download and configure these in your external server, then select the "
+                     "model there or enter its name. Links go to Hugging Face.")
+            for p in hf_profiles:
+                add_row(make_profile_row(p, allow_use=False, show_link=True))
 
         box = QDialogButtonBox(QDialogButtonBox.Close)
         box.rejected.connect(dlg.reject)
@@ -1725,12 +2432,97 @@ class PreferencesDialog(QDialog):
         lay.addWidget(box)
         dlg.exec()
 
-    def _use_recommended_profile(self, profile, dlg) -> None:
-        combo = self._profile_combos["caption"]
-        i = combo.findText(profile.label)
-        if i >= 0:
-            combo.setCurrentIndex(i)
+    def _external_model_key(self, path: Path) -> str:
+        """Best-guess model name string an external server would expose for a GGUF
+        on disk. LM Studio uses a publisher/model key from its folder layout
+        (~/.lmstudio/models/<publisher>/<model>/<file>.gguf); otherwise fall back
+        to the file stem. The user can edit the API model name afterward."""
+        parts = path.parts
+        for i, seg in enumerate(parts):
+            if seg == "models" and i + 2 < len(parts) and any(a == ".lmstudio" for a in parts[:i]):
+                return f"{parts[i + 1]}/{parts[i + 2]}"
+        return path.stem
+
+    def _use_detected_external(self, task: str, path, dlg) -> None:
+        """External-server mode: set the API model name to the chosen on-disk model's
+        likely server key. The server still owns loading (e.g. LM Studio JIT)."""
+        name = self._external_model_key(Path(path))
+        if f"{task}_model" in self.widgets:
+            self.widgets[f"{task}_model"][1].setText(name)
+        if task == "caption" and getattr(self, "bbox_same_as_caption", False):
+            self._mirror_caption_to_bbox()
+        self._refresh_model_label(task)
         dlg.accept()
+
+    def _pick_model(self, task: str, profile, dlg) -> None:
+        combo = self._profile_combos.get(task)
+        if combo is not None:
+            i = combo.findText(profile.label)
+            if i >= 0:
+                combo.setCurrentIndex(i)   # fires _on_profile_changed + _refresh_model_label
+        # Choosing a server alias is an explicit "use the external server" action.
+        if profile.kind == "server" and "server_start_mode" in self.widgets:
+            mode_combo = self.widgets["server_start_mode"][1]
+            j = mode_combo.findText("existing")
+            if j >= 0:
+                mode_combo.setCurrentIndex(j)
+        dlg.accept()
+
+    def _detected_vram(self) -> float | None:
+        """Total VRAM in GB, detected once and cached for the session."""
+        if not hasattr(self, "_vram_gb_cache"):
+            try:
+                self._vram_gb_cache = detect_gpu().vram_total_gb
+            except Exception:
+                self._vram_gb_cache = None
+        return self._vram_gb_cache
+
+    def _append_dir_line(self, edit, path: str) -> None:
+        """Add a folder as a new line in a dirlist edit, skipping duplicates."""
+        path = path.strip()
+        if not path:
+            return
+        existing = [ln.strip() for ln in edit.toPlainText().splitlines() if ln.strip()]
+        if path in existing:
+            return
+        existing.append(path)
+        edit.setPlainText("\n".join(existing))
+
+    def _append_model_dir(self, edit) -> None:
+        start = str(Path.home())
+        path = QFileDialog.getExistingDirectory(self, "Choose a model folder", start)
+        if path:
+            self._append_dir_line(edit, path)
+
+    def _detect_server_dirs(self, edit) -> None:
+        """Add the default model folders for the built-in servers that actually
+        exist on this machine (LM Studio, llama.cpp cache, Ollama), de-duplicated
+        against what's already listed."""
+        found = known_server_model_dirs()
+        existing = {ln.strip() for ln in re.split(r"[\r\n;]+", edit.toPlainText()) if ln.strip()}
+        added = []
+        for d in found:
+            s = str(d)
+            if s not in existing:
+                self._append_dir_line(edit, s)
+                existing.add(s)
+                added.append(s)
+        if added:
+            QMessageBox.information(
+                self, "Model folders",
+                "Added these model folders:\n\n" + "\n".join(added) +
+                "\n\nNote: Ollama stores models as blobs (not .gguf), so its folder "
+                "usually won't surface loadable files here.",
+            )
+        elif found:
+            QMessageBox.information(self, "Model folders",
+                                    "Your servers' default model folders are already listed.")
+        else:
+            QMessageBox.information(
+                self, "Model folders",
+                "No default server model folders were found on this machine "
+                "(LM Studio, llama.cpp, Ollama). Use Browse\u2026 to add one manually.",
+            )
 
     def _browse_into(self, edit: QLineEdit, is_dir: bool) -> None:
         start = edit.text().strip() or str(default_models_dir())
@@ -1783,13 +2575,27 @@ class PreferencesDialog(QDialog):
         if self._custom_presets:
             combo.insertSeparator(combo.count())
             combo.addItems(list(self._custom_presets.keys()))
-        combo.setCurrentIndex(0)
+        # Remember the last server the user picked; otherwise reflect whichever
+        # preset matches the saved settings, so the dropdown isn't always blank.
+        target = QSettings("IdeogramCaptioner", "QtApp").value("last_server_preset")
+        if not (isinstance(target, str) and target in self._all_presets()):
+            target = self._preset_matching_settings()
+        idx = combo.findText(target) if target else -1
+        combo.setCurrentIndex(idx if idx > 0 else 0)
         combo.blockSignals(False)
+
+    def _preset_matching_settings(self) -> str | None:
+        for name, preset in self._all_presets().items():
+            base_url, _key, start_mode = preset
+            if base_url == self.settings.base_url and start_mode == self.settings.server_start_mode:
+                return name
+        return None
 
     def _apply_preset(self, name: str) -> None:
         preset = self._all_presets().get(name)
         if not preset:
             return  # the "Select a server…" placeholder or a separator
+        QSettings("IdeogramCaptioner", "QtApp").setValue("last_server_preset", name)
         base_url, api_key, start_mode = preset
         if "base_url" in self.widgets:
             self.widgets["base_url"][1].setText(base_url)
@@ -1800,6 +2606,7 @@ class PreferencesDialog(QDialog):
             idx = combo.findText(start_mode)
             if idx >= 0:
                 combo.setCurrentIndex(idx)
+        self._refresh_server_panel()
 
     def _manage_presets(self) -> None:
         dlg = QDialog(self)
@@ -1879,6 +2686,223 @@ class PreferencesDialog(QDialog):
         refresh()
         dlg.exec()
 
+    def _cached_latest_build(self):
+        """Latest build number from the background update check, if any (Stage 4b
+        populates this). None until then — age-based 'recommended' still works."""
+        try:
+            val = QSettings("IdeogramCaptioner", "QtApp").value("llama_latest_build")
+            return int(val) if val is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _refresh_llama_status(self) -> None:
+        label = getattr(self, "_llama_status_label", None)
+        button = getattr(self, "_llama_action_btn", None)
+        if label is None or button is None:
+            return
+        record = read_installed_llama()
+        state = update_state(record, self._cached_latest_build())
+        kind = state["state"]
+        if kind == "none":
+            label.setText("Not installed — fetch a prebuilt build for your system.")
+            label.setStyleSheet("color: #9aa3ad;")
+            button.setText("Get llama.cpp")
+            button.setProperty("wants_latest", False)
+            return
+        build = f"b{record.build}" if record.build else "?"
+        age = state["age_days"]
+        age_str = f", {age}d old" if age is not None else ""
+        base = f"Installed: llama.cpp {build} ({record.backend}{age_str})"
+        if kind == "recommended":
+            label.setText(base + " · update recommended")
+            label.setStyleSheet("color: #E0A33B;")
+        elif kind == "available":
+            label.setText(base + " · newer build available")
+            label.setStyleSheet("color: #9aa3ad;")
+        elif self._cached_latest_build() is not None:
+            label.setText(base + " · up to date")
+            label.setStyleSheet("color: #9aa3ad;")
+        else:
+            label.setText(base)
+            label.setStyleSheet("color: #9aa3ad;")
+        button.setText("Update")
+        button.setProperty("wants_latest", True)
+
+    def _refresh_llama_path_placeholder(self) -> None:
+        """Show the resolved binary as grey placeholder text so the path is
+        visible after a Get llama.cpp install, while the override stays blank
+        (and thus keeps auto-tracking future updates)."""
+        widget = self.widgets.get("llama_server_path")
+        if widget is None:
+            return
+        detected = find_llama_server()
+        if detected is not None:
+            widget[1].setPlaceholderText(f"Auto-detected: {detected}")
+        else:
+            widget[1].setPlaceholderText("Auto-detect (managed install or PATH)")
+
+    def _current_start_mode(self) -> str:
+        widget = self.widgets.get("server_start_mode")
+        if widget is not None:
+            try:
+                return widget[1].currentText()
+            except Exception:
+                pass
+        return self.settings.server_start_mode
+
+    def _current_external_label(self) -> str:
+        base = ""
+        widget = self.widgets.get("base_url")
+        if widget is not None:
+            base = widget[1].text().strip()
+        for name, preset in self._all_presets().items():
+            if preset[0] == base:
+                return name
+        return base or "an external server"
+
+    def _refresh_server_panel(self) -> None:
+        label = getattr(self, "_srv_panel_label", None)
+        button = getattr(self, "_srv_panel_btn", None)
+        if label is None or button is None:
+            return
+        main = self.parent()
+        running = bool(getattr(main, "_server_is_running", lambda: False)()) if main else False
+        nomodel_btn = getattr(self, "_srv_panel_nomodel_btn", None)
+        mode = self._current_start_mode()
+        if mode != "local":
+            # An external/managed-elsewhere server: nothing for us to start or stop.
+            label.setText(f"Running external server \u2014 set to {self._current_external_label()}.")
+            label.setStyleSheet("color: #9aa3ad;")
+            button.setVisible(False)
+            if nomodel_btn is not None:
+                nomodel_btn.setVisible(False)
+            return
+        button.setVisible(True)
+        binary = find_llama_server()
+        if nomodel_btn is not None:
+            nomodel_btn.setVisible(
+                bool(not running and binary is not None and llama_server_supports_router(binary))
+            )
+        button.setEnabled(True)
+        if running:
+            label.setText("Local llama-server is running.")
+            label.setStyleSheet("color: #3ddc84;")
+            button.setText("Stop")
+        elif binary is None:
+            label.setText("llama.cpp isn't installed yet \u2014 use \u201cGet llama.cpp\u201d below.")
+            label.setStyleSheet("color: #9aa3ad;")
+            button.setText("Start")
+            button.setEnabled(False)
+        elif not has_model_config(self.settings, "caption"):
+            label.setText("No model configured yet \u2014 pick one to start the server.")
+            label.setStyleSheet("color: #9aa3ad;")
+            button.setText("Choose model")
+        else:
+            label.setText("Local llama-server is stopped.")
+            label.setStyleSheet("color: #9aa3ad;")
+            button.setText("Start")
+
+    def _start_nomodel_from_prefs(self) -> None:
+        main = self.parent()
+        if main is None:
+            return
+        main._launch_local_server(model_less=True)
+        QTimer.singleShot(500, self._refresh_server_panel)
+
+    def _toggle_local_server_from_prefs(self) -> None:
+        main = self.parent()
+        if main is None:
+            return
+        if getattr(main, "_server_is_running", lambda: False)():
+            main._stop_local_server()
+        elif find_llama_server() is None:
+            return  # button is disabled in this state anyway
+        elif not has_model_config(main.settings, "caption"):
+            items = self.nav.findItems("Models", Qt.MatchExactly)
+            if items:
+                self.nav.setCurrentRow(self.nav.row(items[0]))
+            return
+        else:
+            main._launch_local_server()   # binary present — launch directly
+        QTimer.singleShot(500, self._refresh_server_panel)
+
+    def _acquire_llama(self) -> None:
+        button = self._llama_action_btn
+        latest = bool(button.property("wants_latest"))
+        button.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            plan = plan_llama_acquisition(self.settings, latest=latest)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if plan is None:
+            button.setEnabled(True)
+            QMessageBox.information(
+                self, "llama.cpp",
+                "Couldn't find a prebuilt build for your system (or the release "
+                "service is unreachable). You can set a llama-server path manually "
+                "in the field below, or build from source.",
+            )
+            return
+        proceed = QMessageBox.question(
+            self, "Download llama.cpp",
+            f"Download the {plan.description}?\n\n"
+            f"Source: {plan.repo}\n"
+            f"The download is SHA-256 verified before it's installed.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if proceed != QMessageBox.Yes:
+            button.setEnabled(True)
+            return
+        self._llama_progress.setRange(0, 0)   # busy until we get a percentage
+        self._llama_progress.setFormat("Starting\u2026")
+        self._llama_progress.setVisible(True)
+        self._llama_thread = LlamaInstallThread(plan)
+        self._llama_thread.progress.connect(self._on_llama_progress)
+        self._llama_thread.done.connect(self._on_llama_installed)
+        self._llama_thread.error.connect(self._on_llama_install_error)
+        self._llama_thread.start()
+
+    def _on_llama_progress(self, text: str) -> None:
+        self._llama_status_label.setText(text)
+        match = re.search(r"(\d+)%", text)
+        if match:
+            self._llama_progress.setRange(0, 100)
+            self._llama_progress.setValue(int(match.group(1)))
+            self._llama_progress.setFormat("%p%")
+        else:
+            self._llama_progress.setRange(0, 0)   # indeterminate for verify/extract
+            self._llama_progress.setFormat(text)
+
+    def _on_llama_installed(self, record) -> None:
+        self._llama_progress.setVisible(False)
+        self._llama_action_btn.setEnabled(True)
+        self._refresh_llama_status()
+        self._refresh_llama_path_placeholder()
+        if getattr(self, "_srv_panel_btn", None) is not None:
+            self._refresh_server_panel()
+        QMessageBox.information(
+            self, "llama.cpp",
+            f"Installed llama.cpp b{record.build} ({record.backend}).",
+        )
+
+    def _on_llama_install_error(self, message: str) -> None:
+        self._llama_progress.setVisible(False)
+        self._llama_action_btn.setEnabled(True)
+        self._refresh_llama_status()
+        if has_llama_backup():
+            roll = QMessageBox.question(
+                self, "Install failed",
+                f"The llama.cpp install failed:\n\n{message}\n\n"
+                "Roll back to the previously installed build?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if roll == QMessageBox.Yes and rollback_llama():
+                self._refresh_llama_status()
+                QMessageBox.information(self, "Rolled back", "Restored the previous llama.cpp build.")
+                return
+        QMessageBox.warning(self, "Install failed", message)
+
     def _test_server(self) -> None:
         base = self.widgets["base_url"][1].text().strip()
         key = self.widgets["api_key"][1].text().strip()
@@ -1924,7 +2948,7 @@ class PreferencesDialog(QDialog):
         except OSError as exc:
             QMessageBox.critical(self, "Could not open profiles file", str(exc))
 
-    def _save(self) -> None:
+    def _collect(self) -> None:
         kwargs = {}
         for key, (kind, w) in self.widgets.items():
             if kind == "text":
@@ -1964,7 +2988,23 @@ class PreferencesDialog(QDialog):
                 if t and t not in seen:
                     seen.add(t); tags.append(t)
             self.tags_result = tags
+
+    def _save(self) -> None:
+        self._collect()
         self.accept()
+
+    def _apply(self) -> None:
+        """Commit current settings to the running app without closing, so the user
+        can set up a model/server, see it take effect, and keep editing."""
+        self._collect()
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_apply_preferences_result"):
+            parent._apply_preferences_result(self)
+        btn = self._apply_btn
+        if btn is not None:
+            btn.setText("Applied \u2713")
+            btn.setEnabled(False)
+            QTimer.singleShot(1100, lambda: (btn.setText("Apply"), btn.setEnabled(True)))
 
 
 class FilmstripDelegate(QStyledItemDelegate):
@@ -2894,6 +3934,10 @@ class MainWindow(QMainWindow):
         self._job_running = False
         self._job_cancelled = False
         self._read_only = False
+        self._server_proc = None   # llama-server process we launched (local mode)
+        self._server_popover = None
+        self._server_reachable = None
+        self._server_modelless = False
 
         self.setWindowTitle("Ideogram4 Fantastic Upgraded Captioning Kit")
         # Restore the last window size/position (and maximized/screen state);
@@ -2910,6 +3954,7 @@ class MainWindow(QMainWindow):
         self._folder_tags: list[str] = []
         self._build_server_status()
         self._start_server_monitor()
+        self._maybe_check_llama_update()
         self._set_status("Open a folder to begin.")
 
     # ---- layout ----------------------------------------------------------
@@ -4305,29 +5350,40 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(build_stylesheet(settings))
         self._refresh_tool_icons()
 
-    def open_preferences(self) -> None:
+    def open_preferences(self, page: str | None = None) -> None:
         same = self.qsettings.value("bbox_same_as_caption", False, bool)
         dialog = PreferencesDialog(
             self, self.settings, bbox_same_as_caption=same, default_tags=self._default_tags
         )
+        if page and isinstance(page, str):
+            match = dialog.nav.findItems(page, Qt.MatchExactly)
+            if match:
+                dialog.nav.setCurrentRow(dialog.nav.row(match[0]))
         if dialog.exec() and dialog.result is not None:
-            self.settings = dialog.result
-            self.qsettings.setValue("bbox_same_as_caption", dialog.bbox_same_as_caption)
-            if dialog.tags_result is not None and dialog.tags_result != self._default_tags:
-                self._default_tags = dialog.tags_result
-                self._save_default_tags(self._default_tags)
-                self._refresh_tags_used()
-            try:
-                path = save_settings(self.settings)
-            except OSError as exc:
-                QMessageBox.critical(self, "Preferences not saved", str(exc))
-                return
-            self.apply_appearance(self.settings)
-            self._update_locate_button()
-            monitor = getattr(self, "_server_monitor", None)
-            if monitor is not None:
-                monitor.update_target(self.settings.base_url, self.settings.api_key)
-            self._set_status(f"Saved preferences to {path.name}.")
+            self._apply_preferences_result(dialog)
+
+    def _apply_preferences_result(self, dialog) -> None:
+        """Consume a PreferencesDialog's collected result and apply it live. Shared
+        by the dialog's Save (on close) and Apply (without closing) actions."""
+        if dialog.result is None:
+            return
+        self.settings = dialog.result
+        self.qsettings.setValue("bbox_same_as_caption", dialog.bbox_same_as_caption)
+        if dialog.tags_result is not None and dialog.tags_result != self._default_tags:
+            self._default_tags = dialog.tags_result
+            self._save_default_tags(self._default_tags)
+            self._refresh_tags_used()
+        try:
+            path = save_settings(self.settings)
+        except OSError as exc:
+            QMessageBox.critical(self, "Preferences not saved", str(exc))
+            return
+        self.apply_appearance(self.settings)
+        self._update_locate_button()
+        monitor = getattr(self, "_server_monitor", None)
+        if monitor is not None:
+            monitor.update_target(self.settings.base_url, self.settings.api_key)
+        self._set_status(f"Saved preferences to {path.name}.")
 
     def _build_ai_actions(self) -> QWidget:
         w = QWidget()
@@ -4431,7 +5487,17 @@ class MainWindow(QMainWindow):
         job_settings = self.settings
         if self.project.creative_json is not None:
             job_settings = replace(self.settings, creative_json=self.project.creative_json)
+        image_path = self.current
+        self._ensure_local_binary_then(
+            lambda: self._start_ai_job(operation, job_settings, caption_copy, guidance, image_path)
+        )
 
+    def _start_ai_job(self, operation, job_settings, caption_copy, guidance, image_path) -> None:
+        if not self._ensure_model_configured():
+            return
+        if not self._confirm_model_download():
+            self._set_status("Cancelled.")
+            return
         self._job_cancelled = False
         self._set_ai_running(True)
         self._set_job_progress(f"Running {operation}…", busy=True)
@@ -4439,7 +5505,7 @@ class MainWindow(QMainWindow):
         thread = AiJobThread(
             operation=operation,
             settings=job_settings,
-            image_path=self.current,
+            image_path=image_path,
             caption=caption_copy,
             guidance=guidance,
             source_caption="",
@@ -4449,8 +5515,25 @@ class MainWindow(QMainWindow):
         thread.done.connect(self._on_job_done)
         thread.error.connect(self._on_job_error)
         thread.finished.connect(self._on_job_finished)
+        thread.server_started.connect(self._on_server_started)
         self._ai_thread = thread
         thread.start()
+
+    def _ensure_local_binary_then(self, proceed) -> None:
+        """Pre-flight for local mode: if we're set to auto-launch a local server but
+        have no binary, offer to fetch one first and continue on success. Otherwise
+        proceed immediately."""
+        settings = self.settings
+        if settings.server_start_mode != "local" or not settings.auto_start_server:
+            proceed()
+            return
+        if find_llama_server() is not None:
+            proceed()
+            return
+        # No binary yet — installing happens in Preferences (with progress), not
+        # silently from here. Send the user there rather than starting a download.
+        self._set_status("No local server is set up yet \u2014 install llama.cpp in Settings.")
+        self.open_preferences("Connection/Server")
 
     def run_json_captioning(self) -> None:
         if self._job_running:
@@ -4494,6 +5577,179 @@ class MainWindow(QMainWindow):
             self.right_tabs.setEnabled(not on)
         if hasattr(self, "_readonly_banner"):
             self._readonly_banner.setVisible(on)
+
+    def _server_is_running(self) -> bool:
+        proc = getattr(self, "_server_proc", None)
+        return proc is not None and proc.poll() is None
+
+    def _show_server_popover(self) -> None:
+        if self._server_popover is None:
+            self._server_popover = ServerPopover(
+                self.theme,
+                on_settings=lambda: self.open_preferences("Connection/Server"),
+                on_start=self._start_local_server,
+                on_stop=self._stop_local_server,
+                on_start_nomodel=self._start_local_server_no_model,
+                parent=self,
+            )
+        ok = getattr(self, "_server_reachable", None)
+        local = self.settings.server_start_mode == "local"
+        running = self._server_is_running()
+        binary = find_llama_server() if local else None
+        ready = local and (binary is not None) and has_model_config(self.settings, "caption")
+        show_startstop = running or ready
+        # Offer a model-less launch when the build supports router mode (cached probe).
+        show_nomodel = (local and not running and binary is not None
+                        and llama_server_supports_router(binary))
+        if running and getattr(self, "_server_modelless", False):
+            dot, text = "#3ddc84", "Server up \u2014 no model loaded"
+        elif local and not ready and not running:
+            dot, text = "#9aa4b6", "No server configured"
+        elif ok is None:
+            dot, text = "#9aa4b6", "Checking server\u2026"
+        elif ok:
+            dot, text = "#3ddc84", "Server connected"
+        else:
+            dot, text = "#ff5a52", "Server offline"
+        status_html = (f'<span style="color:{dot}">\u25cf</span> '
+                       f'<span style="color:#c8cdd6">{text}</span>')
+        self._server_popover.configure(
+            status_html=status_html, show_startstop=show_startstop,
+            running=running, show_nomodel=show_nomodel,
+        )
+        self._server_popover.show_above(self._server_status_label)
+
+    def _start_local_server_no_model(self) -> None:
+        """Launch the server with no model resident (router mode) — a quick check
+        that the binary runs and the server answers, with no download."""
+        self._launch_local_server(model_less=True)
+
+    def _start_local_server(self) -> None:
+        """Bring the local server up on demand. With no model configured, send the
+        user to the Models page rather than failing with a server error."""
+        if not self._ensure_model_configured():
+            return
+        # acquire a binary first if we don't have one, then launch
+        self._ensure_local_binary_then(self._launch_local_server)
+
+    def _ensure_model_configured(self) -> bool:
+        """True when a model is set for captioning. In local mode with nothing
+        configured, show a popup that takes the user to Model settings (instead of
+        a download prompt for a model they never chose), and return False. In
+        existing/custom-server mode the loaded model is the server's concern, so
+        this never blocks."""
+        if self.settings.server_start_mode != "local":
+            return True
+        if has_model_config(self.settings, "caption"):
+            return True
+        QMessageBox.information(
+            self, "No model set yet",
+            "No captioning model is configured yet.\n\nOpen Model settings to pick "
+            "a model (or point at one you've already downloaded), then start again.",
+        )
+        self.open_preferences("Models")
+        return False
+
+    def _confirm_model_download(self) -> bool:
+        """Nothing should download without a yes. If launching the configured model
+        would fetch files from Hugging Face, confirm first (naming the model so it's
+        clearly the one you set). Returns True to proceed."""
+        settings = self.settings
+        if settings.server_start_mode != "local" or not settings.auto_start_server:
+            return True
+        try:
+            missing = missing_model_files(settings, "caption")
+        except Exception:
+            missing = []
+        if not missing:
+            return True
+        label = (profile_label_from_id("caption", settings.caption_profile_id) or "").strip()
+        if label.lower().startswith("download:"):
+            label = label.split(":", 1)[1].strip()
+        name = label or "the selected model"
+        listing = "\n".join(f"  \u2022 {fn}" for fn in missing)
+        resp = QMessageBox.question(
+            self, "Download model files?",
+            f"Starting the server will fetch {name} from Hugging Face. "
+            f"These files aren't downloaded yet:\n\n{listing}\n\nDownload them now?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        return resp == QMessageBox.Yes
+
+    def _launch_local_server(self, model_less: bool = False) -> None:
+        if self._server_is_running():
+            self._set_status("Local server is already running.")
+            return
+        if not model_less and not self._confirm_model_download():
+            self._set_status("Server start cancelled.")
+            return
+        self._server_modelless_pending = model_less
+        self._set_job_progress(
+            "Starting server (no model)\u2026" if model_less else "Starting local server\u2026",
+            busy=True,
+        )
+        self._server_thread = LlamaServerThread(self.settings, model_less=model_less)
+        self._server_thread.progress.connect(self._set_status)
+        self._server_thread.started_proc.connect(self._on_local_server_launched)
+        self._server_thread.error.connect(self._on_local_server_error)
+        self._server_thread.start()
+
+    def _on_local_server_launched(self, proc) -> None:
+        self._set_job_progress("")
+        if proc is not None:
+            self._on_server_started(proc)
+            self._server_modelless = getattr(self, "_server_modelless_pending", False)
+            self._set_status("Local server started (no model loaded)."
+                             if self._server_modelless else "Local server started.")
+        else:
+            self._set_status("A server is already running.")
+
+    def _on_local_server_error(self, message: str) -> None:
+        self._set_job_progress("")
+        if self._maybe_offer_launch_rollback(message):
+            return
+        QMessageBox.warning(self, "Couldn't start server", message)
+
+    def _stop_local_server(self) -> None:
+        if self._server_is_running():
+            self._shutdown_server()
+            self._server_modelless = False
+            self._set_status("Local server stopped.")
+        else:
+            self._set_status("No local server is running.")
+
+    def _on_server_started(self, proc) -> None:
+        """A job launched a local llama-server; hold the handle so we can shut it
+        down on exit. Replaces (and stops) any earlier handle we were tracking."""
+        if self._server_proc is not None and self._server_proc is not proc:
+            stop_server_process(self._server_proc)
+        self._server_proc = proc
+
+    # ---- managed llama.cpp: background update check + acquire flow -----------
+
+    def _maybe_check_llama_update(self) -> None:
+        """Once-a-day, metadata-only check for a newer build of the binary we have
+        installed. Gated on the user's toggle; silent and best-effort."""
+        if not getattr(self.settings, "llama_auto_update_check", True):
+            return
+        record = read_installed_llama()
+        if record is None or not record.source:
+            return  # nothing installed -> nothing to compare against
+        last = self.qsettings.value("llama_latest_check_ts")
+        try:
+            last_ts = float(last) if last is not None else 0.0
+        except (TypeError, ValueError):
+            last_ts = 0.0
+        if time.time() - last_ts < 24 * 3600:
+            return
+        self._llama_check_thread = LlamaUpdateCheckThread(record.source)
+        self._llama_check_thread.result.connect(self._on_llama_update_checked)
+        self._llama_check_thread.start()
+
+    def _on_llama_update_checked(self, build: int) -> None:
+        self.qsettings.setValue("llama_latest_check_ts", time.time())
+        if build and build > 0:
+            self.qsettings.setValue("llama_latest_build", int(build))
 
     def run_batch_caption(self) -> None:
         if self._job_running or self.store is None or not self.images:
@@ -4562,6 +5818,16 @@ class MainWindow(QMainWindow):
         self._batch_flagged = {}
         n = len(items)
         delay = int(self.qsettings.value("batch_delay_ms", 0, int) or 0)
+        self._ensure_local_binary_then(
+            lambda: self._start_batch_job(job_settings, items, n, delay)
+        )
+
+    def _start_batch_job(self, job_settings, items, n, delay) -> None:
+        if not self._ensure_model_configured():
+            return
+        if not self._confirm_model_download():
+            self._set_status("Cancelled.")
+            return
         self._job_cancelled = False
         self._set_ai_running(True)
         self._set_read_only(True)
@@ -4571,6 +5837,7 @@ class MainWindow(QMainWindow):
         thread.item_done.connect(self._on_batch_item_done)
         thread.item_error.connect(self._on_batch_item_error)
         thread.batch_finished.connect(self._on_batch_finished)
+        thread.server_started.connect(self._on_server_started)
         self._ai_thread = thread
         thread.start()
 
@@ -4680,6 +5947,45 @@ class MainWindow(QMainWindow):
             return
         QMessageBox.critical(self, "AI job failed", message)
         self._set_job_progress("AI job failed.")
+        if self._maybe_offer_launch_rollback(message):
+            return
+        self._maybe_offer_arch_update(message)
+
+    def _maybe_offer_launch_rollback(self, message: str) -> bool:
+        """If a just-launched server failed to come up and we have a backup binary,
+        offer to roll back to it (a freshly-installed build that won't start)."""
+        if not has_llama_backup():
+            return False
+        low = message.lower()
+        if "did not become ready" in low or "exited during startup" in low:
+            roll = QMessageBox.question(
+                self, "Server didn't start",
+                f"The llama-server didn't start:\n\n{message}\n\n"
+                "Roll back to the previously installed build?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if roll == QMessageBox.Yes and rollback_llama():
+                self._set_status("Rolled back to the previous llama.cpp build.")
+                return True
+        return False
+
+    def _maybe_offer_arch_update(self, message: str) -> None:
+        """If a job failed because the model needs a newer llama.cpp, offer to
+        update — the strongest update signal, surfaced exactly when it matters."""
+        if not is_model_arch_error(message):
+            return
+        record = read_installed_llama()
+        if record is None:
+            return  # not using a managed binary; nothing we can update
+        build = f"b{record.build}" if record.build else "your build"
+        resp = QMessageBox.question(
+            self, "Update llama.cpp?",
+            "This model looks like it needs a newer llama.cpp than your installed "
+            f"build ({build}). Open Settings to update it?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if resp == QMessageBox.Yes:
+            self.open_preferences("Connection/Server")
 
     def _on_job_finished(self) -> None:
         self._set_ai_running(False)
@@ -5579,6 +6885,13 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
+    def _shutdown_server(self) -> None:
+        """Stop the llama-server this app launched (local mode), if any."""
+        proc = getattr(self, "_server_proc", None)
+        if proc is not None:
+            stop_server_process(proc)
+            self._server_proc = None
+
     def closeEvent(self, event) -> None:
         self.qsettings.setValue("window_geometry", self.saveGeometry())
         if getattr(self, "splitter", None) is not None:
@@ -5591,6 +6904,7 @@ class MainWindow(QMainWindow):
             elif self._dirty:
                 self._pending[str(self.current)] = self.current_caption
         if self._autosave or not self._pending:
+            self._shutdown_server()
             event.accept()
             return
         box = QMessageBox(self)
@@ -5602,8 +6916,10 @@ class MainWindow(QMainWindow):
         choice = box.exec()
         if choice == QMessageBox.Save:
             self.save_all()
+            self._shutdown_server()
             event.accept()
         elif choice == QMessageBox.Discard:
+            self._shutdown_server()
             event.accept()
         else:
             event.ignore()
@@ -6090,31 +7406,47 @@ class MainWindow(QMainWindow):
         if list_item is not None:
             list_item.setText(self._element_label(els[idx]))
 
-    def delete_box_at(self, scene_pos: QPointF) -> None:
-        for it in list(self.box_items):
-            if it.mapRectToScene(it.rect()).contains(scene_pos):
-                idx = it.element_index
-                els = self._elements()
-                if 0 <= idx < len(els):
-                    name = self._element_name(els[idx])
-                    confirm = QMessageBox.question(
-                        self,
-                        "Delete box",
-                        f"Remove the bounding box from “{name}”?",
-                        QMessageBox.Yes | QMessageBox.No,
-                        QMessageBox.No,
-                    )
-                    if confirm != QMessageBox.Yes:
-                        return
-                    els[idx].pop("bbox", None)
-                    self._touch_dirty()
-                    if idx == self.selected_element_index:
-                        self.populate_element_editor()
-                    rows = getattr(self, "_element_rows", [])
-                    if 0 <= idx < len(rows):
-                        self._update_row_visuals(rows[idx], els[idx], idx)
-                    self.rebuild_boxes()
-                return
+    def _remove_box_for_element(self, idx: int, *, confirm: bool = True) -> bool:
+        """Remove the bbox from element idx, with the usual confirm + editor/list/
+        canvas refresh. Returns True if a box was actually removed."""
+        els = self._elements()
+        if not (0 <= idx < len(els)):
+            return False
+        if not isinstance(els[idx].get("bbox"), (list, tuple)):
+            return False
+        if confirm:
+            name = self._element_name(els[idx])
+            if QMessageBox.question(
+                self,
+                "Delete box",
+                f"Remove the bounding box from “{name}”?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            ) != QMessageBox.Yes:
+                return False
+        els[idx].pop("bbox", None)
+        self._touch_dirty()
+        if idx == self.selected_element_index:
+            self.populate_element_editor()
+        rows = getattr(self, "_element_rows", [])
+        if 0 <= idx < len(rows):
+            self._update_row_visuals(rows[idx], els[idx], idx)
+        self.rebuild_boxes()
+        return True
+
+    def delete_selected_box(self) -> bool:
+        """Delete the box of the currently selected element. Both the Delete key and
+        the delete tool route here, so deletion always targets the box the user
+        selected — never a larger box that merely overlaps the click point."""
+        idx = self.selected_element_index
+        els = self._elements()
+        if idx is None or not (0 <= idx < len(els)):
+            self._set_status("Select a box first, then delete it.")
+            return False
+        if not isinstance(els[idx].get("bbox"), (list, tuple)):
+            self._set_status("The selected element has no box to delete.")
+            return False
+        return self._remove_box_for_element(idx, confirm=True)
 
     def _on_coord_changed(self, *args) -> None:
         if self._loading:
@@ -6182,8 +7514,15 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self._job_progress_label)
         self.statusBar().addPermanentWidget(self._job_progress_bar)
 
-        self._server_status_label = QLabel()
+        self._resource_label = QLabel()
+        self._resource_label.setObjectName("ResourceMonitor")
+        self._resource_label.setToolTip("System RAM" + (" · VRAM · GPU usage"))
+        self.statusBar().addPermanentWidget(self._resource_label)
+        self._server_status_label = ClickableLabel()
         self._server_status_label.setObjectName("ServerStatus")
+        self._server_status_label.setCursor(Qt.PointingHandCursor)
+        self._server_status_label.setToolTip("Server status & controls")
+        self._server_status_label.clicked.connect(self._show_server_popover)
         self.statusBar().addPermanentWidget(self._server_status_label)
         self._set_server_status(None)  # "checking" until the first ping returns
 
@@ -6210,6 +7549,7 @@ class MainWindow(QMainWindow):
             self._job_progress_bar.setVisible(False)
 
     def _set_server_status(self, ok) -> None:
+        self._server_reachable = ok
         if ok is None:
             dot, text = "#9aa4b6", "Checking server…"
         elif ok:
@@ -6224,16 +7564,23 @@ class MainWindow(QMainWindow):
     def _start_server_monitor(self) -> None:
         self._server_monitor = ServerStatusMonitor(self.settings.base_url, self.settings.api_key)
         self._server_monitor.status.connect(self._set_server_status)
+        self._resource_monitor = ResourceMonitor(self)
+        self._resource_monitor.sampled.connect(self._resource_label.setText)
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._stop_server_monitor)
         self._server_monitor.start()
+        self._resource_monitor.start()
 
     def _stop_server_monitor(self) -> None:
         mon = getattr(self, "_server_monitor", None)
         if mon is not None and mon.isRunning():
             mon.requestInterruption()
             mon.wait(2000)
+        res = getattr(self, "_resource_monitor", None)
+        if res is not None and res.isRunning():
+            res.requestInterruption()
+            res.wait(2000)
 
 
 def main() -> None:
