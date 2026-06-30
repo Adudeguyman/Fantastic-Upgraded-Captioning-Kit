@@ -39,6 +39,7 @@ try:
         QButtonGroup,
         QAbstractButton,
         QCheckBox,
+        QRadioButton,
         QColorDialog,
         QComboBox,
         QDialog,
@@ -106,7 +107,7 @@ from .llm_captioning import (
     ensure_server_running,
     stop_server_process,
     find_llama_server,
-    detect_gpu,
+    detect_gpus,
     recommend_profile_for_vram,
     vram_fit,
     model_size_tier,
@@ -346,6 +347,11 @@ def build_stylesheet(s: CaptioningSettings) -> str:
     QCheckBox::indicator {{ width: 16px; height: 16px; border: 1px solid {t.border_strong}; border-radius: 4px; background: {t.surface_2}; }}
     QCheckBox::indicator:hover {{ border-color: {t.accent}; }}
     QCheckBox::indicator:checked {{ background: {t.accent}; border-color: {t.accent}; }}
+
+    QRadioButton {{ background: transparent; color: {t.text_primary}; spacing: 8px; }}
+    QRadioButton::indicator {{ width: 16px; height: 16px; border: 1px solid {t.border_strong}; border-radius: 9px; background: {t.surface_2}; }}
+    QRadioButton::indicator:hover {{ border-color: {t.accent}; }}
+    QRadioButton::indicator:checked {{ background: {t.accent}; border-color: {t.accent}; }}
 
     QTabWidget::pane {{ border: none; background: {t.surface_1}; }}
     QTabBar::tab {{ background: transparent; color: {t.text_muted}; padding: 6px 14px; border: none; border-radius: 4px; margin: 2px; }}
@@ -1326,7 +1332,7 @@ class PreferencesDialog(QDialog):
         "LM Studio": ("http://localhost:1234/v1", "lm-studio", "existing"),
         "vLLM": ("http://localhost:8000/v1", "vllm", "existing"),
         "Ollama": ("http://localhost:11434/v1", "ollama", "existing"),
-        "Local (llama.cpp)": ("http://127.0.0.1:8000/v1", "llama-cpp", "local"),
+        "Local (llama.cpp)": ("http://127.0.0.1:8231/v1", "llama-cpp", "local"),
     }
 
     GROUPS = (
@@ -1340,7 +1346,7 @@ class PreferencesDialog(QDialog):
             (None, "", "_testserver", None),
             (None, "", "_divider", None),
             (None, "Server", "_section", None),
-            (None, "Detected GPU", "_gpustatus", None),
+            ("llama_devices", "Detected GPU", "_gpupicker", None),
             (None, "llama.cpp", "_llamastatus", None),
             ("llama_backend_hint", "Backend (auto-detect override)", "choice", ("auto", "cuda", "vulkan", "cpu")),
             ("llama_auto_update_check", "Auto-check for llama.cpp updates", "bool", None),
@@ -1412,6 +1418,7 @@ class PreferencesDialog(QDialog):
         "llama_server_path": "Optional. Leave blank to auto-detect the managed install (Get llama.cpp) or a llama-server on your PATH. Set this only to force a specific binary.",
         "llama_context": "Context window (tokens) llama-server is launched with. 0 uses the model/server default.",
         "llama_gpu_layers": "Model layers offloaded to the GPU. -1 = auto: llama.cpp fits as many layers as your free VRAM allows (and spills the rest to CPU) instead of failing if a model is slightly too big. A set value forces exactly that many (0 = CPU-only).",
+        "llama_devices": "Which GPU llama.cpp runs on. Pick one (only shown when there's more than one). The chosen GPU's VRAM is what model size recommendations and fit badges are measured against. Detection uses your installed llama.cpp build, so install it first to see non-NVIDIA cards. The captioner uses a single GPU \u2014 it doesn't split models across cards.",
         "llama_batch": "llama-server batch size (prompt tokens processed per pass). 0 = default.",
         "llama_ubatch": "llama-server micro-batch size; the main driver of compute-buffer VRAM. 512 is plenty for captioning.",
         "llama_parallel": "Concurrent request slots (-np). Captioning runs one image at a time, so 1 keeps VRAM lowest; raise it only if you drive the server from elsewhere too.",
@@ -1521,21 +1528,6 @@ class PreferencesDialog(QDialog):
                         pholder.setLayout(prow)
                         form.addRow(QLabel(label), pholder)
                         self._refresh_server_panel()
-                        continue
-                    if kind == "_gpustatus":
-                        try:
-                            summary = detect_gpu().summary
-                        except Exception:
-                            summary = "detection unavailable"
-                        status = QLabel(summary)
-                        status.setObjectName("GpuStatus")
-                        status.setWordWrap(True)
-                        status.setStyleSheet("color: #9aa3ad; font-style: italic;")
-                        status.setToolTip(
-                            "GPU detected on this machine. Determines which llama.cpp "
-                            "build (CUDA / Vulkan / CPU) the app would download for local mode."
-                        )
-                        form.addRow(QLabel(label), status)
                         continue
                     if kind == "_llamastatus":
                         self._llama_status_label = QLabel("…")
@@ -1663,6 +1655,89 @@ class PreferencesDialog(QDialog):
             v.addLayout(row)
             # Register under "multiline" so _save reads it back with toPlainText().
             self.widgets[key] = ("multiline", edit)
+            return cont
+        if kind == "_gpupicker":
+            cont = QWidget()
+            v = QVBoxLayout(cont)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(6)
+            summary = QLabel("")
+            summary.setStyleSheet("color: #9aa3ad; font-style: italic;")
+            summary.setWordWrap(True)
+            v.addWidget(summary)
+            checks_holder = QWidget()
+            checks_lay = QVBoxLayout(checks_holder)
+            checks_lay.setContentsMargins(0, 0, 0, 0)
+            checks_lay.setSpacing(4)
+            v.addWidget(checks_holder)
+            refresh = QPushButton("Re-detect GPUs")
+            rrow = QHBoxLayout()
+            rrow.setContentsMargins(0, 0, 0, 0)
+            rrow.addWidget(refresh)
+            rrow.addStretch(1)
+            v.addLayout(rrow)
+            cont._device_checks = []  # list[(device_token:str, radio)]
+            cont._device_group = QButtonGroup(cont)
+            cont._device_group.setExclusive(True)
+            first = [True]
+
+            def _gpu_label(g):
+                vram = f", {g.vram_total_gb:.0f}GB" if g.vram_total_gb else ""
+                tags = []
+                if g.is_integrated:
+                    tags.append("integrated")
+                if g.sm:
+                    tags.append(f"sm{g.sm}")
+                extra = f", {', '.join(tags)}" if tags else ""
+                return f"{g.device} \u2014 {g.name}{vram}{extra}"
+
+            def rebuild():
+                if first[0]:
+                    saved = next((x.strip() for x in str(value).split(",") if x.strip()), "")
+                    first[0] = False
+                else:
+                    saved = next((dev for dev, rb in cont._device_checks if rb.isChecked()), "")
+                for _dev, rb in cont._device_checks:
+                    cont._device_group.removeButton(rb)
+                while checks_lay.count():
+                    item = checks_lay.takeAt(0)
+                    wdg = item.widget()
+                    if wdg is not None:
+                        wdg.deleteLater()
+                cont._device_checks = []
+                gpus = self._detected_gpus(refresh=not first[0])
+                if not gpus:
+                    summary.setText("No GPU detected for llama.cpp. Install llama.cpp "
+                                    "(Get llama.cpp below) so it can enumerate your "
+                                    "card \u2014 including AMD/Intel integrated GPUs via "
+                                    "Vulkan. Model sizes can't be fit-checked until then.")
+                    checks_holder.setVisible(False)
+                    return
+                if len(gpus) == 1:
+                    # Nothing to pick — just report it (still drives recommendations).
+                    summary.setText(gpus[0].summary)
+                    checks_holder.setVisible(False)
+                    return
+                checks_holder.setVisible(True)
+                summary.setText("Pick the GPU to run captioning on. Its VRAM is what "
+                                "model recommendations are sized against. The captioner "
+                                "uses one GPU \u2014 it won't split a model across cards.")
+                # Default to the saved pick, else the largest-VRAM card.
+                if saved not in {g.device for g in gpus}:
+                    saved = max(gpus, key=lambda g: g.vram_total_gb or 0).device
+                for g in gpus:
+                    rb = QRadioButton(_gpu_label(g))
+                    rb.setChecked(g.device == saved)
+                    cont._device_group.addButton(rb)
+                    checks_lay.addWidget(rb)
+                    cont._device_checks.append((g.device, rb))
+                for _dev, rb in cont._device_checks:
+                    rb.toggled.connect(lambda *_: self._on_gpu_selection_changed())
+                self._on_gpu_selection_changed()  # sync the default pick into settings
+
+            refresh.clicked.connect(lambda: (rebuild(), self._on_gpu_selection_changed()))
+            self.widgets[key] = ("_gpupicker", cont)
+            rebuild()
             return cont
         if kind == "choice":
             w = QComboBox()
@@ -2230,7 +2305,7 @@ class PreferencesDialog(QDialog):
         lay = QVBoxLayout(dlg)
 
         if vram:
-            gpu_name = detect_gpu().name or "your GPU"
+            gpu_name = self._detected_gpu_label()
             header = f"Detected {gpu_name} \u2014 about {vram:.0f}GB VRAM."
             if rec:
                 rname = rec.label.split(":", 1)[1].strip() if rec.label.lower().startswith("download:") else rec.label
@@ -2480,14 +2555,62 @@ class PreferencesDialog(QDialog):
                 mode_combo.setCurrentIndex(j)
         dlg.accept()
 
-    def _detected_vram(self) -> float | None:
-        """Total VRAM in GB, detected once and cached for the session."""
-        if not hasattr(self, "_vram_gb_cache"):
+    def _detected_gpus(self, refresh: bool = False):
+        """All detected GPUs (cross-vendor), cached for the session. Pass refresh=True
+        to re-probe (the picker's Re-detect button)."""
+        if refresh or not hasattr(self, "_gpus_cache"):
             try:
-                self._vram_gb_cache = detect_gpu().vram_total_gb
+                self._gpus_cache = detect_gpus(self.settings)
             except Exception:
-                self._vram_gb_cache = None
-        return self._vram_gb_cache
+                self._gpus_cache = []
+        return self._gpus_cache
+
+    def _selected_gpu_devices(self) -> set:
+        """llama.cpp device tokens currently ticked in the picker (live), or from
+        saved settings if the picker isn't built. Empty set = use all detected GPUs."""
+        entry = self.widgets.get("llama_devices")
+        if entry and entry[0] == "_gpupicker":
+            checks = getattr(entry[1], "_device_checks", [])
+            return {dev for dev, cb in checks if cb.isChecked()}
+        return {x.strip() for x in str(getattr(self.settings, "llama_devices", "")).split(",")
+                if x.strip()}
+
+    def _target_gpu(self):
+        """The single GPU model recommendations are sized against: the picked one, or
+        the largest detected (which is also what the picker defaults to)."""
+        gpus = self._detected_gpus()
+        if not gpus:
+            return None
+        sel = self._selected_gpu_devices()
+        if sel:
+            for g in gpus:
+                if g.device in sel:
+                    return g
+        return max(gpus, key=lambda g: g.vram_total_gb or 0)
+
+    def _detected_vram(self) -> float | None:
+        """VRAM (GB) of the selected GPU — drives the model recommendations and fit
+        badges. The captioner uses one GPU, so this is a single card's VRAM."""
+        g = self._target_gpu()
+        return g.vram_total_gb if g else None
+
+    def _detected_gpu_label(self) -> str:
+        """Human label for the selected GPU, for the recommendation header."""
+        g = self._target_gpu()
+        return g.name if (g and g.name) else "your GPU"
+
+    def _on_gpu_selection_changed(self) -> None:
+        """A new GPU pick changes both the model recommendations (different VRAM) and
+        which llama.cpp build is offered (different backend). Apply it to the dialog's
+        settings immediately — via a fresh copy, so Cancel still discards it — so the
+        download prompt and status reflect it without the user having to Save first."""
+        sel = self._selected_gpu_devices()
+        self.settings = replace(self.settings, llama_devices=(next(iter(sel)) if sel else ""))
+        for task in ("caption", "bbox"):
+            try:
+                self._refresh_model_label(task)
+            except Exception:
+                pass
 
     def _append_dir_line(self, edit, path: str) -> None:
         """Add a folder as a new line in a dirlist edit, skipping duplicates."""
@@ -2838,13 +2961,27 @@ class PreferencesDialog(QDialog):
             main._launch_local_server()   # binary present — launch directly
         QTimer.singleShot(500, self._refresh_server_panel)
 
+    def _live_settings(self):
+        """Settings with the not-yet-saved GPU pick and backend override applied, so
+        the 'Get llama.cpp' build choice matches what's selected in the dialog right
+        now (e.g. picking the Vulkan iGPU on an NVIDIA+iGPU laptop fetches the Vulkan
+        build, not CUDA)."""
+        kw = {}
+        sel = self._selected_gpu_devices()
+        if sel:
+            kw["llama_devices"] = next(iter(sel))
+        hint = self.widgets.get("llama_backend_hint")
+        if hint and hint[0] == "choice":
+            kw["llama_backend_hint"] = hint[1].currentText()
+        return replace(self.settings, **kw) if kw else self.settings
+
     def _acquire_llama(self) -> None:
         button = self._llama_action_btn
         latest = bool(button.property("wants_latest"))
         button.setEnabled(False)
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            plan = plan_llama_acquisition(self.settings, latest=latest)
+            plan = plan_llama_acquisition(self._live_settings(), latest=latest)
         finally:
             QApplication.restoreOverrideCursor()
         if plan is None:
@@ -2975,6 +3112,13 @@ class PreferencesDialog(QDialog):
                 kwargs[key] = w.toPlainText()
             elif kind == "choice":
                 kwargs[key] = w.currentText()
+            elif kind == "_gpupicker":
+                checks = getattr(w, "_device_checks", [])
+                if checks:
+                    kwargs[key] = ",".join(dev for dev, cb in checks if cb.isChecked())
+                else:
+                    # single GPU / detection failed: no checkboxes, keep saved value
+                    kwargs[key] = getattr(self.settings, key)
             elif kind == "font":
                 kwargs[key] = "" if w.currentText() == "(auto)" else w.currentText().strip()
             elif kind == "color":

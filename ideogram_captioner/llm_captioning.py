@@ -10,6 +10,7 @@ import platform
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tarfile
@@ -160,17 +161,22 @@ def find_llama_server() -> Path | None:
 
 @dataclass(frozen=True)
 class GpuInfo:
-    """Best-effort GPU description used to pick a llama.cpp backend/asset.
+    """Best-effort GPU description used to pick a llama.cpp backend/asset and to
+    populate the GPU picker.
 
     `vendor`/`name`/`sm` are whatever detection could read off the machine — never
     hardcoded — and `backend` is the recommended default ('cuda'|'vulkan'|'cpu').
+    `device` is the token llama.cpp uses for --device (e.g. 'CUDA0', 'Vulkan0').
     """
-    vendor: str = "none"          # "nvidia" | "none"
+    vendor: str = "none"          # "nvidia" | "amd" | "intel" | "other" | "none"
     name: str = ""                # e.g. "NVIDIA GeForce RTX 5090" (as reported)
     compute_cap: str = ""         # e.g. "12.0" (NVIDIA only)
     sm: str = ""                  # e.g. "120" (NVIDIA only)
     backend: str = "vulkan"       # recommended backend
-    vram_total_gb: float | None = None   # total VRAM in GB (NVIDIA only)
+    vram_total_gb: float | None = None   # total VRAM in GB (None if unknown)
+    index: int = 0                # enumeration index within its backend
+    device: str = ""              # llama.cpp --device token, e.g. "CUDA0" / "Vulkan0"
+    is_integrated: bool = False   # an iGPU/APU sharing system memory
 
     @property
     def summary(self) -> str:
@@ -182,9 +188,17 @@ class GpuInfo:
                 bits.append(f"{self.vram_total_gb:.0f}GB")
             paren = f" ({', '.join(bits)})" if bits else ""
             return f"{self.name}{paren} \u2192 CUDA"
+        if self.name:
+            bits = []
+            if self.is_integrated:
+                bits.append("integrated")
+            if self.vram_total_gb:
+                bits.append(f"{self.vram_total_gb:.0f}GB")
+            paren = f" ({', '.join(bits)})" if bits else ""
+            return f"{self.name}{paren} \u2192 {self.backend.upper()}"
         if self.vendor == "nvidia":
             return "NVIDIA GPU \u2192 CUDA"
-        return f"No NVIDIA GPU detected \u2192 {self.backend.upper()}"
+        return f"No GPU detected \u2192 {self.backend.upper()}"
 
 
 def _sm_from_compute_cap(compute_cap: str) -> str:
@@ -195,42 +209,338 @@ def _sm_from_compute_cap(compute_cap: str) -> str:
     return str(int(match.group(1)) * 10 + int(match.group(2)))
 
 
-def detect_gpu() -> GpuInfo:
-    """Probe the machine for a GPU. Never raises.
+def _vendor_from_text(text: str) -> str:
+    low = text.lower()
+    if "nvidia" in low or "geforce" in low or "quadro" in low or "tesla" in low:
+        return "nvidia"
+    if "amd" in low or "radeon" in low or "ati " in low or "radv" in low:
+        return "amd"
+    if "intel" in low or "arc " in low or "iris" in low or "uhd" in low:
+        return "intel"
+    return "other"
 
-    NVIDIA is detected via nvidia-smi (giving us the exact compute capability we
-    need to match a CUDA build). Anything else falls back to a Vulkan
-    recommendation — broad GPU support — with CPU left as a manual override.
-    """
+
+# A line from `llama-server --list-devices`, e.g.:
+#   "  CUDA0: NVIDIA GeForce RTX 5090 (32109 MiB, 31000 MiB free)"
+#   "  Vulkan0: AMD Radeon Graphics (RADV) (16000 MiB, 15500 MiB free)"
+_DEVICE_LINE = re.compile(
+    r"^\s*(?P<dev>[A-Za-z][\w.\-]*\d+)\s*:\s*(?P<desc>.+?)\s*"
+    r"\(\s*(?P<total>\d+)\s*MiB(?:\s*,\s*(?P<free>\d+)\s*MiB\s*free)?\s*\)\s*$"
+)
+
+
+def _devices_from_llama(settings: CaptioningSettings) -> list[GpuInfo]:
+    """Enumerate via `llama-server --list-devices` — the authoritative, cross-vendor
+    view of what the captioner can actually use (CUDA, Vulkan/iGPU, ROCm), with the
+    exact --device tokens. Empty list if no binary or the command fails."""
+    server_path = resolve_llama_server_path(settings)
+    if server_path is None or not server_path.exists():
+        return []
+    try:
+        proc = subprocess.run(
+            [str(server_path), "--list-devices"],
+            capture_output=True, text=True, timeout=15,
+            env=server_launch_env(server_path),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    out: list[GpuInfo] = []
+    seen: set[str] = set()
+    per_backend: dict[str, int] = {}
+    for line in (proc.stdout + "\n" + proc.stderr).splitlines():
+        m = _DEVICE_LINE.match(line)
+        if not m:
+            continue
+        dev = m.group("dev")
+        if dev in seen or dev.lower().startswith(("available", "warning", "error", "note")):
+            continue
+        seen.add(dev)
+        backend_name = re.match(r"[A-Za-z]+", dev).group(0)
+        idx = per_backend.get(backend_name, 0)
+        per_backend[backend_name] = idx + 1
+        desc = m.group("desc").strip()
+        try:
+            vram = round(int(m.group("total")) / 1024.0, 1)
+        except (TypeError, ValueError):
+            vram = None
+        vendor = _vendor_from_text(desc)
+        out.append(GpuInfo(
+            vendor=vendor, name=desc, backend=backend_name.lower(),
+            vram_total_gb=vram, index=idx, device=dev,
+            is_integrated=("integrated" in desc.lower() or "igpu" in desc.lower()),
+        ))
+    return out
+
+
+def _detect_nvidia() -> list[GpuInfo]:
+    """NVIDIA GPUs via nvidia-smi (rich: compute capability + VRAM). Empty if none."""
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,compute_cap,memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            text=True,
-            timeout=5,
+            ["nvidia-smi", "--query-gpu=index,name,compute_cap,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            first = result.stdout.strip().splitlines()[0]
-            parts = [p.strip() for p in first.split(",")]
-            name = parts[0] if parts else ""
-            compute_cap = parts[1] if len(parts) > 1 else ""
-            vram_gb = None
-            if len(parts) > 2:
-                try:
-                    vram_gb = round(float(parts[2]) / 1024.0, 1)
-                except ValueError:
-                    vram_gb = None
-            return GpuInfo(
-                vendor="nvidia",
-                name=name,
-                compute_cap=compute_cap,
-                sm=_sm_from_compute_cap(compute_cap),
-                backend="cuda",
-                vram_total_gb=vram_gb,
-            )
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
-    # No NVIDIA GPU found (or no nvidia-smi): Vulkan covers most other hardware.
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    gpus: list[GpuInfo] = []
+    for line in result.stdout.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            idx = int(parts[0])
+        except ValueError:
+            idx = len(gpus)
+        compute_cap = parts[2] if len(parts) > 2 else ""
+        vram_gb = None
+        if len(parts) > 3:
+            try:
+                vram_gb = round(float(parts[3]) / 1024.0, 1)
+            except ValueError:
+                vram_gb = None
+        gpus.append(GpuInfo(
+            vendor="nvidia", name=parts[1], compute_cap=compute_cap,
+            sm=_sm_from_compute_cap(compute_cap), backend="cuda",
+            vram_total_gb=vram_gb, index=idx, device=f"CUDA{idx}",
+        ))
+    return gpus
+
+
+def _detect_vulkan(skip_names: set[str] | None = None) -> list[GpuInfo]:
+    """GPUs the Vulkan loader can see (vulkaninfo) — catches AMD/Intel iGPUs and APUs
+    that nvidia-smi can't. VRAM is left unknown (Vulkan heap reporting for shared-
+    memory iGPUs is unreliable), but the device still shows and is selectable. Empty
+    if vulkaninfo isn't installed. Never raises."""
+    skip = {s.lower() for s in (skip_names or set())}
+    try:
+        proc = subprocess.run(
+            ["vulkaninfo", "--summary"], capture_output=True, text=True, timeout=8,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    text = proc.stdout or ""
+    if "deviceName" not in text:
+        return []
+    out: list[GpuInfo] = []
+    idx = 0
+    cur_name: str | None = None
+    cur_integrated = False
+    def flush():
+        nonlocal cur_name, cur_integrated, idx
+        if cur_name and cur_name.lower() not in skip:
+            out.append(GpuInfo(
+                vendor=_vendor_from_text(cur_name), name=cur_name, backend="vulkan",
+                vram_total_gb=None, index=idx, device=f"Vulkan{idx}",
+                is_integrated=cur_integrated,
+            ))
+            idx += 1
+        cur_name, cur_integrated = None, False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("GPU") and line.endswith(":"):
+            flush()
+        elif "deviceName" in line and "=" in line:
+            cur_name = line.split("=", 1)[1].strip()
+        elif "deviceType" in line and "=" in line:
+            cur_integrated = "INTEGRATED" in line.upper()
+    flush()
+    return out
+
+
+_PCI_VENDOR = {"0x1002": "amd", "0x10de": "nvidia", "0x8086": "intel"}
+
+
+def _lspci_display_names() -> dict[str, str]:
+    """PCI bus address -> human GPU name, from lspci (for display/3D controllers)."""
+    try:
+        out = subprocess.run(["lspci", "-D", "-nn"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    names: dict[str, str] = {}
+    for line in out.stdout.splitlines():
+        m = re.match(r"(\S+)\s+(?:VGA compatible controller|3D controller|"
+                     r"Display controller)[^:]*:\s*(.+)$", line)
+        if not m:
+            continue
+        name = re.sub(r"\s*\[[0-9a-fA-F]{4}:[0-9a-fA-F]{4}\]", "", m.group(2))
+        name = re.sub(r"\s*\(rev [^)]*\)\s*$", "", name).strip()
+        names[m.group(1)] = name
+    return names
+
+
+def _read_text(path) -> str:
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return ""
+
+
+def _detect_linux_drm(skip_vendors: set[str] | None = None) -> list[GpuInfo]:
+    """Linux: enumerate GPUs straight from the kernel via /sys/class/drm — the same
+    source system monitors (Mission Center, etc.) use. Catches AMD/Intel iGPUs and APUs
+    even when neither llama.cpp nor vulkaninfo is installed. Names come from lspci; VRAM
+    from the driver's mem_info_vram_total where exposed. Never raises.
+
+    The --device token is a best guess (CUDAi / Vulkani) since sysfs doesn't know
+    llama.cpp's numbering — fine for a single GPU (no --device needed) and a reasonable
+    default otherwise."""
+    if not sys.platform.startswith("linux"):
+        return []
+    skip = skip_vendors or set()
+    try:
+        import glob
+        cards = sorted(p for p in glob.glob("/sys/class/drm/card*")
+                       if re.search(r"/card\d+$", p))
+    except OSError:
+        return []
+    if not cards:
+        return []
+    names = _lspci_display_names()
+    out: list[GpuInfo] = []
+    counts = {"cuda": 0, "vulkan": 0}
+    for card in cards:
+        dev = Path(card) / "device"
+        vendor = _PCI_VENDOR.get(_read_text(dev / "vendor").lower(), "other")
+        if vendor in skip:
+            continue
+        try:
+            pci_addr = os.path.basename(os.path.realpath(dev))
+        except OSError:
+            pci_addr = ""
+        name = names.get(pci_addr) or f"{vendor.upper()} GPU"
+        vram_raw = _read_text(dev / "mem_info_vram_total")
+        vram_gb = None
+        if vram_raw.isdigit():
+            gb = round(int(vram_raw) / (1024 ** 3), 1)
+            vram_gb = gb if gb > 0 else None
+        backend = "cuda" if vendor == "nvidia" else "vulkan"
+        token = "CUDA" if backend == "cuda" else "Vulkan"
+        idx = counts["cuda" if backend == "cuda" else "vulkan"]
+        counts["cuda" if backend == "cuda" else "vulkan"] += 1
+        # APUs expose a small/zero VRAM carve-out and run from shared system memory.
+        is_integrated = vram_gb is None or vram_gb <= 2.0
+        out.append(GpuInfo(
+            vendor=vendor, name=name, backend=backend, vram_total_gb=vram_gb,
+            index=idx, device=f"{token}{idx}", is_integrated=is_integrated,
+        ))
+    return out
+
+
+_WIN_GPU_PS = r"""
+$ErrorActionPreference='SilentlyContinue'
+$reg = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\*'
+$out = Get-CimInstance Win32_VideoController | ForEach-Object {
+  $vc = $_
+  $m = $reg | Where-Object { $_.MatchingDeviceId -and ($vc.PNPDeviceID -like ($_.MatchingDeviceId + '*')) } | Select-Object -First 1
+  $vram = if ($m -and $m.'HardwareInformation.qwMemorySize') { [int64]$m.'HardwareInformation.qwMemorySize' } else { [int64]$vc.AdapterRAM }
+  [pscustomobject]@{ name=$vc.Name; vendor=$vc.AdapterCompatibility; pnp=$vc.PNPDeviceID; vram=$vram }
+}
+$out | ConvertTo-Json -Compress
+"""
+
+
+def _detect_windows_wmi(skip_vendors: set[str] | None = None) -> list[GpuInfo]:
+    """Windows: enumerate GPUs via WMI (Win32_VideoController) with accurate 64-bit VRAM
+    pulled from the driver registry key (AdapterRAM caps at ~4GB, so it's only a
+    fallback). The Windows analog of reading sysfs — sees AMD/Intel iGPUs without any
+    GPU tooling installed. Never raises."""
+    if os.name != "nt":
+        return []
+    skip = skip_vendors or set()
+    try:
+        enc = base64.b64encode(_WIN_GPU_PS.encode("utf-16-le")).decode("ascii")
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", enc],
+            capture_output=True, text=True, timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    raw = (proc.stdout or "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    out: list[GpuInfo] = []
+    counts = {"cuda": 0, "vulkan": 0}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("name") or "").strip()
+        if not name or "basic display" in name.lower() or "remote display" in name.lower():
+            continue  # Microsoft Basic/Remote Display Adapter — not a real GPU
+        pnp = (item.get("pnp") or "").upper()
+        if "VEN_10DE" in pnp:
+            vendor = "nvidia"
+        elif "VEN_1002" in pnp:
+            vendor = "amd"
+        elif "VEN_8086" in pnp:
+            vendor = "intel"
+        else:
+            vendor = _vendor_from_text(item.get("vendor") or name)
+        if vendor in skip:
+            continue
+        vram_gb = None
+        try:
+            b = int(item.get("vram") or 0)
+            if b > 0:
+                vram_gb = round(b / (1024 ** 3), 1) or None
+        except (TypeError, ValueError):
+            pass
+        backend = "cuda" if vendor == "nvidia" else "vulkan"
+        key = "cuda" if backend == "cuda" else "vulkan"
+        idx = counts[key]
+        counts[key] += 1
+        is_integrated = bool(
+            (vram_gb is not None and vram_gb <= 2.0)
+            or re.search(r"\bUHD\b|\bIris\b|HD Graphics|\(TM\) Graphics|Vega.*Graphics", name)
+        )
+        out.append(GpuInfo(
+            vendor=vendor, name=name, backend=backend, vram_total_gb=vram_gb,
+            index=idx, device=f"{'CUDA' if backend == 'cuda' else 'Vulkan'}{idx}",
+            is_integrated=is_integrated,
+        ))
+    return out
+
+
+def detect_gpus(settings: CaptioningSettings | None = None) -> list[GpuInfo]:
+    """Enumerate usable GPUs across vendors, for the picker and recommendation VRAM.
+
+    Priority:
+      1. `llama-server --list-devices` when a binary exists — authoritative, with the
+         exact --device tokens + VRAM for CUDA, Vulkan/iGPU, or ROCm.
+      2. nvidia-smi (CUDA) + vulkaninfo (Vulkan) — works pre-install.
+      3. OS-native enumeration (Linux /sys/class/drm, Windows WMI) — last resort that
+         still sees AMD/Intel iGPUs when no GPU tooling is installed.
+    Never raises.
+    """
+    if settings is not None:
+        devs = _devices_from_llama(settings)
+        if devs:
+            return devs
+    nvidia = _detect_nvidia()
+    vulkan = _detect_vulkan(skip_names={g.name for g in nvidia})
+    skip = {"nvidia"} if nvidia else None
+    extra = vulkan or _detect_linux_drm(skip_vendors=skip) or _detect_windows_wmi(skip_vendors=skip)
+    return nvidia + extra
+
+
+def detect_gpu() -> GpuInfo:
+    """The primary GPU (first detected), or a Vulkan fallback when none is found.
+    Used for backend/asset selection and the one-line summary. Skips the Vulkan probe
+    when an NVIDIA card is present (it's the primary anyway). Never raises."""
+    nvidia = _detect_nvidia()
+    if nvidia:
+        return nvidia[0]
+    rest = _detect_vulkan() or _detect_linux_drm() or _detect_windows_wmi()
+    if rest:
+        return rest[0]
     return GpuInfo(vendor="none", backend="vulkan")
 
 
@@ -787,15 +1097,38 @@ class LlamaPlan:
     def description(self) -> str:
         size_mb = self.total_size / (1024 * 1024) if self.total_size else 0
         size = f"~{size_mb:.0f} MB " if size_mb else ""
-        who = self.gpu.name if (self.gpu.vendor == "nvidia" and self.gpu.name) else "your system"
+        who = self.gpu.name if self.gpu.name else "your system"
         build = f"b{self.release.build}" if self.release.build else (self.release.tag or "latest")
         return f"{size}{self.backend.upper()} build ({build}) for {who}"
+
+
+def _picked_gpu(settings) -> "GpuInfo | None":
+    """The GpuInfo for the device chosen in the picker (settings.llama_devices), or
+    None if nothing is picked / it's not currently detected."""
+    picked = next((d.strip() for d in (getattr(settings, "llama_devices", "") or "").split(",")
+                   if d.strip()), "")
+    if not picked:
+        return None
+    for g in detect_gpus(settings):
+        if g.device == picked:
+            return g
+    return None
 
 
 def resolve_backend(settings, gpu: GpuInfo) -> str:
     hint = (getattr(settings, "llama_backend_hint", "auto") or "auto").lower()
     if hint in ("cuda", "vulkan", "cpu"):
         return hint
+    # Honor the GPU picker: if the user chose a specific device, the build must match
+    # that device's backend — a CUDA build can't drive an Intel/AMD Vulkan GPU, so
+    # picking the iGPU on an NVIDIA+iGPU laptop means a Vulkan build, not CUDA.
+    picked = next((d.strip() for d in (getattr(settings, "llama_devices", "") or "").split(",")
+                   if d.strip()), "")
+    low = picked.lower()
+    if low.startswith("cuda"):
+        return "cuda"
+    if low.startswith("vulkan"):
+        return "vulkan"
     return gpu.backend
 
 
@@ -807,6 +1140,10 @@ def plan_llama_acquisition(settings, *, latest: bool = False, fetch=None):
     gpu = detect_gpu()
     system, arch = current_platform()
     backend = resolve_backend(settings, gpu)
+    # Describe and match the GPU the user actually picked, not the primary card — on an
+    # NVIDIA+iGPU laptop, picking the Intel iGPU should read "Vulkan build for Intel…",
+    # not "…for NVIDIA…".
+    target = _picked_gpu(settings) or gpu
     repo = llama_repo_for(system, backend)
     release = None
     if not latest:
@@ -815,12 +1152,12 @@ def plan_llama_acquisition(settings, *, latest: bool = False, fetch=None):
         release = fetch(repo, None)   # latest — also the pinned-not-found fallback
     if release is None:
         return None
-    sm = gpu.sm if backend == "cuda" else ""
+    sm = target.sm if backend == "cuda" else ""
     assets = select_llama_assets(release.assets, system=system, arch=arch, backend=backend, sm=sm)
     if not assets:
         return None
     return LlamaPlan(release=release, assets=assets, backend=backend, sm=sm,
-                     gpu=gpu, system=system, arch=arch, repo=repo)
+                     gpu=target, system=system, arch=arch, repo=repo)
 
 
 DEFAULT_PROFILE_DATA: dict[str, Any] = {
@@ -1037,7 +1374,10 @@ MODEL_TARGET_HF = "Shared Hugging Face cache"
 
 @dataclass
 class CaptioningSettings:
-    base_url: str = "http://127.0.0.1:8000/v1"
+    # 8231, not 8000: on Windows 8000 is frequently held by a kernel http.sys
+    # reservation (Docker Desktop, WSL2, dev servers), which blocks the 127.0.0.1 bind
+    # even though nothing visibly owns it. 8231 dodges the common dev/AI-tool defaults.
+    base_url: str = "http://127.0.0.1:8231/v1"
     api_key: str = "dummy"
     hf_token: str = ""
     models_dir: str = ""
@@ -1084,6 +1424,9 @@ class CaptioningSettings:
     llama_ubatch: int = 512
     llama_parallel: int = 1
     llama_threads: int = 0
+    # Single-GPU selection: the one llama.cpp device to use (a --device token like
+    # "CUDA0" / "Vulkan0"). Empty = let llama.cpp use its default device.
+    llama_devices: str = ""
     llama_extra_args: str = "-fa on"
     llama_reasoning_budget: int = 2048
     caption_server_command: str = ""
@@ -1558,6 +1901,19 @@ def server_host_port(base_url: str) -> tuple[str, int]:
     return host, port
 
 
+def port_in_use(host: str, port: int, timeout: float = 0.6) -> bool:
+    """True if something is already listening on host:port. Used to catch an orphaned
+    server holding the port before we launch one that can't bind it. Connects to
+    127.0.0.1 when the host is a wildcard bind address."""
+    probe = "127.0.0.1" if host in ("0.0.0.0", "", "*") else host
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            return sock.connect_ex((probe, int(port))) == 0
+    except OSError:
+        return False
+
+
 def _split_filenames(value: str) -> list[str]:
     return [part.strip() for part in re.split(r"[;,]", value) if part.strip()]
 
@@ -1767,6 +2123,11 @@ def server_launch_env(binary_path: Path | None) -> dict:
     add its folder too, so single-GPU users aren't blocked by a missing NCCL.
     """
     env = os.environ.copy()
+    # Make llama.cpp's CUDA device numbering (CUDA0, CUDA1, …) match nvidia-smi's
+    # index order, so a GPU the user ticked by its nvidia-smi index maps to the right
+    # --device CUDAi. Both are PCI-bus ordered under this setting. Respect any value
+    # the user already set.
+    env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
     if binary_path is None:
         return env
     try:
@@ -1825,6 +2186,20 @@ def llama_server_supports_router(binary_path: Path | None) -> bool:
         supported = False
     _ROUTER_SUPPORT[key] = supported
     return supported
+
+
+def _gpu_device_args(settings: CaptioningSettings) -> list[str]:
+    """Pin llama.cpp to a single GPU when one is chosen in the picker.
+
+    The picker stores one --device token ("CUDA0" / "Vulkan0"); a bare index ("0")
+    is treated as CUDA0 for backward compat. Empty = no flag (llama.cpp default).
+    --split-mode none keeps it strictly single-GPU (no layer/tensor splitting)."""
+    picked = [d.strip() for d in (settings.llama_devices or "").split(",") if d.strip()]
+    if not picked:
+        return []
+    dev = picked[0]
+    dev = f"CUDA{dev}" if dev.isdigit() else dev
+    return ["--device", dev, "--split-mode", "none"]
 
 
 def build_llama_server_command(settings: CaptioningSettings, task: str, assets: ModelAssets,
@@ -1888,6 +2263,7 @@ def build_llama_server_command(settings: CaptioningSettings, task: str, assets: 
     # value (incl. 0 for CPU-only) is passed through and disables the fitter.
     if int(settings.llama_gpu_layers) >= 0:
         args.extend(["-ngl", str(int(settings.llama_gpu_layers))])
+    args.extend(_gpu_device_args(settings))
     if assets.mmproj_path is not None:
         args.extend(["--mmproj", str(assets.mmproj_path)])
     if settings.llama_threads > 0:
@@ -2018,6 +2394,14 @@ def diagnose_server_log(log_path: Path) -> tuple[str, str]:
     except OSError:
         return "", ""
     low = tail.lower()
+    if ("couldn't bind" in low or "could not bind" in low or "bind http server socket" in low
+            or "address already in use" in low or "exiting due to http server error" in low):
+        return ("port_in_use",
+                "The server couldn't bind its port \u2014 it's already in use. An orphaned "
+                "llama.cpp server from a previous session is probably still running, or "
+                "another app holds the port. Stop that process (on Windows: "
+                "netstat -ano | findstr :PORT, then taskkill /PID <pid> /F), or change the "
+                "server port in Preferences \u2192 Connection/Server.")
     if ("out of memory" in low or "cudamalloc failed" in low
             or "failed to allocate" in low or "unable to allocate" in low
             or "cuda error: out of memory" in low):
@@ -2130,6 +2514,20 @@ def ensure_server_running(
     # already answering (a server we launched earlier, or one the user started)
     if is_server_ready(settings.base_url, api_key=settings.api_key, timeout=3.0):
         return None
+    # The port is taken but nothing is answering: an orphaned server from a previous
+    # session is likely still holding it (common on Windows when the app closed without
+    # stopping its child). Launching now would just fail to bind, so stop with a clear
+    # message instead of piling up dead processes.
+    host, port = server_host_port(settings.base_url)
+    if port_in_use(host, port):
+        raise RuntimeError(
+            f"Port {port} is already in use, but no llama.cpp server is answering there. "
+            "An orphaned server from a previous session is probably still running (or "
+            "another app holds the port). Stop that process, then try again \u2014 on "
+            f"Windows: run  netstat -ano | findstr :{port}  to get its PID, then  "
+            f"taskkill /PID <pid> /F  (or  taskkill /IM llama-server.exe /F  to clear "
+            "all of them). Or change the server port in Preferences \u2192 Connection/Server."
+        )
 
     if model_less:
         command = build_llama_server_command(settings, task, ModelAssets(), model_less=True)

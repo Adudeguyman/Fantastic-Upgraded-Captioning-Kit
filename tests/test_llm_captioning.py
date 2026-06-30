@@ -608,7 +608,8 @@ class DetectGpuTests(unittest.TestCase):
     def test_detects_nvidia_from_smi(self):
         import ideogram_captioner.llm_captioning as L
         import subprocess as sp
-        cp = sp.CompletedProcess(args=[], returncode=0, stdout="NVIDIA GeForce RTX 5090, 12.0\n")
+        cp = sp.CompletedProcess(args=[], returncode=0,
+                                 stdout="0, NVIDIA GeForce RTX 5090, 12.0, 32607\n")
         with patch.object(L.subprocess, "run", return_value=cp):
             info = L.detect_gpu()
         self.assertEqual(info.vendor, "nvidia")
@@ -616,7 +617,23 @@ class DetectGpuTests(unittest.TestCase):
         self.assertEqual(info.compute_cap, "12.0")
         self.assertEqual(info.sm, "120")
         self.assertEqual(info.backend, "cuda")
+        self.assertEqual(info.index, 0)
+        self.assertAlmostEqual(info.vram_total_gb, 31.8, places=1)
         self.assertIn("sm120", info.summary)
+
+    def test_detect_gpus_enumerates_all(self):
+        import ideogram_captioner.llm_captioning as L
+        import subprocess as sp
+        cp = sp.CompletedProcess(args=[], returncode=0, stdout=(
+            "0, NVIDIA GeForce RTX 5090, 12.0, 32607\n"
+            "1, NVIDIA GeForce RTX 3090, 8.6, 24576\n"
+        ))
+        with patch.object(L.subprocess, "run", return_value=cp):
+            gpus = L.detect_gpus()
+        self.assertEqual([g.index for g in gpus], [0, 1])
+        self.assertEqual([g.name for g in gpus],
+                         ["NVIDIA GeForce RTX 5090", "NVIDIA GeForce RTX 3090"])
+        self.assertEqual(gpus[1].sm, "86")
 
     def test_falls_back_to_vulkan_without_nvidia(self):
         import ideogram_captioner.llm_captioning as L
