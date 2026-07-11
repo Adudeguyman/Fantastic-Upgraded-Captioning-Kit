@@ -7623,6 +7623,7 @@ class MainWindow(QMainWindow):
         # keep the arrow under the thumbnail centre even after clamping
         arrow_x = thumb_center.x() - left
         arrow_x = max(m + 10, min(arrow_x, m + PREVIEW_W - 10))
+        self._anchor_popup_to_window(win)
         win.show_at(QPoint(left, y), int(arrow_x))
 
     def _on_thumb_changed(self, current: QListWidgetItem | None, _prev: QListWidgetItem | None) -> None:
@@ -7887,6 +7888,25 @@ class MainWindow(QMainWindow):
             return '<span style="color:#6C737C">Guidance text changed.</span>'
         return "<br>".join(rows)
 
+    def _anchor_popup_to_window(self, pop) -> None:
+        """Wayland refuses to map a frameless popup/tooltip surface unless it has a
+        transient parent (KDE/Plasma: 'Failed to create popup ... has a transientParent
+        set'). Qt otherwise falls back to the currently-active window, which is
+        unreliable — e.g. right after the guidance dialog closes, which is exactly when
+        users saw the hover popups stop appearing. Pin every hover popup to the main
+        window's surface before it's shown. Harmless on X11/Windows/macOS."""
+        try:
+            host = self.windowHandle()
+            if host is None:
+                return
+            if pop.windowHandle() is None:
+                pop.winId()  # force native surface so windowHandle() exists
+            ph = pop.windowHandle()
+            if ph is not None:
+                ph.setTransientParent(host)
+        except Exception:
+            pass
+
     def _ensure_gdiff_popup(self) -> "GuidanceDiffPopup":
         pop = getattr(self, "_gdiff_popup", None)
         if pop is None:
@@ -7910,6 +7930,7 @@ class MainWindow(QMainWindow):
             screen = self.screen().availableGeometry()
         except Exception:
             screen = None
+        self._anchor_popup_to_window(pop)
         pop.show_diff(html, target, screen)
 
     def _hide_gdiff_popup(self) -> None:
@@ -7935,6 +7956,7 @@ class MainWindow(QMainWindow):
             screen = self.screen().availableGeometry()
         except Exception:
             screen = None
+        self._anchor_popup_to_window(pop)
         pop.show_tags(self._make_used_pill, used, target, screen)
 
     def _hide_tags_popup(self) -> None:
