@@ -6194,7 +6194,7 @@ class CropResizeDialog(QDialog):
         store = getattr(self.controller, "store", None)
         if store is None or not store.restore_original(self.image_path):
             QMessageBox.information(self, "No backup",
-                                    "No backed-up original exists for this image.")
+                                    "No backed-up original exists for this file.")
             return
         self.accept()
 
@@ -6365,7 +6365,7 @@ class BatchResizeDialog(QDialog):
         self.scope_combo = QComboBox()
         all_n = len(controller.images)
         flagged = self._flagged_paths()
-        self.scope_combo.addItem(f"All images ({all_n})", "all")
+        self.scope_combo.addItem(f"All files ({all_n})", "all")
         self.scope_combo.addItem(f"Flagged for review ({len(flagged)})", "flagged")
         self.scope_combo.currentIndexChanged.connect(self._refresh_estimate)
         scope_row.addWidget(self.scope_combo)
@@ -7514,7 +7514,7 @@ class MainWindow(QMainWindow):
             self,
             f"About {APP_TITLE}",
             f"{APP_TITLE}\n\n"
-            "A local tool for preparing image/caption datasets: crop and resize "
+            "A local tool for preparing image and video caption datasets: crop, trim "
             "images, then edit and generate captions with a local vision model. "
             "Ships with structured Ideogram 4 JSON support.\n\n"
             "Built with PySide6 (Qt for Python), used under the LGPL v3.",
@@ -8058,7 +8058,7 @@ class MainWindow(QMainWindow):
             dlg_convert.toggled.connect(self._set_convert_mode)
             conv_row = self._explained_toggle_row(
                 "Use existing .txt captions as guidance",
-                "Each image's matching .txt sidecar is fed to the captioner to upgrade into "
+                "Each file's matching .txt sidecar is fed to the captioner to upgrade into "
                 "structured JSON. Images without a .txt fall back to image-only captioning. "
                 "Folder-wide; applies as soon as you toggle it.",
                 dlg_convert,
@@ -8089,9 +8089,9 @@ class MainWindow(QMainWindow):
         if has_images:
             dlg_omit = ToggleSwitch()
             left.addWidget(self._toggle_row(
-                "Use this image's .txt caption", dlg_omit,
+                "Use this file's .txt caption", dlg_omit,
                 "Off = caption this image from the image alone, even though convert mode is on. "
-                "Available when convert mode is on and this image has a matching .txt."))
+                "Available when convert mode is on and this file has a matching .txt."))
             self._dlg_omit_toggle = dlg_omit
 
             def refresh_omit() -> None:
@@ -8151,9 +8151,9 @@ class MainWindow(QMainWindow):
 
             def refresh_preview() -> None:
                 img = self.images[state["idx"]]
-                pm = QPixmap(str(img))
+                pm = self.preview_pixmap(img)
                 if pm.isNull():
-                    preview.setText("(cannot load image)")
+                    preview.setText("(no preview available)")
                 else:
                     preview.setPixmap(pm.scaled(440, 720, Qt.KeepAspectRatio, Qt.SmoothTransformation))
                 name_label.setText(f"{img.name}   ({state['idx'] + 1} / {len(self.images)})")
@@ -8293,7 +8293,7 @@ class MainWindow(QMainWindow):
         self.g_convert_enabled.setEnabled(False)
         self._convert_row = self._explained_toggle_row(
             "Use existing .txt captions as guidance",
-            "Upgrade each image's .txt into structured JSON — no .txt means image-only.",
+            "Upgrade each file's .txt into structured JSON — no .txt means media-only.",
             self.g_convert_enabled,
             "When on, each image's matching .txt sidecar is fed to the captioner as a source "
             "caption to upgrade into structured JSON. Images without a .txt use image-only captioning.",
@@ -8304,7 +8304,7 @@ class MainWindow(QMainWindow):
         self.g_source_caption.setObjectName("GuidanceBoxRO")
         self.g_source_caption.setReadOnly(True)
         self.g_source_caption.setFixedHeight(72)
-        self.g_source_caption.setToolTip("The .txt source caption fed to the captioner for this image (read-only).")
+        self.g_source_caption.setToolTip("The .txt source caption fed to the captioner for this file (read-only).")
 
         title = QLabel("Caption Guidance")
         title.setObjectName("SectionLabel")
@@ -8335,7 +8335,7 @@ class MainWindow(QMainWindow):
         # ---- Global (applies to every file) ----
         lay.addWidget(self._folder_enabled_row)
         mode_label = self._field_label("Mode")
-        mode_label.setToolTip("How closely generation should follow the image (applies to the whole folder).")
+        mode_label.setToolTip("How closely generation should follow the source (applies to the whole folder).")
         lay.addWidget(mode_label)
         lay.addWidget(self.g_mode)
         folder_label = self._field_label("Folder \u00b7 all files")
@@ -8364,7 +8364,7 @@ class MainWindow(QMainWindow):
         sc_head = QHBoxLayout()
         sc_head.setContentsMargins(0, 0, 0, 0)
         sc_label = self._field_label("Source caption")
-        sc_label.setToolTip("The .txt fed to the captioner as source material for this image.")
+        sc_label.setToolTip("The .txt fed to the captioner as source material for this file.")
         sc_head.addWidget(sc_label)
         sc_head.addStretch(1)
         self._source_status = QLabel("")
@@ -8372,7 +8372,7 @@ class MainWindow(QMainWindow):
         sc_head.addWidget(self._source_status)
         self.g_source_use = ToggleSwitch()
         self.g_source_use.setToolTip(
-            "Use this image's .txt caption. Turn off to caption this image from the image alone.")
+            "Use this file's .txt caption. Turn off to caption it from the media alone.")
         self.g_source_use.toggled.connect(self._on_source_use_toggled)
         sc_head.addWidget(self.g_source_use)
         sc_lay.addLayout(sc_head)
@@ -8386,7 +8386,7 @@ class MainWindow(QMainWindow):
         sc_expand.setIcon(self._expand_icon())
         sc_expand.setIconSize(QSize(14, 14))
         sc_expand.setFixedSize(22, 22)
-        sc_expand.setToolTip("Pop out the source caption — stays open and follows the image you're on")
+        sc_expand.setToolTip("Pop out the source caption — stays open and follows the file you're on")
         sc_expand.clicked.connect(self._open_source_popout)
         sc_field_h.addWidget(sc_expand, 0, Qt.AlignTop)
         sc_lay.addWidget(sc_field_row)
@@ -8515,7 +8515,8 @@ class MainWindow(QMainWindow):
         return row
 
     _CONVERT_NO_TXT_DESC = ("No .txt caption files were found in this folder. Add a .txt "
-                            "caption file that matches an image's filename to use this feature.")
+                            "caption file whose name matches a file here to use this "
+                            "feature.")
 
     def _refresh_source_availability(self) -> None:
         """Recompute whether the folder has any .txt sidecars (folder-level gate)."""
@@ -8795,7 +8796,7 @@ class MainWindow(QMainWindow):
             return text, "\u2713 " + self._elide_middle(name), "#3ddc84", "", False
         warn = getattr(self.theme, "warning", "#E0A33B")
         return ("", "no .txt \u00b7 image-only", warn,
-                "No source caption for this image — the captioner will work from the image alone.", False)
+                "No source caption for this file — the captioner will work from the media alone.", False)
 
     def _refresh_source_caption(self) -> None:
         box = getattr(self, "_source_caption_box", None)
@@ -8885,10 +8886,10 @@ class MainWindow(QMainWindow):
         status_lab.setAlignment(Qt.AlignCenter)
         v.addWidget(status_lab)
         use_row = QHBoxLayout()
-        use_lab = QLabel("Use this image's .txt caption")
+        use_lab = QLabel("Use this file's .txt caption")
         use_lab.setObjectName("Hint")
         use_tog = ToggleSwitch()
-        use_tog.setToolTip("Off = caption this image from the image alone.")
+        use_tog.setToolTip("Off = caption this file from the media alone.")
         use_tog.toggled.connect(self._on_popout_use_toggled)
         use_row.addWidget(use_lab)
         use_row.addStretch(1)
@@ -8914,10 +8915,10 @@ class MainWindow(QMainWindow):
         if dlg is None:
             return
         if self.current is not None:
-            pm = QPixmap(str(self.current))
+            pm = self.preview_pixmap(self.current)
             if pm.isNull():
                 dlg._sc_thumb.setPixmap(QPixmap())
-                dlg._sc_thumb.setText("(cannot load image)")
+                dlg._sc_thumb.setText("(no preview available)")
             else:
                 dlg._sc_thumb.setPixmap(pm.scaled(380, self._SC_THUMB_H, Qt.KeepAspectRatio, Qt.SmoothTransformation))
             total = len(self.images)
@@ -8925,7 +8926,7 @@ class MainWindow(QMainWindow):
             dlg._sc_name.setText(f"{self.current.name}   ({idx} / {total})" if idx else self.current.name)
         else:
             dlg._sc_thumb.setPixmap(QPixmap())
-            dlg._sc_thumb.setText("(no image)")
+            dlg._sc_thumb.setText("(no file selected)")
             dlg._sc_name.setText("")
         # Nav mirrors the main window: disabled at the ends, and while a batch has
         # navigation locked (so the pop-out can't move the selection mid-run).
@@ -9038,7 +9039,7 @@ class MainWindow(QMainWindow):
         # Raw JSON lives here rather than the toolbar: it's a per-caption inspector,
         # and it only means anything for structured presets.
         self.rawjson_btn = QPushButton("View raw JSON")
-        self.rawjson_btn.setToolTip("Show the raw caption JSON for this image (Ctrl+J)")
+        self.rawjson_btn.setToolTip("Show the raw caption JSON for this file (Ctrl+J)")
         self.rawjson_btn.clicked.connect(self._toggle_raw_json)
         lay.addWidget(self.rawjson_btn)
         lay.addStretch(1)
@@ -9522,7 +9523,7 @@ class MainWindow(QMainWindow):
         if self._job_running:
             return
         if self.store is None or self.current is None:
-            self._set_status("Open a folder and select an image first.")
+            self._set_status("Open a folder and select a file first.")
             return
         # flush pending edits so the operation works on the latest caption
         self.commit_caption_fields()
@@ -9636,7 +9637,7 @@ class MainWindow(QMainWindow):
                 return
             # Configured but not running (or up without a model loaded).
             count = len(self.images) if (batch and self.images) else 0
-            tail = f" and caption all {count} images?" if count else "?"
+            tail = f" and caption all {count} files?" if count else "?"
             relaunch = " (it's running without a model, so it needs to reload)" if model_less else ""
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Question)
@@ -10014,14 +10015,14 @@ class MainWindow(QMainWindow):
                           and self.project.is_convert_omitted(img.name))
             using = with_txt - omitted
             convert_note = (
-                f"Convert mode: {using} of {total} image(s) will use a matching .txt "
+                f"Convert mode: {using} of {total} file(s) will use a matching .txt "
                 "source caption; the rest fall back to image-only captioning."
             )
             if omitted:
-                convert_note += f" ({omitted} with a .txt marked image-only.)"
+                convert_note += f" ({omitted} with a .txt marked media-only.)"
         if already:
             box = QMessageBox(self)
-            box.setWindowTitle("Caption all images")
+            box.setWindowTitle("Caption all files")
             msg = f"{len(already)} of {total} image(s) already have a caption."
             if stale:
                 msg += (f"\n{len(stale)} of those have guidance changes since they "
@@ -10056,7 +10057,7 @@ class MainWindow(QMainWindow):
         else:
             extra = ("\n\n" + convert_note) if convert_note else ""
             resp = QMessageBox.question(
-                self, "Caption all images",
+                self, "Caption all files",
                 f"Generate JSON for all {total} image(s)?\n\n"
                 "Images are processed one at a time through your configured server."
                 + extra,
@@ -10416,7 +10417,7 @@ class MainWindow(QMainWindow):
         right_lay.setContentsMargins(0, 0, 0, 0)
         right_lay.setSpacing(0)
         self._readonly_banner = QLabel(
-            "Captioning in progress — editing paused (read-only). Browse and flag images "
+            "Captioning in progress — editing paused (read-only). Browse and flag files "
             "for manual review — press F or right-click a thumbnail to flag."
         )
         self._readonly_banner.setObjectName("ReadOnlyBanner")
@@ -10723,7 +10724,7 @@ class MainWindow(QMainWindow):
         if self.preset.is_plain:
             parts = [self.effective_system_prompt().strip()]
             if guidance.strip():
-                parts.append("Additional guidance for this image:\n" + guidance.strip())
+                parts.append("Additional guidance for this file:\n" + guidance.strip())
             return "\n\n".join(p for p in parts if p)
         # Structured presets build their prompt from the template files, exactly as
         # the run path does.
@@ -10804,6 +10805,18 @@ class MainWindow(QMainWindow):
 
     def settings_caption_ext(self) -> str:
         return self.preset.extension
+
+    def preview_pixmap(self, path: Path) -> QPixmap:
+        """Full-size preview for a file, using a clip's poster frame.
+
+        QPixmap can't open an .mp4, so any dialog that previewed with QPixmap
+        directly showed "(cannot load image)" for every video.
+        """
+        if is_video(path):
+            poster = self._video_poster(path)
+            pixmap = QPixmap(str(poster)) if poster else QPixmap()
+            return pixmap if not pixmap.isNull() else self._video_placeholder()
+        return QPixmap(str(path))
 
     def _thumb_pixmap(self, path: Path) -> QPixmap:
         if is_video(path):
@@ -11320,7 +11333,7 @@ class MainWindow(QMainWindow):
 
     def open_batch_resize(self) -> None:
         if self.store is None or not self.images:
-            QMessageBox.information(self, "Batch resize", "Open a folder of images first.")
+            QMessageBox.information(self, "Batch resize", "Open a folder first.")
             return
         if getattr(self, "_read_only", False):
             return
@@ -12003,7 +12016,7 @@ class MainWindow(QMainWindow):
                 if folder_ch:
                     out.append(("Folder guidance changed", violet, dark, ""))
                 if image_ch:
-                    out.append(("This image's guidance changed", violet, dark, ""))
+                    out.append(("This file's guidance changed", violet, dark, ""))
         if self._image_is_omit_marked(path):
             out.append((".txt caption omitted", OMIT_COLOR, dark, ""))
         return out
@@ -12150,7 +12163,7 @@ class MainWindow(QMainWindow):
                 "Unsaved changes": "\u25cf amber dot (top-right)",
                 "Guidance changed": "\u25cf violet dot (top-left)",
                 "Folder guidance changed": "\u25cf violet dot (top-left)",
-                "This image's guidance changed": "\u25cf violet dot (top-left)",
+                "This file's guidance changed": "\u25cf violet dot (top-left)",
                 ".txt caption omitted": "\u25cf violet slashed dot (left)",
             }.get(text, "")
             line = f"{text} \u2014 {marker}" if marker else text
@@ -12178,7 +12191,7 @@ class MainWindow(QMainWindow):
             # The folder comes from the store: this runs on any re-list (a bypass,
             # a delete, an import), not only from open_folder where a local existed.
             where = self.store.folder if self.store is not None else "this folder"
-            self._set_status(f"No images found in {where}")
+            self._set_status(f"No files found in {where}")
             self._update_count_label()
             return
 
@@ -12605,7 +12618,7 @@ class MainWindow(QMainWindow):
             if self.project.is_review_marked(Path(self.filmstrip.item(i).data(Qt.UserRole)).name)
         ]
         if not flagged:
-            self._set_status("No images flagged for review")
+            self._set_status("No files flagged for review")
             return
         cur = self.filmstrip.currentRow()
         nxt = next((r for r in flagged if r > cur), flagged[0])  # wrap to first
@@ -13296,7 +13309,7 @@ class MainWindow(QMainWindow):
 
     def add_bbox_element(self) -> None:
         if self.store is None or self.current is None:
-            self._set_status("Open a folder and select an image first.")
+            self._set_status("Open a folder and select a file first.")
             return
         self.commit_element_fields()
         els = self._elements()

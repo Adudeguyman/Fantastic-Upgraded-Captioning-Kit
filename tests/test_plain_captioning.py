@@ -1584,3 +1584,72 @@ class WindowSizeTests(unittest.TestCase):
         self.win.resize(1600, 900)
         QApplication.instance().processEvents()
         self.assertLessEqual(self.win.width(), 1600)
+
+
+class MediaPreviewTests(unittest.TestCase):
+    """QPixmap can't open an .mp4, so any dialog previewing with it directly showed
+    '(cannot load image)' for every clip. Previews go through the poster frame."""
+
+    def setUp(self):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+        from PySide6.QtGui import QImage, QColor
+        QApplication.instance() or QApplication([])
+        import shutil
+        import tempfile as tf
+        import captioning_kit.app as A
+        A.default_profiles_path = lambda: Path(tf.mkdtemp()) / "p.json"
+        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+        self.folder = Path(tf.mkdtemp())
+        img = QImage(64, 48, QImage.Format_RGB32)
+        img.fill(QColor("teal"))
+        img.save(str(self.folder / "a.png"), "PNG")
+        shutil.copy("/tmp/vidtest/clip.mp4", self.folder / "clip.mp4")
+        self.win = A.MainWindow()
+        QFileDialog.getExistingDirectory = staticmethod(lambda *a, **k: str(self.folder))
+        self.win.open_folder()
+
+    def test_a_clip_gets_a_real_preview(self):
+        pixmap = self.win.preview_pixmap(self.folder / "clip.mp4")
+        self.assertFalse(pixmap.isNull())
+        self.assertGreater(pixmap.width(), 1)
+
+    def test_a_still_previews_at_its_own_size(self):
+        pixmap = self.win.preview_pixmap(self.folder / "a.png")
+        self.assertEqual((pixmap.width(), pixmap.height()), (64, 48))
+
+
+class SharedMediaWordingTests(unittest.TestCase):
+    """Strings shown for both stills and clips shouldn't say 'image'.
+
+    Deliberately narrow: the crop dialog, batch resize and bounding-box strings
+    really are image-only and keep their wording.
+    """
+
+    STALE = (
+        "This image's guidance changed",
+        "Use this image's .txt caption",
+        "Additional guidance for this image",
+        "Caption all images",
+        "Open a folder of images first",
+        "No images flagged for review",
+        "No backed-up original exists for this image",
+    )
+
+    def test_no_dialog_reports_a_clip_as_an_unloadable_image(self):
+        """The failure text itself, not the phrase — a docstring may quote the old
+        wording while explaining the fix."""
+        source = (Path(__file__).resolve().parents[1]
+                  / "captioning_kit" / "app.py").read_text()
+        self.assertNotIn('setText("(cannot load image)")', source)
+
+    def test_no_stale_shared_phrasing_remains(self):
+        """Checks quoted strings only — a comment may legitimately mention the old
+        wording while explaining why it was changed."""
+        import re
+        source = (Path(__file__).resolve().parents[1]
+                  / "captioning_kit" / "app.py").read_text()
+        literals = " ".join(re.findall(r'"([^"\n]*)"', source))
+        found = [phrase for phrase in self.STALE if phrase in literals]
+        self.assertEqual(found, [], f"image-only wording on shared strings: {found}")
