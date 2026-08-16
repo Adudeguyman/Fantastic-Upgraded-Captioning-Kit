@@ -26,6 +26,7 @@ leaves your machine except the requests to the endpoint you configure.
   - [Optional — CUDA acceleration](#optional--cuda-acceleration-for-the-built-in-server-nvidia-linux)
 - [Launching](#launching)
 - [Basic use](#basic-use)
+  - [Working with video](#working-with-video)
 - [Configuration](#configuration)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Troubleshooting](#troubleshooting)
@@ -83,9 +84,14 @@ needed for the auto-captioning features.
 ## Requirements
 
 - **Python 3.10 or newer**
+- **For video:** ffmpeg and ffprobe. The app offers to download a managed copy on
+  first use if they aren't on your PATH, so there's nothing to install by hand.
 - **For auto-captioning:** an OpenAI-compatible vision model server. The
   built-in option downloads a GGUF model and runs `llama-server` for you; you
   can also connect to LM Studio, vLLM, Ollama, or your own llama.cpp server.
+- **For captioning a clip's audio:** a model that can actually hear — an Omni or
+  Gemma 4 build. Vision-only models describe lips moving and invent nothing; the
+  video stage shows a 🔊/🔇 badge so you know which you have before you run.
 
 ## Installation
 
@@ -186,11 +192,19 @@ python run_captioner.py
    models it reports. Use **Test Server** to verify the connection. The server status
    is always shown in the bottom-right corner of the main window.
 
-2. Open a folder of images. Per-dataset settings (guidance, tags, review flags) are
-   saved in a **.captioner** folder inside it, so they're restored the next time you
-   open that folder.
+2. Open a folder of images, clips, or both — drag files in or use **Add media** to
+   copy more in later. Per-dataset settings (preset, training goal, guidance, tags,
+   review flags) are saved in a **.captioner** folder inside it, so they're restored
+   the next time you open that folder.
 
-3. *(Optional)* Open **Guidance Settings** to add instructions for the model:
+3. Pick a **preset** and a **training goal** at the top of the right-hand panel.
+   The preset decides the caption's *format* — Ideogram 4 JSON, MiniMax H3, Wan 2.2,
+   LTX-2, or plain text. The goal decides its *content*: what to describe and what
+   to leave out, depending on whether you're training a character, a concept, a
+   motion, an art style or a video look. The two are independent, so any goal works
+   with any format.
+
+4. *(Optional)* Open **Guidance Settings** to add instructions for the model:
    - **Folder-level guidance** is appended to every image — e.g. for a consistent
      art style: *"For the high_level_description section, append the suffix
      'in the style of my_art_style'."*
@@ -203,7 +217,7 @@ python run_captioner.py
 
    ![Guidance Settings — folder-level and per-image guidance with reusable tags](captioningKitScreenshot2.png)
 
-4. *(Optional, when available)* **Use existing `.txt` captions as a starting point.**
+5. *(Optional, when available)* **Use existing `.txt` captions as a starting point.**
    If your folder already has plain-text caption files — one `.txt` per image, named
    to match the image's filename — the captioner can read each one and rewrite it
    into Ideogram-4 structured JSON, instead of describing the image from scratch. The
@@ -215,20 +229,43 @@ python run_captioner.py
 
    ![Existing-caption mode — the source .txt is detected and used to generate structured JSON](captioningKitScreenshot3.png)
 
-5. Click **Run JSON Captioning** and choose **Caption Single Image** (the current
+6. Click **Run JSON Captioning** and choose **Caption Single Image** (the current
    image) or **Caption All Images**. If you run the whole folder and some images
    already have captions, a follow-up prompt lets you do *only new* images,
    *changed + new*, or *re-caption everything*.
 
-6. While the folder runs, captions appear as they're generated. The caption editor
+7. While the folder runs, captions appear as they're generated. The caption editor
    is **read-only** during a run (a banner indicates this), but you can flag any
    image for later review with the **F** key or by right-clicking its thumbnail —
    flagged images show a red flag in the corner, and **Shift+F** jumps to the next
    flagged one.
 
-7. To edit, select an image, change the fields and bounding boxes, then press
+8. To edit, select an image, change the fields and bounding boxes, then press
    `Ctrl+S` to save. Edits are buffered as you move between images; `Ctrl+Shift+S`
    writes every pending change to disk.
+
+### Working with video
+
+Selecting a clip swaps the image canvas for a player with its own edit bar.
+
+- **Trim** with the brackets on the timeline. With a model target armed, **Snap**
+  pulls each edge onto a frame count that model accepts — Wan 4n+1, LTX 8n+1,
+  MiniMax H3 17n+5 — so you can't land on a length the trainer would silently
+  truncate or pad. A clip too short for the model isn't snapped at all; it's
+  flagged instead.
+- **Scrub** by dragging the square playhead grip; grab the bar beside it to move a
+  trim bracket.
+- **Mute section** puts red brackets on the waveform. Playback is silenced inside
+  them as you listen, so you can place the cut on a word boundary before writing
+  anything. Useful when a trim lands mid-syllable.
+- **Crop**, **rotate** and **Save frame** work as they do for stills; the preview
+  reflects each change so you're framing against the final orientation.
+- **Apply edit** writes the result, keeping the untouched original in `.original/`.
+  Unapplied edits are remembered per clip and marked on the filmstrip, so moving
+  between clips never loses work.
+
+Clips that don't meet the selected model's fps, length or frame grid carry an
+amber triangle; hover it for the specific reason.
 
 ## Configuration
 
