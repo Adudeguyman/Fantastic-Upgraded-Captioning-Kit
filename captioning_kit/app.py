@@ -7379,7 +7379,7 @@ class MainWindow(QMainWindow):
         self.flag_action = QAction(lucide_icon("flag", ic), "Flag for review", self)
         self.flag_action.setCheckable(True)
         self.flag_action.setShortcut("F")
-        self.flag_action.setToolTip("Flag this image for manual review (F)")
+        self.flag_action.setToolTip("Flag this file for manual review (F)")
         self.flag_action.triggered.connect(self._toggle_review_flag)
 
         add_media_action = QAction(lucide_icon("image-plus", ic), "Add media\u2026", self)
@@ -7403,7 +7403,8 @@ class MainWindow(QMainWindow):
         self.bypass_action.setShortcut("Ctrl+B")
         self.bypass_action.triggered.connect(lambda: self.toggle_bypass())
         self.crop_action = QAction(lucide_icon("crop", ic), "Crop / Resize", self)
-        self.crop_action.setToolTip("Crop or resize this image (original kept in .original/)")
+        self.crop_action.setToolTip(
+            "Crop, rotate or resize this image (original kept in .original/)")
         self.crop_action.triggered.connect(self.open_crop_dialog)
         self.crop_action.setEnabled(False)  # until an image is shown
 
@@ -9061,8 +9062,9 @@ class MainWindow(QMainWindow):
         lay.setSpacing(4)
         lay.addWidget(self._field_label("Caption"))
         self.cap_plain = QPlainTextEdit()
+        # "file", not "image": the same box captions clips.
         self.cap_plain.setPlaceholderText(
-            "One caption for this image \u2014 saved as a .txt file next to it."
+            "One caption for this file \u2014 saved as a .txt next to it."
         )
         lay.addWidget(self._attach_expand(self.cap_plain, "Caption"), 1)
         self.plain_count = QLabel("")
@@ -13719,8 +13721,11 @@ class MainWindow(QMainWindow):
 
 def main() -> None:
     app = QApplication(sys.argv)
-    app.setApplicationName("Ideogram4 Fantastic Upgraded Captioning Kit")
-    app.setApplicationDisplayName("Ideogram4 Fantastic Upgraded Captioning Kit")
+    # The window manager appends this to every window and dialog title, which is
+    # why they all still read "Ideogram4 …" long after the tool stopped being
+    # Ideogram-only. APP_TITLE is the single source of truth.
+    app.setApplicationName(APP_TITLE)
+    app.setApplicationDisplayName(APP_TITLE)
     icon = app_icon()
     app.setWindowIcon(icon)
     window = MainWindow()
