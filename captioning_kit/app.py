@@ -4901,9 +4901,13 @@ class VideoStage(QWidget):
         bar.setStyleSheet(
             f"#EditBar {{ background: {theme.surface_1}; "
             f"border-top: 1px solid {theme.border}; }}")
-        row = QHBoxLayout(bar)
-        row.setContentsMargins(12, 6, 12, 8)
+        rows = QVBoxLayout(bar)
+        rows.setContentsMargins(12, 6, 12, 8)
+        rows.setSpacing(4)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
+        rows.addLayout(row)
 
         self._in_btn = QPushButton("Set in")
         self._in_btn.setToolTip("Start the clip at the current frame ([)")
@@ -4928,6 +4932,13 @@ class VideoStage(QWidget):
             "Conform the clip to a video model's frame rate and frame-count grid")
         self._target_combo.currentIndexChanged.connect(self._on_target_changed)
         row.addWidget(self._target_combo)
+
+        # Second row. All of this in one row demanded 1316px, which forced the whole
+        # window to a 1880px minimum — wider than a 1600x900 laptop screen.
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        rows.addLayout(row)
 
         self._rot_ccw = QToolButton()
         self._rot_ccw.setObjectName("NavBtn")

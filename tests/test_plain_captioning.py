@@ -1551,3 +1551,36 @@ class LoadFolderPathTests(unittest.TestCase):
         self.win.load_folder_path(self.second)
         self.assertEqual(self.win.qsettings.value("last_folder", "", str),
                          str(self.second))
+
+
+class WindowSizeTests(unittest.TestCase):
+    """The window must fit on a normal screen.
+
+    Every control added to the video edit bar pushed its minimum width up, and
+    since the bar sits in the centre panel that became the whole window's floor —
+    it reached 1880px, wider than a 1600x900 laptop, with no way to shrink it.
+    """
+
+    def setUp(self):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance() or QApplication([])
+        import tempfile as tf
+        import captioning_kit.app as A
+        A.default_profiles_path = lambda: Path(tf.mkdtemp()) / "p.json"
+        self.win = A.MainWindow()
+        self.win.show()
+
+    def test_window_fits_a_1600px_screen(self):
+        self.assertLessEqual(self.win.minimumSizeHint().width(), 1600)
+
+    def test_the_video_edit_bar_is_not_the_constraint(self):
+        """One row of controls is what caused this; it's two now."""
+        self.assertLessEqual(self.win.video_stage.minimumSizeHint().width(), 900)
+
+    def test_the_window_can_actually_be_resized_smaller(self):
+        from PySide6.QtWidgets import QApplication
+        self.win.resize(1600, 900)
+        QApplication.instance().processEvents()
+        self.assertLessEqual(self.win.width(), 1600)
