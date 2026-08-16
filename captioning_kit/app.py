@@ -535,13 +535,26 @@ CREATIVE_TO_MODE = {None: "Inherit", False: "Faithful", True: "Creative"}
 
 # Guidance presets. These built-ins live in code (always current); the presets
 # file stores only user-added presets, which are merged in after these.
-_PRESET_ART_STYLE = (
+_PRESET_ART_STYLE_IDEOGRAM = (
     "For the high_level_description section append a suffix of  in the style of "
     "my_art_style.\n"
     "For the art_style prepend my_art_style,  in front of the regular art style "
     "description."
 )
+# The plain-text pair: same intent, no bounding boxes. Boxes only exist in the
+# Ideogram 4 schema, so asking for one in a .txt caption is an instruction the
+# model can't act on.
 _PRESET_SINGLE_CHARACTER = (
+    "Describe the image, the character is named:\n"
+    "\n"
+    "MyKnownCharacter\n"
+    "\n"
+    "use these triggers words exactly with no spaces instead of the full names.\n"
+    "\n"
+    "Do not describe the known character's features (eye color, hair color, skin "
+    "color) but add a short description of their pose."
+)
+_PRESET_SINGLE_CHARACTER_IDEOGRAM = (
     "Describe the image, the character is named:\n"
     "\n"
     "MyKnownCharacter\n"
@@ -563,15 +576,33 @@ _PRESET_MULTI_CHARACTER = (
     "\n"
     "Do not describe their outfits.\n"
     "Do not describe the known character's features (eye color, hair color, skin "
+    "color) but add a short description of their pose."
+)
+_PRESET_MULTI_CHARACTER_IDEOGRAM = (
+    "Describe the image, from left to right the characters are:\n"
+    "\n"
+    "MyKnownCharacter,\n"
+    "man,\n"
+    "woman,\n"
+    "MyOtherKnownCharacter\n"
+    "\n"
+    "use these triggers words exactly with no spaces instead of the full names.\n"
+    "\n"
+    "Do not describe their outfits.\n"
+    "Do not describe the known character's features (eye color, hair color, skin "
     "color) but add a bounding box for them with a short description of their pose."
 )
 
+# Plain-text presets first, Ideogram 4 ones last: boxes are the special case now,
+# not the default.
 FOLDER_GUIDANCE_PRESETS: list[tuple[str, str]] = [
-    ("Art Style", _PRESET_ART_STYLE),
     ("Single Character", _PRESET_SINGLE_CHARACTER),
+    ("Art Style (Ideogram 4)", _PRESET_ART_STYLE_IDEOGRAM),
+    ("Single Character (Ideogram 4)", _PRESET_SINGLE_CHARACTER_IDEOGRAM),
 ]
 IMAGE_GUIDANCE_PRESETS: list[tuple[str, str]] = [
     ("Multi-Character", _PRESET_MULTI_CHARACTER),
+    ("Multi-Character (Ideogram 4)", _PRESET_MULTI_CHARACTER_IDEOGRAM),
 ]
 
 GUIDANCE_PRESETS_FILENAME = "captioner_guidance_presets.json"

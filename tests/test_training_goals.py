@@ -246,3 +246,64 @@ class ExportBundleShapeTests(unittest.TestCase):
                 self.assertTrue(preset.prompt_for(media).strip(), f"{key}/{media}")
             listed += 1
         self.assertGreaterEqual(listed, 5)
+
+
+class GuidancePresetTests(unittest.TestCase):
+    """Built-in guidance presets come in pairs: a plain-text one and an Ideogram 4
+    one. Bounding boxes exist only in the Ideogram schema, so asking for one in a
+    .txt caption is an instruction the model cannot act on."""
+
+    def setUp(self):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance() or QApplication([])
+        import captioning_kit.app as A
+        self.folder = A.FOLDER_GUIDANCE_PRESETS
+        self.image = A.IMAGE_GUIDANCE_PRESETS
+
+    def test_both_scopes_offer_a_plain_and_an_ideogram_variant(self):
+        folder_names = [n for n, _ in self.folder]
+        self.assertIn("Single Character", folder_names)
+        self.assertIn("Single Character (Ideogram 4)", folder_names)
+        self.assertIn("Art Style (Ideogram 4)", folder_names)
+        image_names = [n for n, _ in self.image]
+        self.assertIn("Multi-Character", image_names)
+        self.assertIn("Multi-Character (Ideogram 4)", image_names)
+
+    def test_only_ideogram_presets_mention_bounding_boxes(self):
+        for name, text in self.folder + self.image:
+            if "(Ideogram 4)" in name:
+                continue
+            self.assertNotIn("bounding box", text,
+                             f"{name} asks for a box outside the Ideogram schema")
+
+    def test_the_ideogram_character_presets_do_ask_for_boxes(self):
+        for name, text in self.folder + self.image:
+            if "Character (Ideogram 4)" in name:
+                self.assertIn("bounding box", text, name)
+
+    def test_ideogram_presets_sort_last(self):
+        """Boxes are the special case now, not the default."""
+        for presets in (self.folder, self.image):
+            names = [n for n, _ in presets]
+            ideogram = [i for i, n in enumerate(names) if "(Ideogram 4)" in n]
+            plain = [i for i, n in enumerate(names) if "(Ideogram 4)" not in n]
+            if ideogram and plain:
+                self.assertGreater(min(ideogram), max(plain), names)
+
+    def test_the_pairs_differ_only_in_the_box_instruction(self):
+        pairs = [("Single Character", "Single Character (Ideogram 4)", self.folder),
+                 ("Multi-Character", "Multi-Character (Ideogram 4)", self.image)]
+        for plain_name, ideogram_name, presets in pairs:
+            lookup = dict(presets)
+            plain, ideogram = lookup[plain_name], lookup[ideogram_name]
+            self.assertEqual(plain.replace("a short description of their pose", ""),
+                             ideogram.replace(
+                                 "a bounding box for them with a short description "
+                                 "of their pose", ""))
+
+    def test_names_are_unique_within_each_scope(self):
+        for presets in (self.folder, self.image):
+            names = [n for n, _ in presets]
+            self.assertEqual(len(names), len(set(names)))
