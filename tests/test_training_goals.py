@@ -185,3 +185,64 @@ class WanLtxPresetTests(unittest.TestCase):
             target = targets[self.presets[key].model_target]
             self.assertGreater(target.fps, 0)
             self.assertGreater(target.max_frames(), 0)
+
+
+class ExportBundleShapeTests(unittest.TestCase):
+    """Exporting only your diffs wrote an empty file for anyone who hadn't
+    customised anything — structurally valid and completely useless."""
+
+    def _bundle(self, prompts, targets):
+        import datetime
+        return {
+            "kind": "fantastic-captioning-kit/llm-instructions",
+            "version": 1,
+            "exported": datetime.datetime.now().isoformat(timespec="seconds"),
+            "description": (f"{len(targets)} model rule(s) and {len(prompts)} "
+                            "caption prompt(s) for the Fantastic Upgraded "
+                            "Captioning Kit."),
+            "prompts": prompts,
+            "model_targets": targets,
+        }
+
+    def test_bundle_carries_a_human_readable_description(self):
+        """A recipient opening the file should see what's in it without counting
+        JSON entries."""
+        bundle = self._bundle({"wan22/video": "x"}, [{"key": "a"}])
+        self.assertIn("1 model rule(s)", bundle["description"])
+        self.assertIn("1 caption prompt(s)", bundle["description"])
+
+    def test_an_empty_bundle_is_recognisable_as_empty(self):
+        bundle = self._bundle({}, [])
+        self.assertEqual(bundle["prompts"], {})
+        self.assertEqual(bundle["model_targets"], [])
+        self.assertIn("0 model rule(s)", bundle["description"])
+
+    def test_every_builtin_target_can_round_trip(self):
+        """Built-ins are exportable as a starting point, so they must survive the
+        dataclass -> dict -> dataclass trip intact."""
+        from dataclasses import asdict
+        from captioning_kit.model_targets import _target_from_dict, builtin_map
+        for key, target in builtin_map().items():
+            restored = _target_from_dict(asdict(target))
+            self.assertEqual(restored.key, target.key)
+            self.assertEqual(restored.fps, target.fps)
+            self.assertEqual(restored.frame_modulus, target.frame_modulus)
+            self.assertEqual(restored.frame_remainder, target.frame_remainder)
+            self.assertEqual(restored.min_seconds, target.min_seconds)
+            self.assertEqual(restored.max_seconds, target.max_seconds)
+
+    def test_plain_presets_have_prompts_for_both_media(self):
+        """The export lists preset x media for every preset that has a prompt.
+        Ideogram 4 builds its instructions from the schema instead, so it has none
+        and is skipped rather than contributing two empty entries."""
+        from captioning_kit.presets import PRESET_ORDER, get_preset
+        listed = 0
+        for key in PRESET_ORDER:
+            preset = get_preset(key)
+            if not preset.prompt_for("image").strip():
+                self.assertEqual(key, "ideogram4")
+                continue
+            for media in ("image", "video"):
+                self.assertTrue(preset.prompt_for(media).strip(), f"{key}/{media}")
+            listed += 1
+        self.assertGreaterEqual(listed, 5)

@@ -2463,28 +2463,145 @@ class PreferencesDialog(QDialog):
     BUNDLE_VERSION = 1
 
     def _export_llm_bundle(self) -> None:
-        """One file carrying prompts and frame rules, so a working setup for a new
-        model can be handed to someone else."""
+        """Pick what to share, then write it.
+
+        Everything is offered, not just what you've edited: exporting only your
+        diffs produced an empty file for anyone who hadn't customised anything, and
+        the built-in rules are a perfectly good starting point for someone writing
+        rules for a new model.
+        """
         self._pe_commit()
+        # With nothing customised there'd be nothing ticked, so pressing Export
+        # would just say "nothing selected". In that case the only useful export is
+        # the built-ins, so tick everything and let the user narrow it down.
+        customised = any(t != self._mt_builtin.get(k)
+                         for k, t in self._mt_working.items())
+        if not customised:
+            for key in PRESET_ORDER:
+                preset = get_preset(key)
+                if not preset.prompt_for("image").strip():
+                    continue
+                for media in ("image", "video"):
+                    stored = self._qsettings.value(self._pe_key(key, media), "", str)
+                    if stored and stored.strip() != preset.prompt_for(media).strip():
+                        customised = True
+                        break
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Export LLM instructions")
+        dlg.setMinimumWidth(560)
+        lay = QVBoxLayout(dlg)
+        intro = QLabel(
+            "Choose what to include. Anything you've changed is ticked; the rest is "
+            "offered too, since the built-in rules make a useful starting point for "
+            "someone writing rules for a new model."
+            if customised else
+            "Nothing has been customised yet, so everything is ticked \u2014 the "
+            "built-in rules and prompts make a useful starting point for writing "
+            "rules for a new model. Untick anything you don't want to share.")
+        intro.setObjectName("Hint")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+
+        listing = QListWidget()
+        listing.setSelectionMode(QListWidget.NoSelection)
+        lay.addWidget(listing, 1)
+
+        def section(title: str) -> None:
+            item = QListWidgetItem(title)
+            item.setFlags(Qt.NoItemFlags)
+            font = item.font()
+            font.setBold(True)
+            item.setFont(font)
+            listing.addItem(item)
+
+        entries: list[tuple[QListWidgetItem, str, object]] = []
+        section("Model frame rules")
+        for key, target in self._mt_working.items():
+            builtin = self._mt_builtin.get(key)
+            if builtin is None:
+                mark, ticked = "added", True
+            elif target != builtin:
+                mark, ticked = "edited", True
+            else:
+                mark, ticked = "built-in", False
+            item = QListWidgetItem(f"    {target.label}  ({mark})")
+            item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            item.setCheckState(Qt.Checked if (ticked or not customised)
+                               else Qt.Unchecked)
+            listing.addItem(item)
+            entries.append((item, "target", key))
+
+        section("Caption prompts")
+        for key in PRESET_ORDER:
+            preset = get_preset(key)
+            # Ideogram 4 builds its instructions from the schema rather than a
+            # plain system prompt, so it has nothing to list here — including it
+            # would put two empty entries in every bundle.
+            if not preset.prompt_for("image").strip():
+                continue
+            for media in ("image", "video"):
+                default = preset.prompt_for(media)
+                stored = self._qsettings.value(self._pe_key(key, media), "", str)
+                edited = bool(stored) and stored.strip() != default.strip()
+                label = f"    {preset.label} \u2014 {'videos' if media == 'video' else 'photos'}"
+                item = QListWidgetItem(f"{label}  ({'edited' if edited else 'built-in'})")
+                item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                item.setCheckState(Qt.Checked if (edited or not customised)
+                                   else Qt.Unchecked)
+                listing.addItem(item)
+                entries.append((item, "prompt", (key, media)))
+
+        row = QHBoxLayout()
+        for text, state in (("Select all", Qt.Checked), ("Select none", Qt.Unchecked)):
+            btn = QPushButton(text)
+            btn.clicked.connect(
+                lambda _c, st=state: [i.setCheckState(st) for i, _k, _r in entries])
+            row.addWidget(btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        buttons.addButton("Export\u2026", QDialogButtonBox.AcceptRole)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        prompts: dict[str, str] = {}
+        targets: list[dict] = []
+        for item, kind, ref in entries:
+            if item.checkState() != Qt.Checked:
+                continue
+            if kind == "target":
+                targets.append(asdict(self._mt_working[ref]))
+            else:
+                preset_key, media = ref
+                default = get_preset(preset_key).prompt_for(media)
+                stored = self._qsettings.value(
+                    self._pe_key(preset_key, media), "", str) or default
+                prompts[f"{preset_key}/{media}"] = stored
+        if not prompts and not targets:
+            QMessageBox.information(
+                self, "Nothing selected",
+                "Tick at least one rule or prompt to export.")
+            return
+
         path, _ = QFileDialog.getSaveFileName(
             self, "Export LLM instructions", "captioner-llm-instructions.json",
             "JSON (*.json)")
         if not path:
             return
-        prompts: dict[str, str] = {}
-        for key in PRESET_ORDER:
-            for media in ("image", "video"):
-                stored = self._qsettings.value(self._pe_key(key, media), "", str)
-                if stored and stored.strip() != get_preset(key).prompt_for(media).strip():
-                    prompts[f"{key}/{media}"] = stored
         bundle = {
             "kind": "fantastic-captioning-kit/llm-instructions",
             "version": self.BUNDLE_VERSION,
             "exported": datetime.datetime.now().isoformat(timespec="seconds"),
+            "description": (f"{len(targets)} model rule(s) and {len(prompts)} "
+                            "caption prompt(s) for the Fantastic Upgraded "
+                            "Captioning Kit."),
             "prompts": prompts,
-            "model_targets": [asdict(t) for k, t in self._mt_working.items()
-                              if k not in self._mt_builtin
-                              or t != self._mt_builtin[k]],
+            "model_targets": targets,
         }
         try:
             Path(path).write_text(json.dumps(bundle, indent=2), encoding="utf-8")
@@ -2492,8 +2609,7 @@ class PreferencesDialog(QDialog):
             QMessageBox.critical(self, "Export failed", str(exc))
             return
         self._llm_status.setText(
-            f"Exported {len(prompts)} prompt(s) and "
-            f"{len(bundle['model_targets'])} model rule(s).")
+            f"Exported {len(prompts)} prompt(s) and {len(targets)} model rule(s).")
 
     def _import_llm_bundle(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -2513,11 +2629,24 @@ class PreferencesDialog(QDialog):
             return
         prompts = data.get("prompts") or {}
         targets = data.get("model_targets") or []
+        # Name what's coming: "3 model rules" doesn't tell you that one of them is
+        # about to replace the H3 rules you tuned yourself.
+        names = [str(t.get("label") or t.get("key")) for t in targets
+                 if isinstance(t, dict)]
+        replacing = [n for n, t in zip(names, targets)
+                     if isinstance(t, dict) and t.get("key") in self._mt_working]
+        detail = ""
+        if names:
+            detail += "\n\nModels: " + ", ".join(names[:8])
+            if len(names) > 8:
+                detail += f" (+{len(names) - 8} more)"
+        if replacing:
+            detail += "\n\nReplaces your current rules for: " + ", ".join(replacing[:8])
         if QMessageBox.question(
             self, "Import LLM instructions",
-            f"Load {len(prompts)} prompt(s) and {len(targets)} model rule(s)?\n\n"
-            "Anything they cover is replaced; everything else is left alone. "
-            "Nothing is written until you press Save.",
+            f"Load {len(prompts)} prompt(s) and {len(targets)} model rule(s)?"
+            f"{detail}\n\nAnything not covered is left alone. Nothing is written "
+            "until you press Save.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
         ) != QMessageBox.Yes:
             return
