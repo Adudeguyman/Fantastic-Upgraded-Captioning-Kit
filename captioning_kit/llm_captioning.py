@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import urllib.request
 import zipfile
@@ -65,6 +66,10 @@ class ModelProfile:
     local_mmproj_path: str = ""
     vram_gb: float = 0.0          # approx VRAM needed at default context (0 = unknown)
     note: str = ""                # optional one-line annotation shown in the picker
+    # Omni-style models accept an audio track alongside images, which is what makes
+    # dialogue and soundscape possible in a video caption. Declared per profile
+    # rather than sniffed: sending audio to a vision-only model just errors.
+    supports_audio: bool = False
 
 
 @dataclass(frozen=True)
@@ -78,6 +83,7 @@ class ModelRuntimeConfig:
     mmproj_filename: str = ""
     local_model_path: str = ""
     local_mmproj_path: str = ""
+    supports_audio: bool = False
 
 
 @dataclass(frozen=True)
@@ -648,7 +654,13 @@ def format_resources(sample: ResourceSample) -> str:
 # Default/floor build baked into the app. llama.cpp releases continuously (a new
 # build every few hours), so a freshly-pinned number goes "stale" almost
 # immediately — the update flag means "a newer build exists", not "you're behind".
-PINNED_LLAMA_BUILD = 9828
+# Fallback only. A fresh install takes the *latest* release, same as the Update
+# button — pinning the first install was worse than useless: it produced a
+# weeks-old binary that the update checker immediately flagged as out of date, and
+# since Update fetches latest anyway, the pin never actually protected anyone. It
+# is kept as a safety net for when the newest release has no asset matching this
+# platform/backend.
+FALLBACK_LLAMA_BUILD = 9828
 
 # Where each backend's prebuilt binaries come from. Official llama.cpp ships
 # Windows (CUDA/Vulkan/CPU), macOS (Metal) and Linux (Vulkan/CPU) — but NOT Linux
@@ -876,7 +888,7 @@ class ReleaseInfo:
 def _github_get(url: str, timeout: float = 10.0):
     request = urllib.request.Request(
         url,
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "ideogram-captioner"},
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "fantastic-captioning-kit"},
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
@@ -927,7 +939,7 @@ def verify_sha256(path: Path, expected_hex: str) -> bool:
 def download_file(url: str, dest: Path, progress: ProgressCallback | None = None, timeout: float = 120.0) -> Path:
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    request = urllib.request.Request(url, headers={"User-Agent": "ideogram-captioner"})
+    request = urllib.request.Request(url, headers={"User-Agent": "fantastic-captioning-kit"})
     with urllib.request.urlopen(request, timeout=timeout) as response, open(dest, "wb") as out:
         total = int(response.headers.get("Content-Length", 0) or 0)
         done = 0
@@ -1132,10 +1144,13 @@ def resolve_backend(settings, gpu: GpuInfo) -> str:
     return gpu.backend
 
 
-def plan_llama_acquisition(settings, *, latest: bool = False, fetch=None):
-    """Detect GPU, choose a backend + source repo, fetch a release (the pinned
-    build, or the latest), and resolve matching assets. Returns None when offline
-    or when no prebuilt fits this platform (caller falls back to manual/build)."""
+def plan_llama_acquisition(settings, *, fetch=None):
+    """Detect GPU, choose a backend + source repo, resolve matching assets.
+
+    Always prefers the latest release, falling back to FALLBACK_LLAMA_BUILD only if
+    the newest one carries no asset for this platform/backend. Returns None when
+    offline or when nothing prebuilt fits (caller offers manual/build-from-source).
+    """
     fetch = fetch or fetch_release
     gpu = detect_gpu()
     system, arch = current_platform()
@@ -1145,19 +1160,19 @@ def plan_llama_acquisition(settings, *, latest: bool = False, fetch=None):
     # not "…for NVIDIA…".
     target = _picked_gpu(settings) or gpu
     repo = llama_repo_for(system, backend)
-    release = None
-    if not latest:
-        release = fetch(repo, f"b{PINNED_LLAMA_BUILD}")
-    if release is None:
-        release = fetch(repo, None)   # latest — also the pinned-not-found fallback
-    if release is None:
-        return None
     sm = target.sm if backend == "cuda" else ""
-    assets = select_llama_assets(release.assets, system=system, arch=arch, backend=backend, sm=sm)
-    if not assets:
-        return None
-    return LlamaPlan(release=release, assets=assets, backend=backend, sm=sm,
-                     gpu=target, system=system, arch=arch, repo=repo)
+    # Latest first; the pinned build is only a rescue for a release that doesn't
+    # ship something this machine can run.
+    for tag in (None, f"b{FALLBACK_LLAMA_BUILD}"):
+        release = fetch(repo, tag)
+        if release is None:
+            continue
+        assets = select_llama_assets(release.assets, system=system, arch=arch,
+                                     backend=backend, sm=sm)
+        if assets:
+            return LlamaPlan(release=release, assets=assets, backend=backend, sm=sm,
+                             gpu=target, system=system, arch=arch, repo=repo)
+    return None
 
 
 DEFAULT_PROFILE_DATA: dict[str, Any] = {
@@ -1172,6 +1187,33 @@ DEFAULT_PROFILE_DATA: dict[str, Any] = {
             "model_filename": "Qwen3-VL-30B-A3B-Instruct-UD-Q4_K_XL.gguf",
             "mmproj_filename": "mmproj-BF16.gguf",
             "vram_gb": 20,
+        },
+        {
+            "id": "ggml-qwen3-omni-30b",
+            "label": "Download: Qwen3-Omni 30B-A3B Q4 \u2014 hears audio, for video captions (~20GB)",
+            "tasks": ["caption"],
+            "kind": "hf",
+            "api_model": "ggml-qwen3-omni-30b",
+            "hf_repo": "ggml-org/Qwen3-Omni-30B-A3B-Instruct-GGUF",
+            "model_filename": "Qwen3-Omni-30B-A3B-Instruct-Q4_K_M.gguf",
+            "mmproj_filename": "mmproj-Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf",
+            "vram_gb": 22,
+            "supports_audio": True,
+            "note": "Vision + audio. Lets video captions include spoken dialogue and "
+                    "the soundscape instead of guessing from frames alone.",
+        },
+        {
+            "id": "huihui-qwen3-omni-30b-thinking-abliterated",
+            "label": "Download: Huihui Qwen3-Omni 30B Thinking abliterated Q4_K_M (~21GB)",
+            "tasks": ["caption"],
+            "kind": "hf",
+            "api_model": "huihui-qwen3-omni-30b-thinking",
+            "hf_repo": "mradermacher/Huihui-Qwen3-Omni-30B-A3B-Thinking-abliterated-GGUF",
+            "model_filename": "Huihui-Qwen3-Omni-30B-A3B-Thinking-abliterated.Q4_K_M.gguf",
+            "mmproj_filename": "Huihui-Qwen3-Omni-30B-A3B-Thinking-abliterated.mmproj-f16.gguf",
+            "vram_gb": 23,
+            "supports_audio": True,
+            "note": "Uncensored Omni. Thinking variant \u2014 reasoning blocks are stripped, but it needs a larger max-tokens budget and is slower than Instruct.",
         },
         {
             "id": "unsloth-qwen3vl-8b-q4",
@@ -1253,6 +1295,19 @@ DEFAULT_PROFILE_DATA: dict[str, Any] = {
             "vram_gb": 26,
         },
         {
+            "id": "hauhaucs-gemma4-12b-qat-balanced-q4km",
+            "label": "Download: HauhauCS Gemma 4 12B QAT Uncensored (Balanced) Q4_K_M (~9GB)",
+            "tasks": ["caption"],
+            "kind": "hf",
+            "api_model": "hauhaucs-gemma4-12b-qat",
+            "hf_repo": "HauhauCS/Gemma4-12B-QAT-Uncensored-HauhauCS-Balanced",
+            "model_filename": "Gemma4-12B-QAT-Uncensored-HauhauCS-Balanced-Q4_K_M.gguf",
+            "mmproj_filename": "mmproj-Gemma4-12B-QAT-Uncensored-HauhauCS-Balanced-BF16.gguf",
+            "vram_gb": 9,
+            "supports_audio": True,
+            "note": "QAT base, quantised to Q4_K_M rather than the naive q4_0 that loses part of the QAT benefit. BF16 projector.",
+        },
+        {
             "id": "server-qwen3vl",
             "label": "Existing server alias: qwen3vl",
             "tasks": ["caption", "bbox"],
@@ -1301,6 +1356,7 @@ def _profile_from_dict(raw: dict[str, Any]) -> ModelProfile | None:
         mmproj_filename=str(raw.get("mmproj_filename", "")).strip(),
         local_model_path=str(raw.get("local_model_path", "")).strip(),
         local_mmproj_path=str(raw.get("local_mmproj_path", "")).strip(),
+        supports_audio=bool(raw.get("supports_audio", False)),
         vram_gb=vram_gb,
         note=str(raw.get("note", "")).strip(),
     )
@@ -1411,6 +1467,13 @@ class CaptioningSettings:
 
     max_tokens_caption: int = 2000
     max_tokens_json: int = 12000
+    # Frames sampled across a clip for video captioning. More frames = better
+    # motion coverage but a much larger prompt; 4-8 is the practical range for
+    # local vision models.
+    video_caption_frames: int = 6
+    # Send the clip's audio alongside the frames when the chosen model can hear.
+    # Off means frames-only even on an Omni profile.
+    send_clip_audio: bool = True
     max_tokens_bboxes: int = 3000
     context_chars: int = 1200
     max_targets_per_call: int = 0
@@ -1623,6 +1686,7 @@ def runtime_config_for_task(settings: CaptioningSettings, task: str) -> ModelRun
         mmproj_filename=profile.mmproj_filename,
         local_model_path=profile.local_model_path,
         local_mmproj_path=profile.local_mmproj_path,
+        supports_audio=profile.supports_audio,
     )
 
 
@@ -1811,19 +1875,30 @@ def _parse_dir_lines(value: str) -> list[Path]:
     return out
 
 
-def _find_in_dir(root: Path, filename: str) -> Path | None:
-    """First file named `filename` under root (checked directly, then recursively)."""
+def _iter_in_dir(root: Path, filename: str):
+    """Every file named `filename` under root (direct child first, then recursive).
+
+    All of them, not just the first: with generic projector names the first hit is
+    often the wrong model's, and the caller needs to keep looking for one it can
+    attribute to the right repo.
+    """
     try:
         if not root.exists():
-            return None
+            return
         direct = root / filename
         if direct.is_file():
-            return direct
+            yield direct
         for hit in root.rglob(filename):
-            if hit.is_file():
-                return hit
+            if hit.is_file() and hit != direct:
+                yield hit
     except (OSError, ValueError):
-        return None
+        return
+
+
+def _find_in_dir(root: Path, filename: str) -> Path | None:
+    """First file named `filename` under root (checked directly, then recursively)."""
+    for hit in _iter_in_dir(root, filename):
+        return hit
     return None
 
 
@@ -1845,10 +1920,21 @@ def locate_existing_model_file(settings: "CaptioningSettings", repo: str, filena
                 return Path(cached)
         except Exception:
             pass
+    # Loose, filename-only search across unrelated model folders. Safe for a model
+    # file (names carry the model in them), dangerous for a projector: Unsloth and
+    # others ship almost every repo's projector as "mmproj-F16.gguf", so a bare-name
+    # match can return a DIFFERENT model's projector. A mismatched pair doesn't error
+    # cleanly — llama-server hangs on startup — so for generic projector names we
+    # require the repo to be identifiable in the path before reusing the file.
+    generic_mmproj = is_generic_mmproj_name(filename)
+    repo_tokens = _distinctive_repo_tokens(repo)
     extra = _parse_dir_lines(getattr(settings, "extra_model_dirs", ""))
     for root in extra + known_server_model_dirs():
-        hit = _find_in_dir(root, filename)
-        if hit is not None:
+        for hit in _iter_in_dir(root, filename):
+            if generic_mmproj:
+                haystack = str(hit).lower()
+                if not repo_tokens or not any(tok in haystack for tok in repo_tokens):
+                    continue   # can't prove it belongs to this model — keep looking
             return hit
     return None
 
@@ -1933,6 +2019,12 @@ def ensure_model_assets(
             mmproj_path = Path(config.local_mmproj_path).expanduser()
             if not mmproj_path.exists():
                 raise AutoCaptionError(f"Local mmproj file does not exist: {mmproj_path}")
+        if mmproj_path is not None:
+            ok, reason = check_mmproj_pairing(model_path, mmproj_path)
+            if not ok:
+                raise AutoCaptionError(
+                    f"{reason} Pick the projector that ships with "
+                    f"{model_path.name}, or clear the mmproj field.")
         if progress:
             progress(f"Using local model file: {model_path.name}")
         return ModelAssets(model_path=model_path, mmproj_path=mmproj_path)
@@ -1990,7 +2082,37 @@ def ensure_model_assets(
 
     model_path = downloaded_models[0] if downloaded_models else None
     mmproj_path = downloaded_mmproj[0] if downloaded_mmproj else None
+    if model_path is not None and mmproj_path is not None:
+        ok, reason = check_mmproj_pairing(model_path, mmproj_path)
+        if not ok:
+            raise AutoCaptionError(
+                f"{reason} A projector from another model was picked up \u2014 remove "
+                f"{mmproj_path.name} from that folder, or set the mmproj path "
+                "explicitly in Preferences.")
     return ModelAssets(model_path=model_path, mmproj_path=mmproj_path)
+
+
+def existing_mmproj_path(settings: CaptioningSettings,
+                         task: str = "caption") -> Path | None:
+    """The projector already on disk for this task, without downloading anything.
+
+    Used to inspect a projector's capabilities before a run; returns None when the
+    model hasn't been fetched yet.
+    """
+    try:
+        config = runtime_config_for_task(settings, task)
+    except Exception:
+        return None
+    if config.local_mmproj_path:
+        path = Path(config.local_mmproj_path).expanduser()
+        return path if path.exists() else None
+    names = _split_filenames(config.mmproj_filename)
+    if not names:
+        return None
+    repo = config.mmproj_repo or config.hf_repo
+    if not repo:
+        return None
+    return locate_existing_model_file(settings, repo, names[0])
 
 
 def missing_model_files(settings: CaptioningSettings, task: str = "caption") -> list[str]:
@@ -2059,32 +2181,37 @@ def resolve_llama_server_path(settings: CaptioningSettings) -> Path | None:
     return find_llama_server()
 
 
-def find_nccl_lib_dir() -> Path | None:
-    """Locate a directory containing libnccl.so.2 (Linux only).
+# CUDA runtime libraries the llama.cpp CUDA prebuilts link against but don't
+# bundle, mapped to the pip wheel that provides each. NCCL was the first one to
+# bite, but it isn't special: cuBLAS and friends fail exactly the same way, so the
+# discovery below handles the whole family rather than one soname at a time.
+# libcuda.so.1 is deliberately absent — that one comes from the NVIDIA driver and
+# cannot be pip-installed.
+CUDA_RUNTIME_PACKAGES: dict[str, str] = {
+    "libnccl": "nvidia-nccl-cu12",
+    "libcublas": "nvidia-cublas-cu12",
+    "libcublaslt": "nvidia-cublas-cu12",
+    "libcudart": "nvidia-cuda-runtime-cu12",
+    "libcufft": "nvidia-cufft-cu12",
+    "libcurand": "nvidia-curand-cu12",
+    "libcusparse": "nvidia-cusparse-cu12",
+    "libcusolver": "nvidia-cusolver-cu12",
+    "libnvrtc": "nvidia-cuda-nvrtc-cu12",
+    "libnvjitlink": "nvidia-nvjitlink-cu12",
+}
 
-    From build b8738 onward, llama.cpp's CUDA prebuilt binaries dynamically link
-    NCCL but the release archive doesn't bundle libnccl.so.2, so on a machine with
-    no system NCCL the server fails to even load. PyTorch (and most CUDA Python
-    envs) ship NCCL via the nvidia-nccl-cu12 wheel or in torch/lib, so we find that
-    copy and put its folder on the loader path — no system install needed."""
-    if os.name == "nt" or sys.platform == "darwin":
-        return None
-    soname = "libnccl.so.2"
-    # 1) the nvidia-nccl wheel, located without importing it (cheap, no CUDA init)
-    try:
-        import importlib.util
-        spec = importlib.util.find_spec("nvidia.nccl")
-        for loc in (spec.submodule_search_locations or []) if spec else []:
-            lib = Path(loc) / "lib"
-            if (lib / soname).exists():
-                return lib
-    except Exception:
-        pass
-    # 2) scan site-packages for the wheel's or torch's bundled copy
+
+def cuda_package_for_lib(soname: str) -> str:
+    """pip package that ships a given CUDA soname, or "" if we don't know one."""
+    stem = Path(soname).name.split(".so")[0].lower()
+    return CUDA_RUNTIME_PACKAGES.get(stem, "")
+
+
+def _site_package_roots() -> set[Path]:
+    roots: set[Path] = set()
     try:
         import site
         import sysconfig
-        roots: set[Path] = set()
         try:
             roots.update(Path(p) for p in site.getsitepackages())
         except Exception:
@@ -2097,14 +2224,48 @@ def find_nccl_lib_dir() -> Path | None:
                 roots.add(Path(sysconfig.get_paths()[key]))
             except Exception:
                 pass
-        for root in roots:
-            for rel in ("nvidia/nccl/lib", "torch/lib"):
-                lib = root / rel
-                if (lib / soname).exists():
-                    return lib
     except Exception:
         pass
-    return None
+    return roots
+
+
+def find_cuda_lib_dirs() -> list[Path]:
+    """Every directory in this environment holding CUDA runtime .so files.
+
+    The llama.cpp CUDA prebuilts dynamically link libnccl/libcublas/libcudart and
+    friends without bundling them, so on a machine with no system CUDA the server
+    won't even load. PyTorch and the nvidia-*-cu12 wheels ship these libraries
+    inside site-packages, so we collect those folders and put them on the loader
+    path — no system CUDA install required.
+
+    Returns every match rather than the first: the libraries are spread across
+    separate per-component wheels (nvidia/cublas/lib, nvidia/cudnn/lib, ...), so
+    stopping at one directory would satisfy one missing library and not the next.
+    """
+    if os.name == "nt" or sys.platform == "darwin":
+        return []
+    found: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(path: Path) -> None:
+        key = str(path)
+        if key in seen or not path.is_dir():
+            return
+        if any(child.name.startswith("lib") and ".so" in child.name
+               for child in path.iterdir()):
+            seen.add(key)
+            found.append(path)
+
+    for root in _site_package_roots():
+        nvidia = root / "nvidia"
+        if nvidia.is_dir():
+            try:
+                for component in sorted(nvidia.iterdir()):
+                    _add(component / "lib")
+            except OSError:
+                pass
+        _add(root / "torch" / "lib")
+    return found
 
 
 def server_launch_env(binary_path: Path | None) -> dict:
@@ -2140,9 +2301,7 @@ def server_launch_env(binary_path: Path | None) -> dict:
             sibling = base / sub
             if sibling.is_dir():
                 candidates.append(sibling)
-    nccl_dir = find_nccl_lib_dir()
-    if nccl_dir is not None:
-        candidates.append(nccl_dir)
+    candidates.extend(find_cuda_lib_dirs())
     seen: set[str] = set()
     dirs: list[str] = []
     for cand in candidates:
@@ -2411,15 +2570,24 @@ def diagnose_server_log(log_path: Path) -> tuple[str, str]:
     m = re.search(r"error while loading shared libraries:\s*([^\s:]+)", tail)
     if m:
         lib = m.group(1)
-        if "nccl" in lib.lower():
+        if "libcuda.so" in lib:
+            # Driver library, not a redistributable — pip can't help here.
             return ("missing_lib",
-                    f"The CUDA build can't find {lib}. Recent llama.cpp CUDA releases "
-                    "need NVIDIA NCCL, which the download doesn't bundle. Install it in "
-                    "this environment with:  pip install nvidia-nccl-cu12  (or "
-                    "conda install -c conda-forge nccl), then start the server again.")
+                    f"The server can't find {lib}, which comes from the NVIDIA driver "
+                    "rather than a CUDA package. Install or repair the NVIDIA driver, "
+                    "or switch the backend to Vulkan in Preferences.")
+        package = cuda_package_for_lib(lib)
+        if package:
+            return ("missing_lib",
+                    f"The CUDA build can't find {lib}. llama.cpp's CUDA releases link "
+                    "these libraries without bundling them. Install it into this "
+                    f"environment with:  pip install {package}  \u2014 or run "
+                    "./cuda_fix.sh (cuda_fix.bat on Windows), which installs the whole "
+                    "CUDA runtime set. Then start the server again.")
         return ("missing_lib",
                 f"The server can't find the shared library {lib}. Install it or add its "
-                "folder to your library path, then try again.")
+                "folder to your library path, then try again. If this is a CUDA "
+                "library, ./cuda_fix.sh installs the usual runtime set.")
     if ("ggml_assert" in low or "terminate called" in low or "segmentation fault" in low
             or "core dumped" in low or "cuda error" in low):
         return ("crash",
@@ -3533,3 +3701,470 @@ def add_bboxes_to_caption(
     for reason in skipped_reasons.values():
         reason_counts[reason] = reason_counts.get(reason, 0) + 1
     return normalize_caption(data), attempted, added, reason_counts
+
+
+# ---------------------------------------------------------------------------
+# GGUF metadata + model/mmproj pairing
+# ---------------------------------------------------------------------------
+
+# Projector filenames are frequently generic — Unsloth ships nearly every repo's
+# projector as "mmproj-F16.gguf"/"mmproj-BF16.gguf" — so a bare-filename search
+# across unrelated model folders will happily return another model's projector.
+# Loading a mismatched pair doesn't fail cleanly: llama-server can sit there
+# apparently starting forever, which is far worse than an error.
+_GENERIC_MMPROJ_RE = re.compile(r"^mmproj[-_.]?(bf16|f16|f32|q\d[^.]*)?\.gguf$", re.I)
+
+
+# Tokens that appear in nearly every repo name or file path, so matching on them
+# would let any folder look like the right one ("gguf" is in every filename).
+_REPO_STOPWORDS = {
+    "gguf", "ggml", "instruct", "model", "models", "main", "chat", "base", "hf",
+    "bf16", "fp16", "f16", "f32", "int4", "int8", "awq", "gptq", "abliterated",
+    "uncensored", "quantized", "quant", "cache", "hub", "snapshots", "blobs",
+}
+
+
+def _distinctive_repo_tokens(repo: str) -> list[str]:
+    """Parts of a repo id specific enough to identify a folder as belonging to it."""
+    tokens = [tok.lower() for tok in re.split(r"[/\\_.\s-]+", repo or "") if len(tok) > 2]
+    return [tok for tok in tokens if tok not in _REPO_STOPWORDS]
+
+
+def is_generic_mmproj_name(filename: str) -> bool:
+    return bool(_GENERIC_MMPROJ_RE.match(Path(filename).name.strip()))
+
+
+_GGUF_SKIP_TYPES = {
+    0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8,
+}
+
+
+def read_gguf_metadata(path: Path | str, max_pairs: int = 2000) -> dict:
+    """Parse the key/value header of a GGUF file.
+
+    The metadata block sits at the very start of the file, so this reads a few KB
+    rather than the whole multi-gigabyte model. Best-effort: any malformed or
+    unreadable file yields {} so callers degrade to "unknown" instead of failing.
+    """
+    try:
+        with open(path, "rb") as handle:
+            if handle.read(4) != b"GGUF":
+                return {}
+            import struct
+
+            def _u32() -> int:
+                return struct.unpack("<I", handle.read(4))[0]
+
+            def _u64() -> int:
+                return struct.unpack("<Q", handle.read(8))[0]
+
+            def _string() -> str:
+                length = _u64()
+                if length > 1 << 20:
+                    raise ValueError("implausible string length")
+                return handle.read(length).decode("utf-8", "replace")
+
+            _u32()          # version
+            _u64()          # tensor count
+            count = _u64()
+            if count > max_pairs:
+                count = max_pairs
+            out: dict = {}
+            for _ in range(count):
+                key = _string()
+                vtype = _u32()
+                if vtype == 8:
+                    out[key] = _string()
+                elif vtype in (4, 5):
+                    out[key] = _u32()
+                elif vtype in (10, 11):
+                    out[key] = _u64()
+                elif vtype == 7:
+                    # BOOL is a single byte. Needed for clip.has_audio_encoder,
+                    # which is how a projector declares it can hear.
+                    out[key] = handle.read(1) != b"\x00"
+                elif vtype == 9:
+                    # array: skip its payload rather than materialising it
+                    item_type = _u32()
+                    length = _u64()
+                    if item_type == 8:
+                        for _ in range(length):
+                            _string()
+                    else:
+                        handle.seek(_GGUF_SKIP_TYPES.get(item_type, 4) * length, 1)
+                else:
+                    handle.seek(_GGUF_SKIP_TYPES.get(vtype, 4), 1)
+            return out
+    except Exception:
+        return {}
+
+
+def gguf_architecture(meta: dict) -> str:
+    return str(meta.get("general.architecture", "")).strip().lower()
+
+
+def _text_embedding_length(meta: dict) -> int | None:
+    arch = gguf_architecture(meta)
+    if arch:
+        value = meta.get(f"{arch}.embedding_length")
+        if isinstance(value, int):
+            return value
+    for key, value in meta.items():
+        if key.endswith(".embedding_length") and not key.startswith("clip."):
+            if isinstance(value, int):
+                return value
+    return None
+
+
+def _projector_output_dim(meta: dict) -> int | None:
+    for key in ("clip.vision.projection_dim", "clip.vision.projector.output_dim",
+                "clip.projector.output_dim"):
+        value = meta.get(key)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def mmproj_has_audio_encoder(mmproj_path: Path | str) -> bool | None:
+    """Does this projector carry an audio tower?
+
+    Returns True/False when the GGUF says so, or None when the file can't be read.
+    This is the only reliable answer to 'can this model hear': an Omni GGUF may be
+    registered under a vision architecture (qwen3vlmoe), and the audio encoder — if
+    it survived conversion at all — lives in the mmproj, not the model file. A
+    profile flag states intent; this states fact.
+    """
+    meta = read_gguf_metadata(mmproj_path)
+    if not meta:
+        return None
+    for key in ("clip.has_audio_encoder", "clip.has_audio", "has_audio_encoder"):
+        value = meta.get(key)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return bool(value)
+    # Some builds omit the flag but still carry audio tensors' hyperparameters.
+    if any(k.startswith("clip.audio") for k in meta):
+        return True
+    return False
+
+
+def check_mmproj_pairing(model_path: Path | str,
+                         mmproj_path: Path | str) -> tuple[bool, str]:
+    """Is this projector actually the one for this model?
+
+    Returns (ok, reason). Deliberately conservative: when the metadata can't be
+    read, or the files don't expose comparable dimensions, this returns ok=True
+    rather than blocking a setup that might be perfectly valid. It only reports a
+    mismatch on positive evidence, because a false rejection is worse than falling
+    through to the server's own error.
+    """
+    model_meta = read_gguf_metadata(model_path)
+    mmproj_meta = read_gguf_metadata(mmproj_path)
+    if not model_meta or not mmproj_meta:
+        return True, ""
+    model_arch = gguf_architecture(model_meta)
+    mmproj_arch = gguf_architecture(mmproj_meta)
+    if mmproj_arch and mmproj_arch not in ("clip", "clip-vision-model"):
+        # The "projector" is really a language model — a straightforward mix-up
+        # (e.g. a full model listed in the mmproj field).
+        if model_arch and mmproj_arch == model_arch:
+            return False, (
+                f"{Path(mmproj_path).name} looks like a full {mmproj_arch} model, not a "
+                "vision projector.")
+    text_dim = _text_embedding_length(model_meta)
+    proj_dim = _projector_output_dim(mmproj_meta)
+    if text_dim and proj_dim and text_dim != proj_dim:
+        return False, (
+            f"{Path(mmproj_path).name} projects to {proj_dim} dimensions but "
+            f"{Path(model_path).name} expects {text_dim}. This projector belongs to a "
+            "different model.")
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
+# Plain-text captioning
+# ---------------------------------------------------------------------------
+
+
+def caption_image_plain(
+    settings: CaptioningSettings,
+    image_path: Path,
+    system_prompt: str,
+    guidance: str = "",
+    progress: ProgressCallback | None = None,
+    max_tokens: int | None = None,
+) -> str:
+    """One free-text caption for an image.
+
+    Deliberately does no JSON parsing or schema repair: for plain presets the
+    model's prose *is* the caption, so anything we'd "fix" would be us editing the
+    user's dataset. The system prompt comes from the active preset, so the same
+    function serves plain text, MiniMax H3 natural language, and H3's structured
+    format — the difference is entirely in the prompt.
+    """
+    config = runtime_config_for_task(settings, "caption")
+    system = (system_prompt or "").strip()
+    if guidance.strip():
+        system = f"{system}\n\nAdditional guidance for this file:\n{guidance.strip()}"
+    if progress:
+        progress(f"Captioning {Path(image_path).name}\u2026")
+    raw = chat_vision(
+        settings=settings,
+        model=config.api_model,
+        image_path=Path(image_path),
+        system=system,
+        user="Write the caption.",
+        max_tokens=max_tokens or settings.max_tokens_json,
+        temperature=0.0,
+    )
+    return _require_caption(clean_plain_caption(raw), raw)
+
+
+# Thinking-variant models (Qwen3-Omni Thinking, Qwen3 *-Thinking, DeepSeek-R1
+# derivatives) emit their reasoning before the answer. Left in, it lands in the
+# dataset sidecar. An unclosed <think> means the model ran out of tokens mid-
+# reasoning, so everything after it is reasoning too.
+_THINK_RE = re.compile(r"<(think|thinking|reasoning)>.*?</\1>", re.S | re.I)
+_THINK_OPEN_RE = re.compile(r"^.*?<(?:think|thinking|reasoning)>.*$", re.S | re.I)
+_THINK_STRAY_CLOSE_RE = re.compile(r"^.*?</(?:think|thinking|reasoning)>\s*", re.S | re.I)
+
+_FENCE_RE = re.compile(r"^\s*```[a-zA-Z]*\s*\n(.*?)\n?\s*```\s*$", re.S)
+_PREAMBLE_RE = re.compile(
+    r"^\s*(?:sure[,!]?|certainly[,!]?|here(?:'s| is)[^:\n]{0,40}:)\s*", re.I)
+
+
+def _require_caption(cleaned: str, raw: str) -> str:
+    """Fail loudly when cleaning leaves nothing.
+
+    This happens when a Thinking model spends its whole budget reasoning and never
+    reaches an answer. Saving the empty string would quietly blank a sidecar; the
+    fix is a bigger max-tokens or a non-Thinking model, so say that.
+    """
+    if cleaned.strip():
+        return cleaned
+    if re.search(r"<(?:think|thinking|reasoning)>", raw or "", re.I):
+        raise AutoCaptionError(
+            "The model returned only reasoning and never produced a caption. "
+            "Thinking variants need a larger 'Max tokens' budget \u2014 or use an "
+            "Instruct model, which is a better fit for captioning anyway.")
+    raise AutoCaptionError("The model returned an empty caption.")
+
+
+def clean_plain_caption(raw: str) -> str:
+    """Trim the wrappers models add around prose without rewriting the caption.
+
+    Only three things are removed: a surrounding code fence, a leading "Sure! Here's
+    the caption:" preamble, and surrounding quotes. Everything else is left exactly
+    as written — this text goes straight into the dataset, so silently reshaping it
+    would be changing training data behind the user's back.
+    """
+    text = (raw or "").strip()
+    text = _THINK_RE.sub("", text).strip()
+    # A stray closing tag means the opening one was consumed by the chat template,
+    # so the answer is whatever follows it.
+    if re.search(r"</(?:think|thinking|reasoning)>", text, re.I):
+        text = _THINK_STRAY_CLOSE_RE.sub("", text).strip()
+    # An unclosed opener leaves nothing usable; better an explicit error than a
+    # sidecar full of reasoning.
+    if re.search(r"<(?:think|thinking|reasoning)>", text, re.I):
+        text = ""
+    fenced = _FENCE_RE.match(text)
+    if fenced:
+        text = fenced.group(1).strip()
+    # "Sure! Here's the caption: ..." is two stackable preambles, so strip until
+    # nothing more matches (bounded, so a pathological string can't spin).
+    for _ in range(3):
+        stripped = _PREAMBLE_RE.sub("", text).strip()
+        if stripped == text:
+            break
+        text = stripped
+    if len(text) > 1 and text[0] == text[-1] and text[0] in "\"'\u201c\u201d":
+        inner = text[1:-1].strip()
+        if inner and text[0] not in inner:
+            text = inner
+    return text.strip()
+
+
+def audio_to_base64(path: Path | str) -> str:
+    return base64.b64encode(Path(path).read_bytes()).decode("ascii")
+
+
+def chat_vision_frames(
+    settings: CaptioningSettings,
+    model: str,
+    frames: list,           # objects with .path, .time_s, .index
+    system: str,
+    user: str,
+    max_tokens: int,
+    temperature: float = 0.0,
+    audio_path: Path | None = None,
+) -> str:
+    """One chat completion over an ordered set of video frames.
+
+    Each image is preceded by its own text label ("Frame 3 of 6, at 2.40s:"), which
+    matters twice over: llama-server substitutes media in order but nothing else
+    tells the model *when* each frame occurs, and timestamp alignment is exactly
+    what the native video paths (transformers/vLLM) add over bare image lists.
+    """
+    if not model:
+        raise AutoCaptionError("No vision model name is configured.")
+    if not frames:
+        raise AutoCaptionError("No frames were sampled from the video.")
+    client = _make_openai_client(settings)
+    content: list[dict] = [{"type": "text", "text": request_user_prompt(settings, user)}]
+    total = len(frames)
+    for frame in frames:
+        content.append({"type": "text",
+                        "text": f"Frame {frame.index} of {total}, at {frame.time_s:.2f}s:"})
+        content.append({"type": "image_url", "image_url": {
+            "url": image_to_data_url(frame.path, settings.vision_image_format)}})
+    if audio_path is not None:
+        # OpenAI-compatible audio part. llama-server detects the container itself
+        # and ignores the declared format, but the field is required by the schema.
+        content.append({"type": "text",
+                        "text": "The clip's audio track for the same span:"})
+        content.append({"type": "input_audio", "input_audio": {
+            "data": audio_to_base64(audio_path), "format": "wav"}})
+    response = client.chat.completions.create(
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": content},
+        ],
+    )
+    text = (response.choices[0].message.content or "") if response.choices else ""
+    if not text.strip():
+        raise AutoCaptionError("The model returned an empty caption for the video.")
+    return text
+
+
+def describe_audio_failure(exc: Exception) -> str:
+    """Turn the server's audio errors into something actionable.
+
+    llama-server answers 'audio input is not supported' both when the model has no
+    audio encoder and when its own request routing can't dispatch the content type,
+    so the message names both possibilities rather than guessing.
+    """
+    detail = str(exc)
+    if "audio input is not supported" in detail or "audio" in detail.lower() and "500" in detail:
+        return ("The server rejected the clip's audio. Either the loaded model has no "
+                "audio encoder (use an Omni-style profile such as Qwen3-Omni), its "
+                "mmproj is missing, or this llama.cpp build can't route audio through "
+                "the chat endpoint yet. Turn off 'Send clip audio' in Preferences to "
+                "caption from frames alone.")
+    return detail
+
+
+def caption_video_plain(
+    settings: CaptioningSettings,
+    video_path: Path,
+    system_prompt: str,
+    guidance: str = "",
+    start_s: float = 0.0,
+    end_s: float | None = None,
+    frame_count: int = 6,
+    include_audio: bool = False,
+    progress: ProgressCallback | None = None,
+) -> str:
+    """Free-text caption for a video, from frames sampled across the (trimmed) span.
+
+    The system prompt comes from the active preset, plus a framing note telling the
+    model the images are consecutive samples of ONE clip — without it, multi-image
+    vision models happily describe "several photos".
+    """
+    from .video_tools import extract_audio, extract_frames
+
+    config = runtime_config_for_task(settings, "caption")
+    system = (system_prompt or "").strip()
+    system += (
+        "\n\nYou are shown consecutive frames sampled from a single video clip, in "
+        "order, each labelled with its timestamp. They are moments of one "
+        "continuous piece of footage, not separate photographs. Write ONE caption "
+        "for the whole clip, inferring the motion between frames. Never mention "
+        "frames, sampling or timestamps in the caption.")
+    if progress:
+        progress(f"Sampling {frame_count} frames from {Path(video_path).name}\u2026")
+    tmp = Path(tempfile.mkdtemp(prefix="capframes_"))
+    try:
+        frames = extract_frames(video_path, tmp, frame_count,
+                                start_s=start_s, end_s=end_s)
+        if not frames:
+            raise AutoCaptionError(
+                "Couldn't sample any frames from the clip \u2014 is ffmpeg installed "
+                "and the file readable?")
+        audio_path = None
+        if include_audio:
+            if progress:
+                progress("Extracting the clip's audio\u2026")
+            audio_path = extract_audio(video_path, tmp / "audio.wav",
+                                       start_s=start_s, end_s=end_s)
+        # The instruction has to match what the model actually receives: telling a
+        # model it can't hear while handing it the audio track (or the reverse)
+        # is the fastest way to get invented or omitted dialogue.
+        if audio_path is not None:
+            system += (
+                "\n\nThe clip's audio track for the same span is included. Use it: "
+                "transcribe speech from what you actually hear, and describe the "
+                "real music and ambient sound. Never invent words that were not "
+                "spoken; mark anything unintelligible rather than guessing.")
+        else:
+            system += (
+                "\n\nNo audio is available for this clip, so you cannot hear it. Do "
+                "not invent dialogue, and describe sound only where something "
+                "visible implies it unambiguously.")
+        if guidance.strip():
+            system += f"\n\nAdditional guidance for this file:\n{guidance.strip()}"
+        if progress:
+            progress(f"Captioning {Path(video_path).name} ({len(frames)} frames"
+                     f"{' + audio' if audio_path else ''})\u2026")
+        try:
+            raw = chat_vision_frames(
+                settings=settings,
+                model=config.api_model,
+                frames=frames,
+                system=system,
+                user="Write the caption for this clip.",
+                max_tokens=settings.max_tokens_json,
+                temperature=0.0,
+                audio_path=audio_path,
+            )
+        except Exception as exc:
+            if audio_path is not None:
+                raise AutoCaptionError(describe_audio_failure(exc)) from exc
+            raise
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return _require_caption(clean_plain_caption(raw), raw)
+
+
+_H3_FIELDS = ("integrated_multimodal_description", "overall_soundscape",
+              "non_diegetic_music")
+
+
+def normalise_h3_caption(text: str) -> str:
+    """Collapse stray line breaks inside each H3 field.
+
+    H3 reads a newline as a shot change, so a model that helpfully wraps its prose
+    invents cuts that aren't in the footage. The prompt asks for one line per
+    field, but instruction-following varies by model — Gemma 4 in particular wraps
+    — so the output is normalised rather than trusted.
+
+    Field separation is preserved: the three labelled fields stay on their own
+    blocks, only the text within each is joined.
+    """
+    if not text or not text.strip():
+        return text
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    blocks: list[list[str]] = []
+    for raw in lines:
+        line = raw.strip()
+        starts_field = any(line.lower().startswith(f + ":") for f in _H3_FIELDS)
+        if starts_field or not blocks:
+            blocks.append([line] if line else [])
+        elif line:
+            blocks[-1].append(line)
+    joined = [" ".join(part for part in block if part) for block in blocks]
+    return "\n\n".join(block for block in joined if block).strip()

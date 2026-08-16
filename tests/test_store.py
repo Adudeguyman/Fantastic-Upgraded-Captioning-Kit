@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ideogram_captioner.store import CaptionStore, ProjectConfig
+from captioning_kit.store import CaptionStore, ProjectConfig
 
 
 class StoreTests(unittest.TestCase):
@@ -141,7 +141,7 @@ class StoreTests(unittest.TestCase):
             store = CaptionStore(folder, ".json")
 
             proj = ProjectConfig(name="t", folder_guidance="F", folder_guidance_enabled=True)
-            proj.per_image["a.png"] = "P"
+            proj.per_file["a.png"] = "P"
             proj.mark_generated("a.png", proj.resolved_for("a.png"),
                                 proj.effective_folder_guidance(),
                                 proj.effective_image_guidance("a.png"))
@@ -155,8 +155,8 @@ class StoreTests(unittest.TestCase):
             self.assertTrue(proj.folder_guidance_changed("a.png"))
             self.assertFalse(proj.image_guidance_changed("a.png"))
 
-            # per-image edit attributes to per-image
-            proj.per_image["a.png"] = "P2"
+            # per-file edit attributes to per-file
+            proj.per_file["a.png"] = "P2"
             self.assertTrue(proj.image_guidance_changed("a.png"))
 
             # round-trip the split stamps

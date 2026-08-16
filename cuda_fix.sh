@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 #
-# cuda_fix.sh — install the CUDA NCCL runtime into your captioner environment.
+# cuda_fix.sh — install the CUDA runtime libraries into your captioner environment.
 #
-# Recent llama.cpp CUDA prebuilts (build b8738+) dynamically link libnccl.so.2 but
-# the release archive doesn't ship it, so a CUDA launch can fail to even load with
+# The prebuilt CUDA llama-server dynamically links the CUDA runtime (libcublas,
+# libcudart, libnccl and friends) but the release archives don't ship them, so a
+# CUDA launch can fail to even load with, for example
+#   "error while loading shared libraries: libcublas.so.12"
 #   "error while loading shared libraries: libnccl.so.2"
-# even on a single GPU. This installs requirements-cuda.txt (the nvidia-nccl-cu12
-# wheel) into your environment so the server can find it.
+# even on a single GPU. This installs requirements-cuda.txt (the nvidia-*-cu12
+# wheels) into your environment so the server can find them.
 #
-# Linux x86_64 only — Windows/macOS and the Vulkan/CPU backends don't need NCCL.
+# Note: libcuda.so.1 is NOT covered — that one comes from the NVIDIA driver, so if
+# it's the missing library, install or repair the driver instead.
+#
+# Linux x86_64 only — Windows/macOS and the Vulkan/CPU backends don't need these.
 #
 # Usage:
 #   chmod +x cuda_fix.sh   # once
@@ -36,10 +41,10 @@ run_pip() {
     echo "Installing $REQ ..."
     "$1" -m pip install -r "$REQ"
     echo
-    echo "Done. Restart the captioner (or its llama.cpp server) to pick up NCCL."
+    echo "Done. Restart the captioner (or its llama.cpp server) to pick up the libraries."
 }
 
-echo "CUDA NCCL fix — installs $REQ into your captioner environment."
+echo "CUDA runtime fix — installs $REQ into your captioner environment."
 echo
 echo "Which environment does the captioner run in?"
 echo "  1) conda"
@@ -71,9 +76,9 @@ case "$choice" in
 
     # Prompt for the env name and verify it exists before touching anything.
     while true; do
-        printf "Conda environment name [id4caption]: "
+        printf "Conda environment name [fantastic-captioner]: "
         read -r ENV_NAME
-        ENV_NAME="${ENV_NAME:-id4caption}"
+        ENV_NAME="${ENV_NAME:-fantastic-captioner}"
         if conda env list | awk '{print $1}' | grep -qxF "$ENV_NAME"; then
             break
         fi
@@ -89,7 +94,7 @@ case "$choice" in
   2)
     PYEXE=".venv/bin/python"
     if [ ! -x "$PYEXE" ]; then
-        echo "Error: $PYEXE not found. Create the venv first with run_captioner_venv.sh." >&2
+        echo "Error: $PYEXE not found. Create the venv first with install_venv.sh." >&2
         exit 1
     fi
     echo "Using venv at $PYEXE."

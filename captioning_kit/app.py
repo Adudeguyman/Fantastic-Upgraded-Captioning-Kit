@@ -9,23 +9,26 @@ from __future__ import annotations
 import copy
 import difflib
 import html
+import datetime
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import time
 import webbrowser
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 try:
-    from PySide6.QtCore import Qt, QSize, QSettings, QRect, QRectF, QPoint, QPointF, QMimeData, QEvent, QThread, Signal, QByteArray, QTimer, QPropertyAnimation, QEasingCurve, Property, QParallelAnimationGroup, QAbstractAnimation, QVariantAnimation
-    from PySide6.QtGui import QAction, QBrush, QColor, QFont, QFontDatabase, QFontMetrics, QPainter, QPainterPath, QPen, QPixmap, QIcon, QTextCharFormat, QTextCursor, QTextFormat, QDrag, QPolygonF
+    from PySide6.QtCore import QObject, Qt, QSize, QSettings, QRect, QRectF, QPoint, QPointF, QMimeData, QEvent, QThread, Signal, QByteArray, QTimer, QPropertyAnimation, QEasingCurve, Property, QParallelAnimationGroup, QAbstractAnimation, QVariantAnimation, QUrl
+    from PySide6.QtGui import QAction, QBrush, QColor, QFont, QFontDatabase, QFontMetrics, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QIcon, QShortcut, QTextCharFormat, QTextCursor, QTextFormat, QDrag, QPolygonF
     from PySide6.QtSvg import QSvgRenderer
     from PySide6.QtWidgets import (
         QApplication,
         QFileDialog,
+        QGridLayout,
         QFrame,
         QLayout,
         QGraphicsPixmapItem,
@@ -35,6 +38,7 @@ try:
         QGraphicsView,
         QGraphicsItem,
         QGraphicsRectItem,
+        QGraphicsPathItem,
         QHBoxLayout,
         QButtonGroup,
         QAbstractButton,
@@ -50,6 +54,8 @@ try:
         QLabel,
         QLineEdit,
         QProgressBar,
+        QProgressDialog,
+        QSlider,
         QListWidget,
         QListWidgetItem,
         QMainWindow,
@@ -74,9 +80,9 @@ try:
 except ImportError as exc:  # Tier 2: clear message instead of a raw traceback.
     sys.stderr.write(
         "\nPySide6 is not installed in this environment.\n"
-        "Activate the captioner environment and install requirements:\n\n"
-        "    conda activate id4caption\n"
-        "    pip install -r requirements-qt.txt\n\n"
+        "Run the installer for your setup:\n\n"
+        "    ./install_venv.sh     (or install_venv.bat on Windows)\n"
+        "    ./install_conda.sh    (or install_conda.bat on Windows)\n\n"
         f"(original import error: {exc})\n"
     )
     raise SystemExit(1)
@@ -84,6 +90,8 @@ except ImportError as exc:  # Tier 2: clear message instead of a raw traceback.
 # Shared backend — imported unchanged from the existing Tkinter app.
 from .store import CaptionStore, ProjectConfig
 from .llm_captioning import (
+    json_system_prompt,
+    load_prompts,
     CaptioningSettings,
     AutoCaptionError,
     add_bboxes_to_caption,
@@ -94,7 +102,11 @@ from .llm_captioning import (
     profiles_for_task,
     profile_labels,
     profile_id_from_label,
+    _split_filenames,
     discover_local_gguf_models,
+    normalise_h3_caption,
+    locate_existing_model_file,
+    model_search_roots,
     estimate_gguf_vram_gb,
     guess_mmproj_for,
     CUSTOM_LOCAL_PROFILE,
@@ -121,6 +133,11 @@ from .llm_captioning import (
     llama_server_supports_router,
     sample_resources,
     format_resources,
+    caption_image_plain,
+    caption_video_plain,
+    runtime_config_for_task,
+    mmproj_has_audio_encoder,
+    existing_mmproj_path,
     plan_llama_acquisition,
     install_llama_release,
     rollback_llama,
@@ -133,8 +150,40 @@ from .llm_captioning import (
     default_models_dir,
     profile_seed_data,
 )
-from .schema import caption_health, default_caption, serialize_caption
+from .presets import PRESET_ORDER, PRESETS, CaptionPreset, get_preset
+from .training_goals import DEFAULT_GOAL, GOAL_ORDER, GOALS, TrainingGoal, get_goal
+from .video_tools import (
+    VideoInfo,
+    extract_poster,
+    ffmpeg_available,
+    find_ffmpeg,
+    install_ffmpeg,
+    has_audio_stream,
+    is_video,
+    quiet_ffmpeg_logs,
+    VIDEO_EXTENSIONS,
+    probe_video,
+    apply_mute_span,
+    audio_peaks,
+    extract_single_frame,
+    VideoEditPlan,
+    apply_video_edit as run_video_edit,
+    plan_for_target,
+)
+from .llm_captioning import app_base_dir
+from .model_targets import (
+    ModelTarget,
+    _target_from_dict,
+    builtin_map,
+    load_targets,
+    save_targets,
+    targets_path,
+)
+from .schema import IMAGE_EXTENSIONS, caption_health, default_caption, serialize_caption
 
+
+# User-facing product name, used for the window title and About box.
+APP_TITLE = "Fantastic Upgraded Captioning Kit"
 
 THUMB = 64
 # Filmstrip hover-preview popup (designed spec, dark theme). Shows instantly on
@@ -159,7 +208,24 @@ _LUCIDE_ICONS = {
     "chevron-right": "<path d='m9 18 6-6-6-6' />",
     "chevron-up": "<path d='m18 15-6-6-6 6' />",
     "chevrons-left": "<path d='m11 17-5-5 5-5' /> <path d='m18 17-5-5 5-5' />",
+    "crop": "<path d='M6 2v14a2 2 0 0 0 2 2h14' /> <path d='M18 22V8a2 2 0 0 0-2-2H2' />",
+    "link": ("<path d='M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71' />"
+             " <path d='M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71' />"),
+    "copy": ("<rect width='14' height='14' x='8' y='8' rx='2' ry='2' />"
+             " <path d='M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2' />"),
+    "image-plus": ("<path d='M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7' />"
+                   " <path d='M16 5h6' /> <path d='M19 2v6' />"
+                   " <circle cx='9' cy='9' r='2' />"
+                   " <path d='m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21' />"),
+    "eye-off": ("<path d='M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68' />"
+                " <path d='M6.61 6.61A13.5 13.5 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61' />"
+                " <path d='M14.12 14.12a3 3 0 1 1-4.24-4.24' /> <path d='m2 2 20 20' />"),
+    "rotate-cw": ("<path d='M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8' />"
+                  " <path d='M21 3v5h-5' />"),
+    "rotate-ccw": ("<path d='M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8' />"
+                   " <path d='M3 3v5h5' />"),
     "ellipsis": "<circle cx='12' cy='12' r='1' /> <circle cx='19' cy='12' r='1' /> <circle cx='5' cy='12' r='1' />",
+    "film": "<rect width='18' height='18' x='3' y='3' rx='2' /> <path d='M7 3v18' /> <path d='M17 3v18' /> <path d='M3 7.5h4' /> <path d='M3 12h18' /> <path d='M3 16.5h4' /> <path d='M17 7.5h4' /> <path d='M17 16.5h4' />",
     "flag": "<path d='M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z' /> <path d='M4 22v-7' />",
     "folder-open": "<path d='m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2' />",
     "info": "<circle cx='12' cy='12' r='10' /> <path d='M12 16v-4' /> <path d='M12 8h.01' />",
@@ -167,6 +233,10 @@ _LUCIDE_ICONS = {
     "lock-open": "<rect width='18' height='11' x='3' y='11' rx='2' ry='2' /> <path d='M7 11V7a5 5 0 0 1 9.9-1' />",
     "maximize": "<path d='M8 3H5a2 2 0 0 0-2 2v3' /> <path d='M21 8V5a2 2 0 0 0-2-2h-3' /> <path d='M3 16v3a2 2 0 0 0 2 2h3' /> <path d='M16 21h3a2 2 0 0 0 2-2v-3' />",
     "maximize-2": "<path d='M15 3h6v6' /> <path d='m21 3-7 7' /> <path d='m3 21 7-7' /> <path d='M9 21H3v-6' />",
+    "pause": "<rect x='14' y='4' width='4' height='16' rx='1' /> <rect x='6' y='4' width='4' height='16' rx='1' />",
+    "play": "<path fill='{color}' d='M6 3.5v17a1 1 0 0 0 1.5.86l13-8.5a1 1 0 0 0 0-1.72l-13-8.5A1 1 0 0 0 6 3.5z' />",
+    "volume-2": "<path d='M11 4.7a.7.7 0 0 0-1.2-.5L6 8H4a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2l3.8 3.8a.7.7 0 0 0 1.2-.5z' /> <path d='M16 9a5 5 0 0 1 0 6' /> <path d='M19.4 6.6a9 9 0 0 1 0 10.8' />",
+    "volume-x": "<path d='M11 4.7a.7.7 0 0 0-1.2-.5L6 8H4a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2l3.8 3.8a.7.7 0 0 0 1.2-.5z' /> <line x1='22' x2='16' y1='9' y2='15' /> <line x1='16' x2='22' y1='9' y2='15' />",
     "mouse-pointer-2": "<path d='M4.037 4.688a.495.495 0 0 1 .651-.651l16 6.5a.5.5 0 0 1-.063.947l-6.124 1.58a2 2 0 0 0-1.438 1.435l-1.579 6.126a.5.5 0 0 1-.947.063z' />",
     "move": "<path d='M12 2v20' /> <path d='m15 19-3 3-3-3' /> <path d='m19 9 3 3-3 3' /> <path d='M2 12h20' /> <path d='m5 9-3 3 3 3' /> <path d='m9 5 3-3 3 3' />",
     "panel-left-close": "<rect width='18' height='18' x='3' y='3' rx='2' /> <path d='M9 3v18' /> <path d='m16 15-3-3 3-3' />",
@@ -177,6 +247,7 @@ _LUCIDE_ICONS = {
     "plus": "<path d='M5 12h14' /> <path d='M12 5v14' />",
     "save": "<path d='M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z' /> <path d='M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7' /> <path d='M7 3v4a1 1 0 0 0 1 1h7' />",
     "save-all": "<path d='M10 2v3a1 1 0 0 0 1 1h5' /> <path d='M18 18v-6a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6' /> <path d='M18 22H4a2 2 0 0 1-2-2V6' /> <path d='M8 18a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9.172a2 2 0 0 1 1.414.586l2.828 2.828A2 2 0 0 1 22 6.828V16a2 2 0 0 1-2.01 2z' />",
+    "scaling": "<path d='M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7' /> <path d='M16 3h5v5' /> <path d='m21 3-6.5 6.5' /> <path d='M7 17h.01' /> <path d='M11 17h.01' /> <path d='M7 13h.01' />",
     "settings": "<path d='M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915' /> <circle cx='12' cy='12' r='3' />",
     "square-dashed": "<path d='M5 3a2 2 0 0 0-2 2' /> <path d='M19 3a2 2 0 0 1 2 2' /> <path d='M21 19a2 2 0 0 1-2 2' /> <path d='M5 21a2 2 0 0 1-2-2' /> <path d='M9 3h1' /> <path d='M9 21h1' /> <path d='M14 3h1' /> <path d='M14 21h1' /> <path d='M3 9v1' /> <path d='M21 9v1' /> <path d='M3 14v1' /> <path d='M21 14v1' />",
     "square-plus": "<rect width='18' height='18' x='3' y='3' rx='2' /> <path d='M8 12h8' /> <path d='M12 8v8' />",
@@ -198,6 +269,13 @@ def lucide_pixmap(name: str, color: str = "#A6ADB6", size: int = 18, stroke: flo
     if cached is not None:
         return cached
     inner = _LUCIDE_ICONS.get(name, "")
+    if not inner:
+        # A missing glyph silently renders an empty button, which is very easy to
+        # ship by accident — make it obvious in dev instead.
+        print(f"[icons] unknown lucide glyph: {name!r}", file=sys.stderr)
+    # Glyph bodies may carry their own {color} (e.g. filled shapes), so expand the
+    # body first — placeholders inside `inner` aren't seen by the outer format().
+    inner = inner.replace("{color}", color)
     svg = _LUCIDE_TPL.format(color=color, sw=stroke, inner=inner)
     renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
     dpr = 2.0
@@ -332,6 +410,10 @@ def build_stylesheet(s: CaptioningSettings) -> str:
     QToolButton {{ background: {t.surface_2}; color: {t.text_secondary}; border: 1px solid {t.border}; border-radius: 6px; padding: 4px; }}
     QToolButton:hover {{ background: {t.surface_hover}; border-color: {t.border_strong_hover}; color: {t.text_primary}; }}
     QToolButton:checked {{ background: {t.accent}; color: #FFFFFF; border-color: {t.accent}; }}
+    /* Checkable QPushButtons (Snap, Crop, Mute section) had no checked state at
+       all, so they looked identical on and off. */
+    QPushButton:checked {{ background: {t.accent}; color: #FFFFFF; border-color: {t.accent}; }}
+    QPushButton:checked:hover {{ background: {t.accent_hover}; border-color: {t.accent_hover}; }}
 
     QLineEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
         background: {t.surface_2}; color: {t.text_primary};
@@ -504,10 +586,17 @@ UNSAVED_ROLE = int(Qt.UserRole) + 1  # per-item flag: has uncommitted edits
 STALE_ROLE = int(Qt.UserRole) + 2    # per-item flag: guidance changed since last caption
 STALE_COLOR = "#A78BFA"              # violet — "guidance changed since last run"
 REVIEW_ROLE = int(Qt.UserRole) + 3   # per-item flag: caption failed a health check (corrupt/off-schema)
+MUTE_COLOR = "#E24B4A"               # red — the span whose audio will be silenced
 REVIEW_COLOR = "#E24B4A"             # red — "needs review: caption may be corrupt"
 FLAG_ROLE = int(Qt.UserRole) + 4     # per-item flag: user manually flagged for review
 FLAG_COLOR = "#E5484D"               # red flag — "you flagged this for manual review"
 OMIT_ROLE = int(Qt.UserRole) + 5     # per-item flag: convert mode on but this image's .txt is omitted
+DURATION_ROLE = int(Qt.UserRole) + 6  # per-item str: video duration badge ('0:05'); None for images
+BYPASS_ROLE = int(Qt.UserRole) + 9      # per-item flag: file is in .bypass/
+SEPARATOR_ROLE = int(Qt.UserRole) + 10  # per-item flag: the bypass divider
+VIDEO_EDIT_ROLE = int(Qt.UserRole) + 8  # per-item flag: clip has unapplied edits
+SPEC_ROLE = int(Qt.UserRole) + 7     # per-item flag: clip doesn't meet the target's specs
+SPEC_COLOR = "#E0A33B"               # amber — "won't train as-is on the selected model"
 OMIT_COLOR = "#A78BFA"               # violet (guidance family) — "source .txt omitted for this image"
 
 SERVER_PING_INTERVAL_MS = 2000  # how often the background monitor re-checks the server
@@ -939,8 +1028,9 @@ class AiJobThread(QThread):
     """Runs one AI operation off the UI thread.
 
     Operations: 'json_image' (generate, then optional bbox pass), 'refine',
-    'bboxes'. Progress strings and the result/error come back as signals so the
-    main thread can update widgets safely.
+    'bboxes', and 'plain' (free-text caption for plain/H3 presets). Progress
+    strings and the result/error come back as signals so the main thread can update
+    widgets safely.
     """
 
     progress = Signal(str)
@@ -948,9 +1038,17 @@ class AiJobThread(QThread):
     error = Signal(str)
     server_started = Signal(object)
 
-    def __init__(self, operation, settings, image_path, caption, guidance, source_caption, instructions):
+    def __init__(self, operation, settings, image_path, caption, guidance,
+                 source_caption, instructions, system_prompt=""):
         super().__init__()
         self.operation = operation
+        # Plain presets supply their own system prompt (plain text, H3 natural,
+        # H3 official) — the operation is the same, only the instructions differ.
+        self.system_prompt = system_prompt
+        # For 'plain_video': caption this span of the clip (the user's trim).
+        self.span: tuple[float, float] | None = None
+        self.frame_count = 6
+        self.include_audio = False
         self.settings = settings
         self.image_path = image_path
         self.caption = caption
@@ -992,6 +1090,19 @@ class AiJobThread(QThread):
                 caption, _att, _add, _reasons = add_bboxes_to_caption(
                     self.settings, self.image_path, self.caption, progress=prog
                 )
+            elif op == "plain":
+                caption = caption_image_plain(
+                    self.settings, self.image_path, self.system_prompt,
+                    guidance=self.guidance, progress=prog,
+                )
+            elif op == "plain_video":
+                start_s, end_s = self.span if self.span else (0.0, None)
+                caption = caption_video_plain(
+                    self.settings, self.image_path, self.system_prompt,
+                    guidance=self.guidance, start_s=start_s, end_s=end_s,
+                    frame_count=self.frame_count,
+                    include_audio=self.include_audio, progress=prog,
+                )
             else:
                 raise AutoCaptionError(f"Unknown operation: {op}")
             self.done.emit(caption)
@@ -1015,11 +1126,18 @@ class BatchCaptionThread(QThread):
     batch_finished = Signal(int, int, bool)  # success, fail, cancelled
     server_started = Signal(object)         # launched llama-server process
 
-    def __init__(self, settings, items, delay_ms: int = 0):
+    def __init__(self, settings, items, delay_ms: int = 0, system_prompt: str = ""):
         super().__init__()
         self.settings = settings
         self.items = items  # list of (Path, guidance, source_caption)
         self.delay_ms = max(0, int(delay_ms))
+        # Non-empty for plain presets: batch then produces free text with this
+        # prompt instead of the Ideogram JSON structure.
+        self.system_prompt = system_prompt
+        self.frame_count = 6
+        # Defaulted here as well as set by the caller: without it, constructing the
+        # thread directly raises AttributeError mid-batch on the first video.
+        self.include_audio = False
 
     def _interruptible_sleep(self, ms: int) -> None:
         waited = 0
@@ -1057,14 +1175,29 @@ class BatchCaptionThread(QThread):
                 self.item_progress.emit(_i, _t, f"[{_i}/{_t}] {msg}")
 
             try:
-                caption = generate_json_from_image(
-                    self.settings, image_path, progress=prog,
-                    guidance=guidance, source_caption=source_caption,
-                )
-                if self.settings.add_bboxes_after_json and not self.isInterruptionRequested():
-                    caption, _att, _add, _reasons = add_bboxes_to_caption(
-                        self.settings, image_path, caption, progress=prog
+                if self.system_prompt and is_video(image_path):
+                    # Batch has no per-clip trim; the whole clip is captioned. Trim
+                    # first (Apply edit) if only part of a clip should ship.
+                    caption = caption_video_plain(
+                        self.settings, image_path, self.system_prompt,
+                        guidance=guidance, frame_count=self.frame_count,
+                        include_audio=self.include_audio, progress=prog,
                     )
+                elif self.system_prompt:
+                    caption = caption_image_plain(
+                        self.settings, image_path, self.system_prompt,
+                        guidance=guidance, progress=prog,
+                    )
+                else:
+                    caption = generate_json_from_image(
+                        self.settings, image_path, progress=prog,
+                        guidance=guidance, source_caption=source_caption,
+                    )
+                    if (self.settings.add_bboxes_after_json
+                            and not self.isInterruptionRequested()):
+                        caption, _att, _add, _reasons = add_bboxes_to_caption(
+                            self.settings, image_path, caption, progress=prog
+                        )
                 self.item_done.emit(str(image_path), caption)
                 success += 1
             except Exception as exc:
@@ -1376,12 +1509,18 @@ class PreferencesDialog(QDialog):
             ("vision_image_format", "Vision image format", "choice", ("auto", "jpeg", "png")),
             ("max_tokens_caption", "Max tokens — caption", "int", (1, 200000)),
             ("max_tokens_json", "Max tokens — JSON", "int", (1, 200000)),
+            ("video_caption_frames", "Video caption frames", "int", (2, 16)),
+            ("send_clip_audio", "Send clip audio (audio-capable models)", "bool", None),
             ("max_tokens_bboxes", "Max tokens — bboxes", "int", (1, 200000)),
             ("context_chars", "Context chars", "int", (0, 100000)),
             ("max_targets_per_call", "Max bbox targets / call (0 = all)", "int", (0, 10000)),
             ("json_refine_instructions", "Refine instructions", "multiline", None),
         )),
         ("Tags", ()),
+        # Prompts and per-model frame rules. Both are data the app ships defaults
+        # for but can't keep current — new video models appear faster than releases
+        # do — so they're editable and shareable here.
+        ("LLM Instructions", ()),
         ("Appearance", (
             ("ui_font_family", "UI font", "font", None),
             ("mono_font_family", "Monospace font", "font", None),
@@ -1408,6 +1547,13 @@ class PreferencesDialog(QDialog):
         "vision_image_format": "Image encoding sent to the vision model. 'auto' chooses per image; force jpeg/png if your server prefers one.",
         "max_tokens_caption": "Maximum tokens the model may generate during the prose caption step.",
         "max_tokens_json": "Maximum tokens the model may generate during the JSON step.",
+        "send_clip_audio": "When the selected model can hear (an Omni-style profile), "
+                           "send the clip's audio with the frames so captions can "
+                           "include real dialogue and sound. Ignored by vision-only "
+                           "models.",
+        "video_caption_frames": "How many frames are sampled across a clip when "
+                                "captioning a video. More frames capture motion "
+                                "better but cost context; 4–8 is typical.",
         "max_tokens_bboxes": "Maximum tokens the model may generate during the bounding-box step.",
         "context_chars": "How many characters of the existing caption are passed as context when locating boxes. Larger = more context and more tokens.",
         "max_targets_per_call": "Elements sent per box-location request. 0 = all in one call; a small number splits long lists across requests.",
@@ -1446,7 +1592,7 @@ class PreferencesDialog(QDialog):
         self.bbox_same_as_caption = bbox_same_as_caption
         self.tags_result = list(default_tags) if default_tags is not None else None
         self.widgets: dict = {}
-        self._qsettings = QSettings("IdeogramCaptioner", "QtApp")
+        self._qsettings = QSettings("FantasticCaptioningKit", "QtApp")
         self._custom_presets = self._load_custom_presets()
         self._preset_combo = None
 
@@ -1466,6 +1612,8 @@ class PreferencesDialog(QDialog):
                 page = self._build_models_page()
             elif name == "Tags":
                 page = self._build_tags_page()
+            elif name == "LLM Instructions":
+                page = self._build_llm_page()
             else:
                 page = QWidget()
                 form = QFormLayout(page)
@@ -1815,21 +1963,26 @@ class PreferencesDialog(QDialog):
         lay.addLayout(folders_form)
         lay.addSpacing(10)
 
-        for task, title in (("caption", "Caption / JSON model"), ("bbox", "BBox VLM")):
+        for task, title in (("caption", "Captioning model"),
+                            ("bbox", "BBox VLM \u2014 only used by bbox presets")):
             head_row = QHBoxLayout()
             head_row.setContentsMargins(0, 0, 0, 0)
             section = QLabel(title)
             section.setObjectName("SectionLabel")
             head_row.addWidget(section)
             head_row.addStretch(1)
-            if task == "caption":
-                rec_btn = QPushButton("Browse models\u2026")
-                rec_btn.setToolTip("Browse all models with VRAM fit estimates for your card.")
-                rec_btn.clicked.connect(lambda: self._open_model_picker("caption"))
-                head_row.addWidget(rec_btn, 0, Qt.AlignRight)
+            # No "Browse models…" button here: it opened the very same picker as
+            # "Choose model…" on the row below.
             lay.addLayout(head_row)
 
             if task == "bbox":
+                why = QLabel(
+                    "Only presets that draw bounding boxes use this \u2014 Ideogram 4 "
+                    "JSON. Plain-text presets (MiniMax H3, Wan, LTX) ignore it "
+                    "entirely.")
+                why.setObjectName("Hint")
+                why.setWordWrap(True)
+                lay.addWidget(why)
                 self._bbox_lock_btn = QToolButton()
                 self._bbox_lock_btn.setObjectName("LockToggle")
                 self._bbox_lock_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -1988,6 +2141,412 @@ class PreferencesDialog(QDialog):
         lay.addWidget(open_btn, 0, Qt.AlignLeft)
         lay.addStretch(1)
         return page
+
+    def _build_llm_page(self) -> QWidget:
+        """Prompts and per-model frame rules, editable and shareable.
+
+        Both are things the app ships defaults for but can't keep current: video
+        models arrive faster than releases do, and their frame grids come from
+        community reverse-engineering as often as from published specs. Rather than
+        making every new model wait for an update, the rules are data — editable
+        here, exported as one JSON, and importable by anyone else.
+        """
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(14, 14, 14, 14)
+        outer.setSpacing(10)
+        tabs = QTabWidget()
+        tabs.addTab(self._build_prompt_editor(), "Caption prompts")
+        tabs.addTab(self._build_targets_editor(), "Model frame rules")
+        outer.addWidget(tabs, 1)
+
+        row = QHBoxLayout()
+        exp = QPushButton("Export\u2026")
+        exp.setToolTip("Save prompts and frame rules to one JSON file to share")
+        exp.clicked.connect(self._export_llm_bundle)
+        row.addWidget(exp)
+        imp = QPushButton("Import\u2026")
+        imp.setToolTip("Load prompts and frame rules from a shared JSON file")
+        imp.clicked.connect(self._import_llm_bundle)
+        row.addWidget(imp)
+        row.addStretch(1)
+        self._llm_status = QLabel("")
+        self._llm_status.setObjectName("Hint")
+        row.addWidget(self._llm_status)
+        outer.addLayout(row)
+        return page
+
+    def _build_prompt_editor(self) -> QWidget:
+        """Per preset, per media. Same store the caption run reads, so an edit here
+        changes what actually gets sent rather than a copy of it."""
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        picker = QHBoxLayout()
+        picker.addWidget(QLabel("Preset:"))
+        self._pe_preset = QComboBox()
+        for key in PRESET_ORDER:
+            self._pe_preset.addItem(PRESETS[key].label, key)
+        picker.addWidget(self._pe_preset, 1)
+        picker.addWidget(QLabel("For:"))
+        self._pe_media = QComboBox()
+        self._pe_media.addItem("Photos", "image")
+        self._pe_media.addItem("Videos", "video")
+        picker.addWidget(self._pe_media)
+        lay.addLayout(picker)
+
+        self._pe_edit = QPlainTextEdit()
+        self._pe_edit.setLineWrapMode(QPlainTextEdit.NoWrap)
+        lay.addWidget(self._pe_edit, 1)
+
+        self._pe_pending: dict[tuple[str, str], str] = {}
+        self._pe_current: tuple[str, str] | None = None
+        self._pe_preset.currentIndexChanged.connect(self._pe_reload)
+        self._pe_media.currentIndexChanged.connect(self._pe_reload)
+
+        row = QHBoxLayout()
+        reset = QPushButton("Reset this prompt")
+        reset.clicked.connect(self._pe_reset)
+        row.addWidget(reset)
+        row.addStretch(1)
+        hint = QLabel("Edits are saved when you press Save.")
+        hint.setObjectName("Hint")
+        row.addWidget(hint)
+        lay.addLayout(row)
+        self._pe_reload()
+        return w
+
+    def _pe_key(self, preset: str, media: str) -> str:
+        return f"system_prompt/{preset}/{media}"
+
+    def _pe_reload(self) -> None:
+        """Keep unsaved edits per (preset, media) while switching between them."""
+        if self._pe_current is not None:
+            self._pe_pending[self._pe_current] = self._pe_edit.toPlainText()
+        preset = self._pe_preset.currentData()
+        media = self._pe_media.currentData()
+        self._pe_current = (preset, media)
+        if self._pe_current in self._pe_pending:
+            self._pe_edit.setPlainText(self._pe_pending[self._pe_current])
+            return
+        default = get_preset(preset).prompt_for(media)
+        stored = self._qsettings.value(self._pe_key(preset, media), default, str)
+        self._pe_edit.setPlainText(stored)
+
+    def _pe_reset(self) -> None:
+        preset, media = self._pe_current or ("", "")
+        self._pe_edit.setPlainText(get_preset(preset).prompt_for(media))
+
+    def _pe_commit(self) -> None:
+        """Write every touched prompt. Called from the dialog's Save."""
+        if self._pe_current is not None:
+            self._pe_pending[self._pe_current] = self._pe_edit.toPlainText()
+        for (preset, media), text in self._pe_pending.items():
+            default = get_preset(preset).prompt_for(media)
+            key = self._pe_key(preset, media)
+            if text.strip() == default.strip():
+                self._qsettings.remove(key)   # back to shipped default, not a copy
+            else:
+                self._qsettings.setValue(key, text)
+
+    def _build_targets_editor(self) -> QWidget:
+        """Frame rules per model: fps, the legal frame-count grid, dimension
+        multiple, pixel budget and duration range.
+
+        Editable because these specs drift and several were pieced together from
+        community implementations rather than published docs — waiting on an app
+        release to correct one, or to add a model that shipped last week, is the
+        wrong dependency.
+        """
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Model:"))
+        self._mt_combo = QComboBox()
+        top.addWidget(self._mt_combo, 1)
+        add = QPushButton("Add\u2026")
+        add.setToolTip("Define a model the app doesn't ship rules for")
+        add.clicked.connect(self._mt_add)
+        top.addWidget(add)
+        self._mt_remove = QPushButton("Remove")
+        self._mt_remove.setToolTip("Delete a model you added")
+        self._mt_remove.clicked.connect(self._mt_remove_current)
+        top.addWidget(self._mt_remove)
+        lay.addLayout(top)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 6, 0, 6)
+        self._mt_fields: dict[str, QWidget] = {}
+
+        def _num(key: str, label: str, lo: float, hi: float, decimals: int = 0,
+                 tip: str = "") -> None:
+            box = QDoubleSpinBox() if decimals else QSpinBox()
+            box.setRange(lo, hi)
+            if decimals:
+                box.setDecimals(decimals)
+            box.setToolTip(tip)
+            box.setMaximumWidth(160)
+            self._mt_fields[key] = box
+            form.addRow(label, box)
+
+        _num("fps", "Frames per second", 1, 240, 3,
+             "The rate the model trains at. 16 for Wan 2.2 A14B, 24 for most others.")
+        _num("frame_modulus", "Frame grid — every", 1, 512, 0,
+             "Legal frame counts follow frames %% modulus == remainder. Wan is 4n+1, "
+             "LTX 8n+1, MiniMax H3 17n+5.")
+        _num("frame_remainder", "Frame grid — plus", 0, 511, 0,
+             "The +N part of the grid. Wan/LTX use 1, H3 uses 5.")
+        _num("dimension_multiple", "Dimensions multiple of", 1, 256, 0,
+             "Width and height must divide by this. 16 for Wan, 32 for LTX and H3.")
+        _num("max_pixels", "Max pixels (0 = no cap)", 0, 100_000_000, 0,
+             "Area budget, if the model documents one. H3 caps at 768\u00d71344.")
+        _num("min_seconds", "Minimum length (s)", 0, 600, 2,
+             "Shorter clips are flagged as unusable for this model.")
+        _num("max_seconds", "Maximum length (s)", 0, 600, 2,
+             "Longer clips are flagged; trim to fit.")
+        self._mt_exact = QCheckBox("Requires exactly this frame rate")
+        self._mt_exact.setToolTip(
+            "On for models that reject off-rate sources outright (H3 needs 24.000). "
+            "Off means the rate is a target, not a hard requirement.")
+        self._mt_fields["exact_fps"] = self._mt_exact
+        form.addRow("", self._mt_exact)
+        self._mt_notes = QPlainTextEdit()
+        self._mt_notes.setMaximumHeight(70)
+        self._mt_notes.setToolTip("Anything worth remembering about this model's "
+                                  "quirks — shown nowhere else, kept with the rules.")
+        self._mt_fields["notes"] = self._mt_notes
+        form.addRow("Notes", self._mt_notes)
+        lay.addLayout(form)
+
+        self._mt_summary = QLabel("")
+        self._mt_summary.setObjectName("Hint")
+        self._mt_summary.setWordWrap(True)
+        lay.addWidget(self._mt_summary)
+        lay.addStretch(1)
+
+        row = QHBoxLayout()
+        reset = QPushButton("Reset to built-in")
+        reset.setToolTip("Discard your edits to this model and restore the shipped "
+                         "rules")
+        reset.clicked.connect(self._mt_reset_current)
+        row.addWidget(reset)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        self._mt_working = {k: replace(t) for k, t in load_targets(app_base_dir()).items()}
+        self._mt_builtin = builtin_map()
+        self._mt_current: str | None = None
+        for key, target in self._mt_working.items():
+            self._mt_combo.addItem(target.label, key)
+        self._mt_combo.currentIndexChanged.connect(self._mt_reload)
+        for box in self._mt_fields.values():
+            if isinstance(box, (QSpinBox, QDoubleSpinBox)):
+                box.valueChanged.connect(self._mt_capture)
+            elif isinstance(box, QCheckBox):
+                box.toggled.connect(self._mt_capture)
+            else:
+                box.textChanged.connect(self._mt_capture)
+        self._mt_reload()
+        return w
+
+    def _mt_reload(self) -> None:
+        key = self._mt_combo.currentData()
+        if not key or key not in self._mt_working:
+            return
+        self._mt_current = None          # suppress capture while repopulating
+        target = self._mt_working[key]
+        f = self._mt_fields
+        f["fps"].setValue(target.fps)
+        f["frame_modulus"].setValue(target.frame_modulus)
+        f["frame_remainder"].setValue(target.frame_remainder)
+        f["dimension_multiple"].setValue(target.dimension_multiple)
+        f["max_pixels"].setValue(target.max_pixels)
+        f["min_seconds"].setValue(target.min_seconds)
+        f["max_seconds"].setValue(target.max_seconds)
+        f["exact_fps"].setChecked(target.exact_fps)
+        f["notes"].setPlainText(target.notes)
+        self._mt_current = key
+        self._mt_remove.setEnabled(key not in self._mt_builtin)
+        self._mt_refresh_summary()
+
+    def _mt_capture(self, *_args) -> None:
+        """Fold edits into the working copy as they're made, so switching models
+        doesn't lose them."""
+        key = self._mt_current
+        if not key:
+            return
+        f = self._mt_fields
+        self._mt_working[key] = replace(
+            self._mt_working[key],
+            fps=float(f["fps"].value()),
+            frame_modulus=max(1, int(f["frame_modulus"].value())),
+            frame_remainder=int(f["frame_remainder"].value()),
+            dimension_multiple=max(1, int(f["dimension_multiple"].value())),
+            max_pixels=int(f["max_pixels"].value()),
+            min_seconds=float(f["min_seconds"].value()),
+            max_seconds=float(f["max_seconds"].value()),
+            exact_fps=bool(f["exact_fps"].isChecked()),
+            notes=f["notes"].toPlainText(),
+        )
+        self._mt_refresh_summary()
+
+    def _mt_refresh_summary(self) -> None:
+        """Show the rules as legal frame counts, which is the form they're used in
+        — a modulus and remainder are hard to sanity-check in the abstract."""
+        key = self._mt_current
+        if not key:
+            return
+        t = self._mt_working[key]
+        ladder = []
+        n = t.smallest_legal_frames()
+        while len(ladder) < 6 and n <= t.max_frames():
+            ladder.append(str(n))
+            n += t.frame_modulus
+        self._mt_summary.setText(
+            f"Legal frame counts: {', '.join(ladder)} \u2026 up to {t.max_frames()} "
+            f"({t.seconds_for_frames(t.max_frames()):.2f}s at {t.fps:g}fps). "
+            f"Shortest usable: {t.min_frames()} frames "
+            f"({t.seconds_for_frames(t.min_frames()):.2f}s)."
+        )
+
+    def _mt_add(self) -> None:
+        label, ok = QInputDialog.getText(self, "Add model", "Model name:")
+        label = (label or "").strip()
+        if not ok or not label:
+            return
+        key = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_") or "custom_model"
+        if key in self._mt_working:
+            QMessageBox.information(self, "Add model",
+                                    f"'{label}' already exists in the list.")
+            return
+        # Seeded from the most common shape rather than zeros, so a new entry is
+        # immediately plausible and only needs the bits that differ.
+        self._mt_working[key] = ModelTarget(
+            key=key, label=label, fps=24.0, frame_modulus=1, frame_remainder=0,
+            dimension_multiple=32, max_pixels=0, min_seconds=1.0, max_seconds=10.0,
+            source="added by hand", verified=datetime.date.today().isoformat())
+        self._mt_combo.addItem(label, key)
+        self._mt_combo.setCurrentIndex(self._mt_combo.count() - 1)
+
+    def _mt_remove_current(self) -> None:
+        key = self._mt_current
+        if not key or key in self._mt_builtin:
+            return
+        self._mt_working.pop(key, None)
+        idx = self._mt_combo.findData(key)
+        if idx >= 0:
+            self._mt_combo.removeItem(idx)
+
+    def _mt_reset_current(self) -> None:
+        key = self._mt_current
+        if not key or key not in self._mt_builtin:
+            return
+        self._mt_working[key] = replace(self._mt_builtin[key])
+        self._mt_reload()
+
+    def _mt_commit(self) -> None:
+        """Persist to model_targets.json. Only entries that differ from the shipped
+        defaults are written, so the file stays a diff rather than a snapshot that
+        would freeze future corrections out."""
+        changed = {k: t for k, t in self._mt_working.items()
+                   if k not in self._mt_builtin or t != self._mt_builtin[k]}
+        path = targets_path(app_base_dir())
+        if not changed:
+            path.unlink(missing_ok=True)
+            return
+        save_targets(app_base_dir(), changed)
+
+    BUNDLE_VERSION = 1
+
+    def _export_llm_bundle(self) -> None:
+        """One file carrying prompts and frame rules, so a working setup for a new
+        model can be handed to someone else."""
+        self._pe_commit()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export LLM instructions", "captioner-llm-instructions.json",
+            "JSON (*.json)")
+        if not path:
+            return
+        prompts: dict[str, str] = {}
+        for key in PRESET_ORDER:
+            for media in ("image", "video"):
+                stored = self._qsettings.value(self._pe_key(key, media), "", str)
+                if stored and stored.strip() != get_preset(key).prompt_for(media).strip():
+                    prompts[f"{key}/{media}"] = stored
+        bundle = {
+            "kind": "fantastic-captioning-kit/llm-instructions",
+            "version": self.BUNDLE_VERSION,
+            "exported": datetime.datetime.now().isoformat(timespec="seconds"),
+            "prompts": prompts,
+            "model_targets": [asdict(t) for k, t in self._mt_working.items()
+                              if k not in self._mt_builtin
+                              or t != self._mt_builtin[k]],
+        }
+        try:
+            Path(path).write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        self._llm_status.setText(
+            f"Exported {len(prompts)} prompt(s) and "
+            f"{len(bundle['model_targets'])} model rule(s).")
+
+    def _import_llm_bundle(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import LLM instructions", "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            QMessageBox.critical(self, "Import failed",
+                                 f"Couldn't read that file:\n{exc}")
+            return
+        if not isinstance(data, dict) or "prompts" not in data and "model_targets" not in data:
+            QMessageBox.critical(
+                self, "Import failed",
+                "That doesn't look like an exported instructions file.")
+            return
+        prompts = data.get("prompts") or {}
+        targets = data.get("model_targets") or []
+        if QMessageBox.question(
+            self, "Import LLM instructions",
+            f"Load {len(prompts)} prompt(s) and {len(targets)} model rule(s)?\n\n"
+            "Anything they cover is replaced; everything else is left alone. "
+            "Nothing is written until you press Save.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        ) != QMessageBox.Yes:
+            return
+        loaded_prompts = 0
+        for key, text in prompts.items():
+            if not isinstance(text, str) or "/" not in key:
+                continue
+            preset, _, media = key.partition("/")
+            if preset in PRESETS and media in ("image", "video"):
+                self._pe_pending[(preset, media)] = text
+                loaded_prompts += 1
+        loaded_targets = 0
+        for raw in targets:
+            if not isinstance(raw, dict) or not raw.get("key"):
+                continue
+            try:
+                target = _target_from_dict(raw)
+            except (TypeError, ValueError, KeyError):
+                continue     # skip the bad entry, keep the rest
+            self._mt_working[target.key] = target
+            if self._mt_combo.findData(target.key) < 0:
+                self._mt_combo.addItem(target.label, target.key)
+            loaded_targets += 1
+        self._pe_current = None
+        self._pe_reload()
+        self._mt_reload()
+        self._llm_status.setText(
+            f"Loaded {loaded_prompts} prompt(s) and {loaded_targets} model rule(s) "
+            "\u2014 press Save to keep them.")
 
     def _build_tags_page(self) -> QWidget:
         page = QWidget()
@@ -2224,6 +2783,26 @@ class PreferencesDialog(QDialog):
             text = "~" + text[len(home):]
         return text
 
+    def _tail_dir(self, path: Path) -> str:
+        """The last couple of folders, or the whole path when it's already short.
+
+        Model paths share a long common prefix (~/.cache/huggingface/hub/models--…),
+        so showing it in full pushes the part that actually differs out of view. The
+        complete path stays on the tooltip.
+        """
+        short = self._short_dir(path)
+        parts = [p for p in Path(short).parts if p not in ("/", "\\")]
+        if len(short) <= 40 or len(parts) <= 3:
+            return short
+        # The HF cache buries the model name behind snapshots/<hash>, so taking the
+        # last two segments would show the hash and drop the only useful part.
+        noise = {"snapshots", "blobs", "refs"}
+        meaningful = [p for p in parts
+                      if p.lower() not in noise
+                      and not re.fullmatch(r"[0-9a-f]{8,}", p.lower())]
+        tail = meaningful[-2:] if len(meaningful) >= 2 else parts[-2:]
+        return "\u2026/" + "/".join(tail)
+
     def _settings_with_current_dirs(self):
         """Snapshot of settings reflecting the folder fields as currently typed
         (so Detect uses edits the user hasn't saved yet)."""
@@ -2279,7 +2858,14 @@ class PreferencesDialog(QDialog):
                 texts = {"fits": "Fits", "tight": "Tight", "too_big": "Too big", "unknown": ""}
                 if texts[fit]:
                     badge = f'&nbsp;&nbsp;<span style="color:{colors[fit]}">[{texts[fit]}]</span>'
+        # Audio capability sits next to the fit badge: it's the difference between
+        # a video caption that can quote dialogue and one that can only watch lips.
+        if prof.supports_audio:
+            badge += ('&nbsp;&nbsp;<span style="color:#45B964">'
+                      '[\U0001F50A Audio]</span>')
         lbl.setText(f"<b>{short}</b>{badge}")
+        lbl.setToolTip("Hears the clip's audio \u2014 video captions can include "
+                       "dialogue and sound." if prof.supports_audio else "")
 
     def _open_model_picker(self, task: str) -> None:
         """Model picker. In local (app-managed llama.cpp) mode it lists the
@@ -2296,12 +2882,14 @@ class PreferencesDialog(QDialog):
         badge_colors = {"fits": "#3ddc84", "tight": "#E0A33B", "too_big": "#ff5a52", "unknown": "#9aa4b6"}
         badge_text = {"fits": "Fits", "tight": "Tight", "too_big": "Too big", "unknown": "\u2014"}
         rank = {"fits": 0, "tight": 1, "too_big": 2, "unknown": 3}
-        CONTENT_W = 660
+        # Wider than it was: model names run long, and at 660 they wrapped to two or
+        # three lines, so every row was a different height and the list looked ragged.
+        CONTENT_W = 860
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Choose a model")
-        dlg.resize(720, 560)
-        dlg.setMinimumWidth(700)
+        dlg.resize(CONTENT_W + 60, 620)
+        dlg.setMinimumWidth(CONTENT_W + 40)
         lay = QVBoxLayout(dlg)
 
         if vram:
@@ -2332,16 +2920,28 @@ class PreferencesDialog(QDialog):
         listing.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         lay.addWidget(listing, 1)
 
+        def row_width() -> int:
+            """Rows follow the viewport, never a hard-coded width.
+
+            They used to be pinned at CONTENT_W while the list was narrower, so the
+            last 200-odd pixels hung off the right edge and the Use/HF buttons were
+            clipped into unreadable stubs — visible only on rows carrying an extra
+            chip, which is what made it look like an audio-specific bug.
+            """
+            vp = listing.viewport().width()
+            return max(360, vp - 2) if vp > 10 else CONTENT_W
+
         def add_row(row):
-            row.setFixedWidth(CONTENT_W)
+            width = row_width()
+            row.setFixedWidth(width)
             row.ensurePolished()
             h = row.sizeHint().height()
             lay_ = row.layout()
             if lay_ is not None and lay_.hasHeightForWidth():
-                h = max(h, lay_.heightForWidth(CONTENT_W))
+                h = max(h, lay_.heightForWidth(width))
             h = max(h, 42)            # never shorter than a Use/HF button row
             item = QListWidgetItem(listing)
-            item.setSizeHint(QSize(CONTENT_W, h))
+            item.setSizeHint(QSize(width, h))
             listing.addItem(item)
             listing.setItemWidget(item, row)
 
@@ -2351,7 +2951,7 @@ class PreferencesDialog(QDialog):
             hdr.setContentsMargins(8, 10, 8, 2)
             item = QListWidgetItem(listing)
             item.setFlags(Qt.NoItemFlags)
-            item.setSizeHint(QSize(CONTENT_W, hdr.sizeHint().height() + 8))
+            item.setSizeHint(QSize(row_width(), hdr.sizeHint().height() + 8))
             listing.addItem(item)
             listing.setItemWidget(item, hdr)
 
@@ -2360,30 +2960,86 @@ class PreferencesDialog(QDialog):
             e.setObjectName("Hint")
             e.setWordWrap(True)
             e.setContentsMargins(8, 2, 8, 6)
-            e.setFixedWidth(CONTENT_W - 4)
-            h = e.heightForWidth(CONTENT_W - 4)
+            e.setFixedWidth(row_width() - 4)
+            h = e.heightForWidth(row_width() - 4)
             if h <= 0:
                 h = e.sizeHint().height()
             item = QListWidgetItem(listing)
             item.setFlags(Qt.NoItemFlags)
-            item.setSizeHint(QSize(CONTENT_W, h + 4))
+            item.setSizeHint(QSize(row_width(), h + 4))
             listing.addItem(item)
             listing.setItemWidget(item, e)
 
-        def make_profile_row(p, *, allow_use, show_link=False):
+        def elided(text: str, width: int, tooltip: str | None = None) -> QLabel:
+            """One-line label that shortens with an ellipsis instead of wrapping.
+
+            Wrapping was what made the rows jump around: a long name became two or
+            three lines and every row ended up a different height. The full text
+            stays available on hover.
+            """
+            label = QLabel()
+            label.setWordWrap(False)
+            label.setMinimumWidth(0)
+            label.setMaximumWidth(width)
+            # Ignored horizontally so the label gives up space instead of forcing
+            # the buttons beside it below their own text: an elided label's size
+            # hint is as wide as the text it holds, which squeezed "Use" and "HF"
+            # into unreadable stubs on rows carrying an extra chip.
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            metrics = QFontMetrics(label.font())
+            label.setText(metrics.elidedText(text, Qt.ElideRight, width - 6))
+            if metrics.horizontalAdvance(text) > width - 6 or tooltip:
+                label.setToolTip(tooltip or text)
+            return label
+
+        def make_profile_row(p, *, allow_use, show_link=False, downloaded=False):
             name = p.label.split(":", 1)[1].strip() if p.label.lower().startswith("download:") else p.label
+            # Two columns: everything descriptive on the left, the action buttons in
+            # their own fixed column on the right. Previously the buttons shared a
+            # layout with the title and chips while a full-width note sat beneath —
+            # so a long note widened the row past the viewport and squeezed the
+            # buttons. In a separate column nothing on the left can reach them.
             row = QWidget()
-            outer = QVBoxLayout(row)
-            outer.setContentsMargins(8, 6, 8, 6)
+            shell = QHBoxLayout(row)
+            shell.setContentsMargins(8, 6, 8, 6)
+            shell.setSpacing(8)
+            left = QWidget()
+            outer = QVBoxLayout(left)
+            outer.setContentsMargins(0, 0, 0, 0)
             outer.setSpacing(2)
+            left.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            shell.addWidget(left, 1)
+            actions = QHBoxLayout()
+            actions.setContentsMargins(0, 0, 0, 0)
+            actions.setSpacing(6)
+            shell.addLayout(actions, 0)
             top = QHBoxLayout()
             top.setContentsMargins(0, 0, 0, 0)
             top.setSpacing(8)
             star = "\u2605 " if p.id == rec_id else ""
-            title = QLabel(f"{star}{name}")
-            title.setWordWrap(True)
-            title.setMaximumWidth(300)
+            title_width = 430 - (96 if p.supports_audio else 0)
+            title = elided(f"{star}{name}", title_width, tooltip=p.note or None)
+            title.setStyleSheet("font-weight:600;")
             top.addWidget(title, 1)
+            if downloaded:
+                have = QLabel("On disk")
+                have.setToolTip("Already in one of your model folders \u2014 selecting "
+                                "this won't download anything.")
+                have.setStyleSheet(
+                    "color:#3ddc84;border:1px solid #3ddc84;border-radius:6px;"
+                    "padding:1px 8px;font-weight:600;")
+                top.addWidget(have, 0)
+            if p.supports_audio:
+                # Audio capability changes what a video caption can contain, so it
+                # belongs beside the size/fit chips rather than buried in the note.
+                audio_chip = QLabel("\U0001F50A Audio")
+                audio_chip.setToolTip(
+                    "Hears the clip's audio, so captions can include spoken "
+                    "dialogue, music and ambient sound.")
+                audio_chip.setStyleSheet(
+                    "color:#45B964;border:1px solid #45B964;border-radius:6px;"
+                    "padding:1px 8px;font-weight:600;")
+                top.addWidget(audio_chip, 0)
             if p.kind == "hf" and p.vram_gb > 0:
                 tier = model_size_tier(p.vram_gb)
                 chip = QLabel(f"{tier} \u00b7 ~{p.vram_gb:.0f}GB")
@@ -2399,27 +3055,31 @@ class PreferencesDialog(QDialog):
                     top.addWidget(badge, 0)
             if allow_use:
                 use_btn = QPushButton("Use")
+                use_btn.setMinimumWidth(58)
+                use_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
                 use_btn.setCursor(Qt.PointingHandCursor)
                 use_btn.clicked.connect(lambda _c, prof=p: self._pick_model(task, prof, dlg))
-                top.addWidget(use_btn, 0)
+                actions.addWidget(use_btn, 0)
             if p.kind == "hf" and p.hf_repo and not show_link:
                 hf_btn = QPushButton("HF")
+                hf_btn.setMinimumWidth(46)
+                hf_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
                 hf_btn.setToolTip(f"https://huggingface.co/{p.hf_repo}")
                 hf_btn.clicked.connect(lambda _c, repo=p.hf_repo: webbrowser.open(f"https://huggingface.co/{repo}"))
-                top.addWidget(hf_btn, 0)
+                actions.addWidget(hf_btn, 0)
             outer.addLayout(top)
             if show_link and p.kind == "hf" and p.hf_repo:
                 link = QLabel(f'<a href="https://huggingface.co/{p.hf_repo}" style="color:#6cb6ff;">huggingface.co/{p.hf_repo}</a>')
                 link.setOpenExternalLinks(True)
                 link.setObjectName("Hint")
-                link.setMaximumWidth(CONTENT_W - 20)
+                link.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
                 outer.addWidget(link)
             if p.note:
-                note = QLabel(p.note)
+                # One line, elided: a wrapping note made rows 42, 54 or 70px tall
+                # depending on how much its author wrote. Full text on hover.
+                note = elided(p.note, CONTENT_W - 40, tooltip=p.note)
                 note.setObjectName("Hint")
-                note.setWordWrap(True)
                 note.setStyleSheet("color:#A78BFA;")
-                note.setMaximumWidth(CONTENT_W - 20)
                 outer.addWidget(note)
             return row
 
@@ -2431,13 +3091,13 @@ class PreferencesDialog(QDialog):
             col = QVBoxLayout()
             col.setContentsMargins(0, 0, 0, 0)
             col.setSpacing(0)
-            fname = QLabel(path.name)
-            fname.setWordWrap(True)
-            fname.setMaximumWidth(CONTENT_W - 250)
-            where = QLabel(self._short_dir(path.parent))
+            fname = elided(path.name, CONTENT_W - 260)
+            fname.setStyleSheet("font-weight:600;")
+            # Just the last folder or two: the leading path is nearly always the
+            # same across a folder's models and crowds out the part that differs.
+            where = elided(self._tail_dir(path.parent), CONTENT_W - 260,
+                           tooltip=str(path.parent))
             where.setObjectName("Hint")
-            where.setWordWrap(True)
-            where.setMaximumWidth(CONTENT_W - 250)
             col.addWidget(fname)
             col.addWidget(where)
             rl.addLayout(col, 1)
@@ -2483,21 +3143,46 @@ class PreferencesDialog(QDialog):
             # 1) Models already on disk — the usual pick when running local llama.cpp
             add_section("Downloaded in your folders")
             if not found:
-                add_hint("No downloaded GGUF files found. Add folders on the Models page "
-                         "(Browse\u2026 / Detect model folders), or download one below.")
+                # Name the folders actually searched. "Nothing found" is unactionable
+                # when a download went somewhere the scan doesn't look — usually
+                # because Model download location is set to the HF cache, or the
+                # models folder was edited but not saved.
+                roots = model_search_roots(self._settings_with_current_dirs())
+                listed = "\n".join(f"\u2022 {self._short_dir(r)}"
+                                    for r in roots[:6] if r.exists())
+                add_hint("No GGUF files found. Searched:\n"
+                         + (listed or "(none of the configured folders exist)")
+                         + "\n\nDownloads go to the folder set by 'Model download "
+                           "location' on this page \u2014 if that's the Hugging Face "
+                           "cache, files land there rather than your models folder.")
             else:
                 for path in found:
                     add_row(make_detected_row(path))
-            # 2) Custom / existing-server options (secondary)
-            others = [p for p in profiles_for_task(task)
-                      if p.kind in ("server", "custom_hf", "custom_local")]
-            if others:
-                add_section("Custom & server options")
-                for p in others:
-                    add_row(make_profile_row(p, allow_use=True))
-            # 3) Recommended models to download (heaviest action) at the bottom
-            add_section("Recommended to download")
+            # No "Custom & server options" here. The server aliases only mean
+            # something against an external server — in local mode the app launches
+            # its own, and selecting one used to be silently reset when settings were
+            # applied. Custom local paths are already covered by the detected list
+            # and the Browse… field on the Models page, and the custom-HF form is a
+            # footer button rather than a row pretending to be a model.
+            # A recommended model you've already fetched shouldn't keep sitting under
+            # "download" — that's what makes it look like the download went nowhere.
+            settings_now = self._settings_with_current_dirs()
+            on_disk, to_get = [], []
             for p in hf_profiles:
+                have = False
+                try:
+                    first = _split_filenames(p.model_filename)
+                    have = bool(first) and locate_existing_model_file(
+                        settings_now, p.hf_repo, first[0]) is not None
+                except Exception:
+                    have = False
+                (on_disk if have else to_get).append(p)
+            if on_disk:
+                add_section("Already downloaded")
+                for p in on_disk:
+                    add_row(make_profile_row(p, allow_use=True, downloaded=True))
+            add_section("Recommended to download")
+            for p in to_get:
                 add_row(make_profile_row(p, allow_use=True))
         else:
             add_section("Detected models")
@@ -2507,13 +3192,53 @@ class PreferencesDialog(QDialog):
             else:
                 for path in found:
                     add_row(make_detected_row(path))
+            # Server aliases belong here, not in local mode: they name a model the
+            # external server already has loaded.
+            aliases = [p for p in profiles_for_task(task) if p.kind == "server"]
+            if aliases:
+                add_section("Name your server's model")
+                add_hint("Use one of these if your server already has the model "
+                         "loaded under that name.")
+                for p in aliases:
+                    add_row(make_profile_row(p, allow_use=True))
             add_section("Recommended models")
             add_hint("Download and configure these in your external server, then select the "
                      "model there or enter its name. Links go to Hugging Face.")
             for p in hf_profiles:
                 add_row(make_profile_row(p, allow_use=False, show_link=True))
 
+        def _sync_widths():
+            width = row_width()
+            for i in range(listing.count()):
+                item = listing.item(i)
+                widget = listing.itemWidget(item)
+                if widget is not None:
+                    widget.setFixedWidth(width)
+                item.setSizeHint(QSize(width, item.sizeHint().height()))
+
+        class _WidthSync(QObject):
+            def eventFilter(self, obj, event):
+                if event.type() == QEvent.Resize:
+                    _sync_widths()
+                return False
+
+        sync = _WidthSync(dlg)
+        listing.viewport().installEventFilter(sync)
+
         box = QDialogButtonBox(QDialogButtonBox.Close)
+        # The custom-HF path is a form, not a model, so it's a button rather than a
+        # row sitting among entries that have sizes and fit badges.
+        rescan = QPushButton("Rescan folders")
+        rescan.setToolTip("Look again for GGUF files — use after a download finishes")
+        rescan.clicked.connect(lambda: (dlg.accept(), self._open_model_picker(task)))
+        box.addButton(rescan, QDialogButtonBox.ResetRole)
+        custom = [p for p in profiles_for_task(task) if p.kind == "custom_hf"]
+        if custom:
+            hf_btn = QPushButton("Use a Hugging Face repo\u2026")
+            hf_btn.setToolTip("Point at any repo and filename on Hugging Face")
+            hf_btn.clicked.connect(
+                lambda _c, prof=custom[0]: self._pick_model(task, prof, dlg))
+            box.addButton(hf_btn, QDialogButtonBox.ActionRole)
         box.rejected.connect(dlg.reject)
         box.accepted.connect(dlg.accept)
         lay.addWidget(box)
@@ -2712,7 +3437,7 @@ class PreferencesDialog(QDialog):
             combo.addItems(list(self._custom_presets.keys()))
         # Remember the last server the user picked; otherwise reflect whichever
         # preset matches the saved settings, so the dropdown isn't always blank.
-        target = QSettings("IdeogramCaptioner", "QtApp").value("last_server_preset")
+        target = QSettings("FantasticCaptioningKit", "QtApp").value("last_server_preset")
         if not (isinstance(target, str) and target in self._all_presets()):
             target = self._preset_matching_settings()
         idx = combo.findText(target) if target else -1
@@ -2730,7 +3455,7 @@ class PreferencesDialog(QDialog):
         preset = self._all_presets().get(name)
         if not preset:
             return  # the "Select a server…" placeholder or a separator
-        QSettings("IdeogramCaptioner", "QtApp").setValue("last_server_preset", name)
+        QSettings("FantasticCaptioningKit", "QtApp").setValue("last_server_preset", name)
         base_url, api_key, start_mode = preset
         if "base_url" in self.widgets:
             self.widgets["base_url"][1].setText(base_url)
@@ -2825,7 +3550,7 @@ class PreferencesDialog(QDialog):
         """Latest build number from the background update check, if any (Stage 4b
         populates this). None until then — age-based 'recommended' still works."""
         try:
-            val = QSettings("IdeogramCaptioner", "QtApp").value("llama_latest_build")
+            val = QSettings("FantasticCaptioningKit", "QtApp").value("llama_latest_build")
             return int(val) if val is not None else None
         except (TypeError, ValueError):
             return None
@@ -2842,7 +3567,6 @@ class PreferencesDialog(QDialog):
             label.setText("Not installed — fetch a prebuilt build for your system.")
             label.setStyleSheet("color: #9aa3ad;")
             button.setText("Get llama.cpp")
-            button.setProperty("wants_latest", False)
             return
         build = f"b{record.build}" if record.build else "?"
         age = state["age_days"]
@@ -2861,7 +3585,6 @@ class PreferencesDialog(QDialog):
             label.setText(base)
             label.setStyleSheet("color: #9aa3ad;")
         button.setText("Update")
-        button.setProperty("wants_latest", True)
 
     def _refresh_llama_path_placeholder(self) -> None:
         """Show the resolved binary as grey placeholder text so the path is
@@ -2977,11 +3700,10 @@ class PreferencesDialog(QDialog):
 
     def _acquire_llama(self) -> None:
         button = self._llama_action_btn
-        latest = bool(button.property("wants_latest"))
         button.setEnabled(False)
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            plan = plan_llama_acquisition(self._live_settings(), latest=latest)
+            plan = plan_llama_acquisition(self._live_settings())
         finally:
             QApplication.restoreOverrideCursor()
         if plan is None:
@@ -3098,6 +3820,12 @@ class PreferencesDialog(QDialog):
             QMessageBox.critical(self, "Could not open profiles file", str(exc))
 
     def _collect(self) -> None:
+        # Prompts and frame rules live outside the settings dataclass, so they
+        # commit here rather than through _make_field.
+        if hasattr(self, "_pe_pending"):
+            self._pe_commit()
+        if hasattr(self, "_mt_working"):
+            self._mt_commit()
         kwargs = {}
         for key, (kind, w) in self.widgets.items():
             if kind == "text":
@@ -3184,6 +3912,23 @@ class FilmstripDelegate(QStyledItemDelegate):
         painter.setRenderHint(QPainter.Antialiasing, True)
         painter.setRenderHint(QPainter.TextAntialiasing, True)
 
+        if bool(index.data(SEPARATOR_ROLE)):
+            # The divider: everything past it is out of the dataset.
+            painter.setPen(QPen(QColor(t.border), 1, Qt.DashLine))
+            x = rect.center().x()
+            painter.drawLine(QPointF(x, rect.top() + 6), QPointF(x, rect.bottom() - 6))
+            painter.setPen(QColor(t.text_secondary))
+            font = painter.font()
+            font.setPointSizeF(max(7.0, font.pointSizeF() - 2))
+            painter.setFont(font)
+            painter.drawText(rect, int(Qt.AlignCenter), "bypassed")
+            painter.restore()
+            return
+        # Bypassed files are dimmed: still visible and still individually
+        # captionable, but visibly not part of the dataset.
+        if bool(index.data(BYPASS_ROLE)):
+            painter.setOpacity(0.42)
+
         # icon, centered near the top of the cell
         isz = option.decorationSize
         icon = index.data(Qt.DecorationRole)
@@ -3202,6 +3947,24 @@ class FilmstripDelegate(QStyledItemDelegate):
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
             painter.drawRoundedRect(QRectF(icon_rect).adjusted(-1, -1, 1, 1), 6, 6)
+
+        # video duration badge: dark pill at the thumbnail's bottom-right, so clips
+        # are recognisable at a glance without a play overlay cluttering the strip.
+        duration = index.data(DURATION_ROLE)
+        if duration and icon_rect is not None:
+            bfont = QFont(option.font)
+            bfont.setPointSizeF(max(6.5, option.font.pointSizeF() - 1.5))
+            bfm = QFontMetrics(bfont)
+            bw = bfm.horizontalAdvance(str(duration)) + 8
+            bh = bfm.height() + 2
+            brect = QRectF(icon_rect.right() - bw - 2, icon_rect.bottom() - bh - 2, bw, bh)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 190))
+            painter.drawRoundedRect(brect, 4, 4)
+            painter.setFont(bfont)
+            painter.setPen(QColor(235, 238, 241))
+            painter.drawText(brect, Qt.AlignCenter, str(duration))
+            painter.setFont(option.font)
 
         # filename below the icon, single elided line with a drop shadow.
         # selected (accent) wins over unsaved (amber); otherwise muted secondary.
@@ -3277,6 +4040,35 @@ class FilmstripDelegate(QStyledItemDelegate):
             d = r * 0.7
             painter.setPen(QPen(QColor(t.surface_1), 1.6, Qt.SolidLine, Qt.RoundCap))
             painter.drawLine(QPointF(cx - d, cy + d), QPointF(cx + d, cy - d))
+        # unapplied-edit marker: amber scissors-ish bracket at the BOTTOM-LEFT of
+        # the poster. Distinct from the caption "unsaved" dot because it's a
+        # different kind of unsaved: pixels, not text.
+        if icon_rect is not None and bool(index.data(VIDEO_EDIT_ROLE)):
+            r = 5.0
+            cx = max(float(icon_rect.left()) - 1.0, float(rect.left()) + (r + 2))
+            cy = min(float(icon_rect.bottom()) + 1.0, float(rect.bottom()) - (r + 2))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(t.surface_1))
+            painter.drawEllipse(QPointF(cx, cy), r + 2, r + 2)
+            painter.setPen(QPen(QColor(t.warning), 2.0))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawArc(QRectF(cx - r, cy - r, r * 2, r * 2), 0, 270 * 16)
+        # spec marker: amber triangle on the RIGHT edge — "this clip won't train
+        # as-is on the selected model". A triangle rather than a dot so it reads as
+        # a warning distinct from the round status dots.
+        if icon_rect is not None and bool(index.data(SPEC_ROLE)):
+            r = 5.5
+            cx = min(float(icon_rect.right()) + 1.0, float(rect.right()) - (r + 2))
+            cy = float(icon_rect.center().y())
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(t.surface_1))
+            painter.drawEllipse(QPointF(cx, cy), r + 2, r + 2)
+            tri = QPolygonF([QPointF(cx, cy - r), QPointF(cx + r, cy + r * 0.8),
+                             QPointF(cx - r, cy + r * 0.8)])
+            painter.setBrush(QColor(SPEC_COLOR))
+            painter.drawPolygon(tri)
+            painter.setPen(QPen(QColor(t.surface_1), 1.4, Qt.SolidLine, Qt.RoundCap))
+            painter.drawLine(QPointF(cx, cy - r * 0.25), QPointF(cx, cy + r * 0.3))
         if icon_rect is not None and bool(index.data(REVIEW_ROLE)):
             r = 5.0
             ring = 2.0
@@ -3578,6 +4370,2191 @@ class TagListPopup(QWidget):
         self.show()
 
 
+class _FfmpegInstallThread(QThread):
+    """Managed ffmpeg download off the UI thread, with status text for the dialog."""
+    status = Signal(str)
+    finished_with = Signal(bool, str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ok = False
+        self.message = ""
+
+    def run(self) -> None:
+        try:
+            install_ffmpeg(progress=self.status.emit)
+        except Exception as exc:
+            self.ok, self.message = False, str(exc)
+        else:
+            self.ok, self.message = True, ""
+        self.finished_with.emit(self.ok, self.message)
+
+
+class _VideoEditThread(QThread):
+    """Runs the ffmpeg re-encode off the UI thread, writing to a temp file and
+    swapping it in only on success so a failure can't leave a truncated clip."""
+    finished_with = Signal(bool, str)
+
+    def __init__(self, path: Path, plan) -> None:
+        super().__init__()
+        self.path = Path(path)
+        self.plan = plan
+        # Read directly after wait() rather than via the signal: a queued signal is
+        # only delivered inside processEvents(), so a thread that finishes before
+        # the caller's wait loop starts would never report its result at all.
+        self.ok = False
+        self.message = ""
+
+    def _finish(self, ok: bool, message: str) -> None:
+        self.ok, self.message = ok, message
+        self.finished_with.emit(ok, message)
+
+    def run(self) -> None:
+        tmp = self.path.with_name(f".{self.path.stem}.edit{self.path.suffix}")
+        try:
+            ok, message = run_video_edit(self.path, tmp, self.plan)
+            if not ok:
+                tmp.unlink(missing_ok=True)
+                self._finish(False, message)
+                return
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            tmp.unlink(missing_ok=True)
+            self._finish(False, str(exc))
+            return
+        self._finish(True, "")
+
+
+class TrimBar(QWidget):
+    """Scrub bar with draggable in/out handles.
+
+    A QSlider can only carry one value, and trimming needs three (playhead, in,
+    out) on the same timeline, so this paints its own track: the kept span is
+    highlighted, the discarded ends are dimmed, and the handles are grabbable.
+    """
+    positionRequested = Signal(int)     # ms
+    trimChanged = Signal(int, int)      # in_ms, out_ms
+    muteChanged = Signal(int, int)      # mute in_ms, out_ms
+    HANDLE = 9
+    GRIP = 7          # half-width of the playhead square's grab zone
+
+    def __init__(self, theme: "Theme", parent=None) -> None:
+        super().__init__(parent)
+        self.theme = theme
+        self.setMinimumHeight(34)
+        self._peaks: list[float] = []
+        # Optional (in_ms, out_ms, which) -> (in_ms, out_ms) hook that pulls a drag
+        # onto a legal length. Set by the stage from the selected model target.
+        self._snap = None
+        self.setMouseTracking(True)
+        self._duration = 0
+        self._position = 0
+        self._in = 0
+        self._out = 0
+        self._drag: str | None = None      # 'in' | 'out' | 'window' | 'playhead' | 'seek'
+        self._grab_ms = 0
+        self._grab_in = 0
+        # Optional second range, drawn as a red band under the trim track: the span
+        # whose audio will be silenced. Kept separate from the trim because it
+        # answers a different question — the trim decides which frames ship, the
+        # mute decides which of them are silent.
+        self._mute_visible = False
+        self._mute_in = 0
+        self._mute_out = 0
+        self._peaks: list[float] = []
+
+    # ---- state ----
+
+    def set_duration(self, ms: int) -> None:
+        self._duration = max(0, int(ms))
+        if self._out <= 0 or self._out > self._duration:
+            self._in, self._out = 0, self._duration
+            self.trimChanged.emit(self._in, self._out)
+        self.update()
+
+    def set_position(self, ms: int) -> None:
+        self._position = max(0, min(self._duration, int(ms)))
+        self.update()
+
+    def set_trim(self, in_ms: int, out_ms: int) -> None:
+        in_ms = max(0, min(self._duration, int(in_ms)))
+        out_ms = max(in_ms, min(self._duration, int(out_ms)))
+        if (in_ms, out_ms) != (self._in, self._out):
+            self._in, self._out = in_ms, out_ms
+            self.trimChanged.emit(self._in, self._out)
+        self.update()
+
+    def trim(self) -> tuple[int, int]:
+        return self._in, self._out
+
+    def position(self) -> int:
+        return self._position
+
+    # ---- mute range ----
+
+    def set_snap(self, fn) -> None:
+        """Install (or clear, with None) the length-snapping hook."""
+        self._snap = fn
+
+    def _snapped(self, in_ms: int, out_ms: int, which: str) -> tuple[int, int]:
+        if self._snap is None:
+            return in_ms, out_ms
+        try:
+            return self._snap(in_ms, out_ms, which)
+        except Exception:
+            return in_ms, out_ms
+
+    def set_peaks(self, peaks: list[float]) -> None:
+        """Waveform for the track background. Placing a mute on a word boundary by
+        eye is guesswork without it."""
+        had = bool(self._peaks)
+        self._peaks = list(peaks or [])
+        if bool(self._peaks) != had:
+            self._resize_for_content()
+        self.update()
+
+    def _resize_for_content(self) -> None:
+        # One track either way now — turning mute on no longer changes the height.
+        base = 28 if self._peaks else 8
+        self.setMinimumHeight(base + 20)
+        self.updateGeometry()
+
+    def set_mute_visible(self, on: bool) -> None:
+        self._mute_visible = bool(on)
+        if on and self._mute_out <= self._mute_in:
+            # Default to the middle third of the current selection: a visible band
+            # you can drag, rather than a zero-width one you have to find.
+            span = self._out - self._in
+            self._mute_in = self._in + span // 3
+            self._mute_out = self._in + 2 * span // 3
+        self._resize_for_content()
+        self.update()
+
+    def mute_visible(self) -> bool:
+        return self._mute_visible
+
+    def set_mute_range(self, in_ms: int, out_ms: int) -> None:
+        in_ms = max(0, min(self._duration, int(in_ms)))
+        out_ms = max(in_ms, min(self._duration, int(out_ms)))
+        self._mute_in, self._mute_out = in_ms, out_ms
+        self.muteChanged.emit(in_ms, out_ms)
+        self.update()
+
+    def mute_range(self) -> tuple[int, int]:
+        return self._mute_in, self._mute_out
+
+    def _mute_band(self) -> QRectF:
+        """The muted span, drawn on the same track as everything else.
+
+        It used to be a separate strip underneath, which had to be tall enough to
+        grab and kept fighting the waveform for height. Red brackets on the one
+        timeline are simpler and always the full height of the track.
+        """
+        track = self._track_rect()
+        return QRectF(track.left(), track.top(), track.width(), track.height())
+
+    def duration(self) -> int:
+        return self._duration
+
+    # ---- geometry ----
+
+    def _track_rect(self) -> QRectF:
+        # The bar grows a real track when there's a waveform to show: an 8px strip
+        # renders peaks 4px tall, which is present but useless for placing a cut on
+        # a word boundary.
+        height = 28.0 if self._peaks else 8.0
+        top = max(4.0, (self.height() - height) / 2)
+        return QRectF(self.HANDLE, top,
+                      max(1, self.width() - 2 * self.HANDLE), height)
+
+    def _x_for(self, ms: int) -> float:
+        track = self._track_rect()
+        if self._duration <= 0:
+            return track.left()
+        return track.left() + track.width() * (ms / self._duration)
+
+    def _ms_for(self, x: float) -> int:
+        track = self._track_rect()
+        if track.width() <= 0 or self._duration <= 0:
+            return 0
+        frac = (x - track.left()) / track.width()
+        return int(max(0.0, min(1.0, frac)) * self._duration)
+
+    # ---- interaction ----
+
+    def mousePressEvent(self, event) -> None:
+        x = event.position().x()
+        y = event.position().y()
+        if self._mute_visible:
+            # Both ranges share one track now, so the mute brackets are tested
+            # before the trim handles while mute mode is on — that's the range
+            # you're there to adjust.
+            if abs(x - self._x_for(self._mute_in)) <= self.HANDLE:
+                self._drag = "mute_in"
+                self.update()
+                return
+            if abs(x - self._x_for(self._mute_out)) <= self.HANDLE:
+                self._drag = "mute_out"
+                self.update()
+                return
+            if self._x_for(self._mute_in) < x < self._x_for(self._mute_out):
+                self._drag = "mute_window"
+                self._grab_ms = self._ms_for(x)
+                self._grab_in = self._mute_in
+                self.update()
+                return
+        # The playhead grip is drawn on top, so it's tested first — otherwise the
+        # in-handle sitting at the same position (as it does on every fresh clip,
+        # both at 0) swallows every attempt to scrub. Its target is deliberately
+        # tight: grab the square to move the playhead, the wider bar to move a
+        # bracket.
+        if abs(x - self._x_for(self._position)) <= self.GRIP:
+            self._drag = "playhead"
+            self.positionRequested.emit(self._ms_for(x))
+            self.setCursor(Qt.SizeHorCursor)
+            return
+        near_in = abs(x - self._x_for(self._in)) <= self.HANDLE + 2
+        near_out = abs(x - self._x_for(self._out)) <= self.HANDLE + 2
+        if near_in and near_out:
+            # overlapping handles: pick whichever side the click leans towards
+            self._drag = "in" if x <= self._x_for(self._in) else "out"
+        elif near_in:
+            self._drag = "in"
+        elif near_out:
+            self._drag = "out"
+        elif self._x_for(self._in) < x < self._x_for(self._out):
+            # Grab inside the selection to slide the whole window. This is what
+            # makes "Fit to target" usable: the fitted length is legal, and moving
+            # it preserves that length, so the user picks *which* seconds to keep
+            # rather than being stuck with the start of the clip.
+            self._drag = "window"
+            self._grab_ms = self._ms_for(x)
+            self._grab_in = self._in
+        else:
+            self._drag = "seek"
+            self.positionRequested.emit(self._ms_for(x))
+        self.update()
+
+    def mouseMoveEvent(self, event) -> None:
+        x = event.position().x()
+        if self._drag == "in":
+            self.set_trim(*self._snapped(
+                min(self._ms_for(x), self._out), self._out, "in"))
+        elif self._drag == "out":
+            self.set_trim(*self._snapped(
+                self._in, max(self._ms_for(x), self._in), "out"))
+        elif self._drag == "window":
+            span = self._out - self._in
+            new_in = self._grab_in + (self._ms_for(x) - self._grab_ms)
+            new_in = max(0, min(new_in, self._duration - span))
+            self.set_trim(new_in, new_in + span)
+            self.positionRequested.emit(new_in)
+        elif self._drag == "mute_in":
+            self.set_mute_range(min(self._ms_for(x), self._mute_out), self._mute_out)
+        elif self._drag == "mute_out":
+            self.set_mute_range(self._mute_in, max(self._ms_for(x), self._mute_in))
+        elif self._drag == "mute_window":
+            span = self._mute_out - self._mute_in
+            new_in = self._grab_in + (self._ms_for(x) - self._grab_ms)
+            new_in = max(0, min(new_in, self._duration - span))
+            self.set_mute_range(new_in, new_in + span)
+        elif self._drag in ("seek", "playhead"):
+            self.positionRequested.emit(self._ms_for(x))
+        else:
+            on_playhead = abs(x - self._x_for(self._position)) <= self.GRIP
+            near_handle = (not on_playhead
+                           and (abs(x - self._x_for(self._in)) <= self.HANDLE + 2
+                                or abs(x - self._x_for(self._out)) <= self.HANDLE + 2))
+            inside = self._x_for(self._in) < x < self._x_for(self._out)
+            self.setCursor(Qt.SizeHorCursor if near_handle
+                           else Qt.SizeHorCursor if on_playhead
+                           else Qt.OpenHandCursor if inside
+                           else Qt.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._drag == "window":
+            self.positionRequested.emit(self._in)
+        if self._drag in ("in", "out"):
+            # park the playhead on the handle just moved, so you see the edit frame
+            self.positionRequested.emit(self._in if self._drag == "in" else self._out)
+        self._drag = None
+
+    # ---- painting ----
+
+    def paintEvent(self, event) -> None:
+        t = self.theme
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        track = self._track_rect()
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(t.surface_3))
+        painter.drawRoundedRect(track, 4, 4)
+        if self._duration > 0:
+            keep = QRectF(self._x_for(self._in), track.top(),
+                          max(1.0, self._x_for(self._out) - self._x_for(self._in)),
+                          track.height())
+            painter.setBrush(QColor(t.accent))
+            painter.drawRoundedRect(keep, 4, 4)
+        if self._peaks:
+            # Painted AFTER the selection fill: drawing it first meant the accent
+            # rect covered the whole waveform wherever the clip was selected,
+            # which is normally all of it.
+            painter.save()
+            path = QPainterPath()
+            path.addRoundedRect(track, 4, 4)
+            painter.setClipPath(path)
+            mid = track.center().y()
+            half = track.height() / 2
+            step = track.width() / len(self._peaks)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(t.surface_0))
+            for i, peak in enumerate(self._peaks):
+                h = max(0.6, peak * half)
+                painter.drawRect(QRectF(track.left() + i * step, mid - h,
+                                        max(1.0, step - 0.5), h * 2))
+            painter.restore()
+            # Playhead: a stem plus a square grip, so it reads as draggable and
+            # gives a big enough target to grab.
+            px = self._x_for(self._position)
+            painter.setPen(QPen(QColor(t.text_primary), 2))
+            painter.drawLine(QPointF(px, track.top() - 8), QPointF(px, track.bottom() + 8))
+            grip = QRectF(px - 6, track.center().y() - 6, 12, 12)
+            painter.setPen(QPen(QColor(t.surface_0), 1))
+            painter.setBrush(QColor(t.text_primary))
+            painter.drawRoundedRect(grip, 2, 2)
+            # grip marks: signal that the selection itself can be dragged
+            if keep.width() > 26:
+                cx, cy = keep.center().x(), keep.center().y()
+                painter.setPen(QPen(QColor(t.surface_0), 1))
+                for dx in (-4, 0, 4):
+                    painter.drawLine(QPointF(cx + dx, cy - 2), QPointF(cx + dx, cy + 2))
+            if self._mute_visible:
+                # A red wash over the span plus a bracket at each end, on the same
+                # track as the waveform — so you can see which sound you're cutting.
+                mx1, mx2 = self._x_for(self._mute_in), self._x_for(self._mute_out)
+                wash = QColor(MUTE_COLOR)
+                wash.setAlpha(90)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(wash)
+                painter.drawRect(QRectF(mx1, track.top(),
+                                        max(1.0, mx2 - mx1), track.height()))
+                pen = QPen(QColor(MUTE_COLOR), 2.5, Qt.SolidLine, Qt.SquareCap)
+                painter.setPen(pen)
+                painter.setBrush(Qt.NoBrush)
+                top_y, bot_y = track.top() - 3, track.bottom() + 3
+                arm = 5.0
+                # "[" at the start, "]" at the end, so the direction is readable.
+                for hx, direction in ((mx1, 1), (mx2, -1)):
+                    painter.drawLine(QPointF(hx, top_y), QPointF(hx, bot_y))
+                    painter.drawLine(QPointF(hx, top_y),
+                                     QPointF(hx + arm * direction, top_y))
+                    painter.drawLine(QPointF(hx, bot_y),
+                                     QPointF(hx + arm * direction, bot_y))
+            # handles
+            painter.setPen(QPen(QColor(t.surface_0), 1))
+            painter.setBrush(QColor(t.text_primary))
+            for ms in (self._in, self._out):
+                hx = self._x_for(ms)
+                painter.drawRoundedRect(
+                    QRectF(hx - 3, track.top() - 6, 6, track.height() + 12), 2, 2)
+        painter.end()
+
+
+class VideoStage(QWidget):
+    """Inline video player for the centre stage — the video equivalent of the image
+    canvas, not a popup. Transport sits directly under the picture so playback,
+    scrubbing and (from the next increment) trim handles are all in the main window.
+
+    Qt 6.5+ ships an FFmpeg-based multimedia backend with PySide6, so this needs no
+    system codecs. If QtMultimedia is missing we fall back to the poster frame and
+    say so, rather than leaving a dead panel.
+    """
+
+    def __init__(self, controller: "MainWindow") -> None:
+        super().__init__(controller)
+        self.controller = controller
+        self.setObjectName("Stage")
+        t = controller.theme
+        self._player = None
+        self._path: Path | None = None
+        self._duration_ms = 0
+        self._info: "VideoInfo | None" = None
+        self._crop_item: CropRectItem | None = None
+        self._rotation = 0
+        # Keyed by path so switching clips keeps each one's in-progress edit.
+        self._pending_edits: dict[str, dict] = {}
+        self._audio = None
+        self._base_volume = 1.0
+        self._peaks_cache: dict[str, list] = {}
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self._surface = None
+        self._fallback = QLabel("")
+        self._fallback.setAlignment(Qt.AlignCenter)
+        self._fallback.setVisible(False)
+        try:
+            from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+            from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
+        except ImportError:
+            self._available = False
+        else:
+            self._available = True
+            # The video renders into a QGraphicsScene rather than a plain
+            # QVideoWidget so the existing CropRectItem can be laid over it — video
+            # crop then behaves exactly like image crop instead of being a second,
+            # parallel implementation.
+            self._scene = QGraphicsScene(self)
+            self._video_item = QGraphicsVideoItem()
+            self._scene.addItem(self._video_item)
+            self._surface = QGraphicsView(self._scene)
+            self._surface.setObjectName("Stage")
+            self._surface.setFrameShape(QFrame.NoFrame)
+            self._surface.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+            self._surface.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self._surface.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self._video_item.nativeSizeChanged.connect(self._on_native_size)
+            self._player = QMediaPlayer(self)
+            self._audio = QAudioOutput(self)
+            self._player.setAudioOutput(self._audio)
+            self._player.setVideoOutput(self._video_item)
+            self._player.positionChanged.connect(self._on_position)
+            self._player.durationChanged.connect(self._on_duration)
+            self._player.playbackStateChanged.connect(self._on_state)
+            self._player.errorOccurred.connect(self._on_error)
+            # The plugin (and its bundled libavutil) is resident now, so its noisy
+            # default logging can be turned down.
+            quiet_ffmpeg_logs()
+        if self._surface is not None:
+            lay.addWidget(self._surface, 1)
+        lay.addWidget(self._fallback, 1)
+
+        bar = QFrame()
+        bar.setObjectName("VideoBar")
+        bar.setFixedHeight(46)
+        bar.setStyleSheet(
+            f"#VideoBar {{ background: {t.surface_1}; border-top: 1px solid {t.border}; }}")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(12, 6, 12, 6)
+        row.setSpacing(8)
+
+        self._play_btn = QToolButton()
+        self._play_btn.setObjectName("NavBtn")
+        self._play_btn.setIcon(lucide_icon("play", t.text_primary, 18))
+        self._play_btn.setToolTip("Play / pause (Space)")
+        self._play_btn.clicked.connect(self.toggle_play)
+        row.addWidget(self._play_btn)
+
+        self._back_btn = QToolButton()
+        self._back_btn.setObjectName("NavBtn")
+        self._back_btn.setIcon(lucide_icon("chevron-left", t.text_secondary, 16))
+        self._back_btn.setToolTip("Back one frame")
+        self._back_btn.clicked.connect(lambda: self.step_frames(-1))
+        row.addWidget(self._back_btn)
+
+        self._fwd_btn = QToolButton()
+        self._fwd_btn.setObjectName("NavBtn")
+        self._fwd_btn.setIcon(lucide_icon("chevron-right", t.text_secondary, 16))
+        self._fwd_btn.setToolTip("Forward one frame")
+        self._fwd_btn.clicked.connect(lambda: self.step_frames(1))
+        row.addWidget(self._fwd_btn)
+
+        self._pos_label = QLabel("0:00")
+        self._pos_label.setObjectName("NavCount")
+        self._pos_label.setMinimumWidth(46)
+        self._pos_label.setAlignment(Qt.AlignCenter)
+        row.addWidget(self._pos_label)
+
+        self._slider = TrimBar(t)
+        self._slider.positionRequested.connect(self._seek)
+        self._slider.trimChanged.connect(self._on_trim_changed)
+        row.addWidget(self._slider, 1)
+
+        self._len_label = QLabel("0:00")
+        self._len_label.setObjectName("NavCount")
+        self._len_label.setMinimumWidth(46)
+        self._len_label.setAlignment(Qt.AlignCenter)
+        row.addWidget(self._len_label)
+
+        self._mute_btn = QToolButton()
+        self._mute_btn.setObjectName("NavBtn")
+        self._mute_btn.setIcon(lucide_icon("volume-2", t.text_secondary, 16))
+        self._mute_btn.setToolTip("Mute / unmute")
+        self._mute_btn.clicked.connect(self.toggle_mute)
+        row.addWidget(self._mute_btn)
+
+        self._meta_label = QLabel("")
+        self._meta_label.setObjectName("Hint")
+        row.addWidget(self._meta_label)
+
+        lay.addWidget(bar)
+        self._bar = bar
+        lay.addWidget(self._build_edit_bar(t))
+
+    def _build_edit_bar(self, theme: "Theme") -> QWidget:
+        """Trim/conform controls, inline under the transport. Everything here acts on
+        the selection shown in the trim bar above it."""
+        bar = QFrame()
+        bar.setObjectName("EditBar")
+        bar.setStyleSheet(
+            f"#EditBar {{ background: {theme.surface_1}; "
+            f"border-top: 1px solid {theme.border}; }}")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(12, 6, 12, 8)
+        row.setSpacing(8)
+
+        self._in_btn = QPushButton("Set in")
+        self._in_btn.setToolTip("Start the clip at the current frame ([)")
+        self._in_btn.clicked.connect(self.set_in_at_playhead)
+        row.addWidget(self._in_btn)
+        self._out_btn = QPushButton("Set out")
+        self._out_btn.setToolTip("End the clip at the current frame (])")
+        self._out_btn.clicked.connect(self.set_out_at_playhead)
+        row.addWidget(self._out_btn)
+        self._reset_btn = QPushButton("Reset")
+        self._reset_btn.setToolTip("Select the whole clip again")
+        self._reset_btn.clicked.connect(self.reset_trim)
+        row.addWidget(self._reset_btn)
+
+        row.addSpacing(6)
+        row.addWidget(QLabel("Target:"))
+        self._target_combo = QComboBox()
+        self._target_combo.addItem("None (keep source)", "")
+        for key, target in self.controller.model_targets.items():
+            self._target_combo.addItem(target.label, key)
+        self._target_combo.setToolTip(
+            "Conform the clip to a video model's frame rate and frame-count grid")
+        self._target_combo.currentIndexChanged.connect(self._on_target_changed)
+        row.addWidget(self._target_combo)
+
+        self._rot_ccw = QToolButton()
+        self._rot_ccw.setObjectName("NavBtn")
+        self._rot_ccw.setIcon(lucide_icon("rotate-ccw", theme.text_secondary, 15))
+        self._rot_ccw.setToolTip("Rotate 90\u00b0 anticlockwise")
+        self._rot_ccw.clicked.connect(lambda: self.rotate_by(-90))
+        row.addWidget(self._rot_ccw)
+        self._rot_cw = QToolButton()
+        self._rot_cw.setObjectName("NavBtn")
+        self._rot_cw.setIcon(lucide_icon("rotate-cw", theme.text_secondary, 15))
+        self._rot_cw.setToolTip("Rotate 90\u00b0 clockwise")
+        self._rot_cw.clicked.connect(lambda: self.rotate_by(90))
+        row.addWidget(self._rot_cw)
+
+        self._crop_btn = QPushButton("Crop")
+        self._crop_btn.setCheckable(True)
+        self._crop_btn.setToolTip("Draw a crop region over the video")
+        self._crop_btn.toggled.connect(self.set_crop_enabled)
+        row.addWidget(self._crop_btn)
+        self._aspect_combo = QComboBox()
+        for label, _ratio in ASPECT_PRESETS:
+            self._aspect_combo.addItem(label)
+        self._aspect_combo.setToolTip("Constrain the crop to an aspect ratio")
+        self._aspect_combo.setVisible(False)
+        self._aspect_combo.currentIndexChanged.connect(self._on_aspect_changed)
+        row.addWidget(self._aspect_combo)
+
+        self._fit_btn = QPushButton("Fit to target")
+        self._fit_btn.setToolTip("Snap the selection to the target's legal length, "
+                                 "then drag it to pick which part to keep")
+        self._fit_btn.clicked.connect(self.fit_to_target)
+        row.addWidget(self._fit_btn)
+
+        self._nudge_back = QToolButton()
+        self._nudge_back.setObjectName("NavBtn")
+        self._nudge_back.setIcon(lucide_icon("chevron-left", theme.text_secondary, 15))
+        self._nudge_back.setToolTip("Move the selection earlier (keeps its length)")
+        self._nudge_back.clicked.connect(lambda: self.nudge_window(-1))
+        row.addWidget(self._nudge_back)
+        self._nudge_fwd = QToolButton()
+        self._nudge_fwd.setObjectName("NavBtn")
+        self._nudge_fwd.setIcon(lucide_icon("chevron-right", theme.text_secondary, 15))
+        self._nudge_fwd.setToolTip("Move the selection later (keeps its length)")
+        self._nudge_fwd.clicked.connect(lambda: self.nudge_window(1))
+        row.addWidget(self._nudge_fwd)
+
+        self._trim_label = QLabel("")
+        self._trim_label.setObjectName("Hint")
+        row.addWidget(self._trim_label, 1)
+
+        # Whether this clip's sound will reach the model, visible before you run
+        # rather than inferable from the caption afterwards.
+        self._audio_badge = QLabel("")
+        self._audio_badge.setObjectName("Hint")
+        row.addWidget(self._audio_badge)
+
+        self._save_frame_btn = QPushButton("Save frame\u2026")
+        self._save_frame_btn.setToolTip(
+            "Write the frame under the playhead to an image file")
+        self._save_frame_btn.clicked.connect(self.save_current_frame)
+        row.addWidget(self._save_frame_btn)
+
+        self._snap_btn = QPushButton("Snap")
+        self._snap_btn.setCheckable(True)
+        # Default on: a trim that isn't on the grid gets silently truncated or
+        # padded by the trainer, so the useful default is the one that can't.
+        self._snap_btn.setChecked(
+            self.controller.qsettings.value("trim_snap", True, bool))
+        self._snap_btn.setToolTip(
+            "Pull the trim onto a frame count the selected model accepts "
+            "instead of moving frame by frame")
+        self._snap_btn.toggled.connect(self._on_snap_toggled)
+        row.addWidget(self._snap_btn)
+
+        self._mute_section_btn = QPushButton("Mute section")
+        self._mute_section_btn.setCheckable(True)
+        self._mute_section_btn.setToolTip(
+            "Silence part of the clip's audio \u2014 useful when a trim cuts a word "
+            "in half. The picture is untouched.")
+        self._mute_section_btn.toggled.connect(self._on_mute_section_toggled)
+        row.addWidget(self._mute_section_btn)
+
+        # One button, no preview render: playback is already silenced live inside
+        # the brackets, so you audition by pressing play. Rendering a file just to
+        # listen left a stray clip in the dataset folder if anything went wrong.
+        self._mute_apply_btn = QPushButton("Apply mute")
+        self._mute_apply_btn.setObjectName("Primary")
+        self._mute_apply_btn.setToolTip(
+            "Write the silence to the clip. Press play first \u2014 the bracketed "
+            "span is already muted during playback.")
+        self._mute_apply_btn.clicked.connect(self.commit_mute)
+        self._mute_apply_btn.setVisible(False)
+        row.addWidget(self._mute_apply_btn)
+
+        self._pending_banner = QLabel("")
+        self._pending_banner.setObjectName("PendingEdits")
+        self._pending_banner.setWordWrap(True)
+        self._pending_banner.setVisible(False)
+        self._pending_banner.setStyleSheet(
+            f"#PendingEdits {{ background: {theme.warning}; "
+            f"color: {theme.surface_0}; border-radius: 4px; "
+            f"padding: 3px 8px; font-weight: 600; }}")
+
+        self._apply_btn = QPushButton("Apply edit\u2026")
+        self._apply_btn.setToolTip("Re-encode this clip with the changes above")
+        self._apply_btn.clicked.connect(self.apply_edit)
+        row.addWidget(self._apply_btn)
+
+        wrap = QWidget()
+        col = QVBoxLayout(wrap)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+        col.addWidget(bar)
+        col.addWidget(self._pending_banner)
+        return wrap
+
+    # ---- pending edits ----
+
+    def _edit_state(self) -> dict:
+        in_ms, out_ms = self._slider.trim()
+        return {
+            "trim": (in_ms, out_ms),
+            "duration": self._slider.duration(),
+            "crop": self.crop_rect(),
+            "rotation": self._rotation,
+            "target": self._target_combo.currentData() or "",
+        }
+
+    def _is_default_state(self, state: dict) -> bool:
+        """No edit means: whole clip, no crop, no rotation. A chosen target alone
+        isn't an edit — it only describes what Apply would do."""
+        return (state["crop"] is None
+                and not state["rotation"]
+                and state["trim"] == (0, state["duration"]))
+
+    def has_pending_edits(self, path: Path | None = None) -> bool:
+        if path is None:
+            return bool(self._path and str(self._path) in self._pending_edits)
+        return str(path) in self._pending_edits
+
+    def _mark_pending(self) -> None:
+        """Remember the in-progress edit against this clip.
+
+        Stored rather than merely warned about: losing a carefully placed trim
+        because you clicked the next thumbnail is the failure worth designing out,
+        and a modal on every navigation would be its own annoyance.
+        """
+        if self._path is None or self._info is None:
+            return
+        key = str(self._path)
+        state = self._edit_state()
+        if self._is_default_state(state):
+            self._pending_edits.pop(key, None)
+        else:
+            self._pending_edits[key] = state
+        self._refresh_pending_banner()
+        self.controller._refresh_video_edit_marker(self._path)
+
+    def _restore_pending(self) -> None:
+        """Put a remembered edit back when you return to a clip."""
+        if self._path is None:
+            return
+        state = self._pending_edits.get(str(self._path))
+        if not state:
+            self._rotation = 0
+            self._refresh_pending_banner()
+            return
+        self._rotation = int(state.get("rotation") or 0)
+        target_key = state.get("target") or ""
+        idx = self._target_combo.findData(target_key)
+        if idx >= 0:
+            self._target_combo.blockSignals(True)
+            self._target_combo.setCurrentIndex(idx)
+            self._target_combo.blockSignals(False)
+        trim = state.get("trim")
+        if trim:
+            self._slider.set_trim(*trim)
+        crop = state.get("crop")
+        if crop:
+            self._crop_btn.blockSignals(True)
+            self._crop_btn.setChecked(True)
+            self._crop_btn.blockSignals(False)
+            self.set_crop_enabled(True)
+            if self._crop_item is not None:
+                x, y, cw, ch = crop
+                self._crop_item.setRect(QRectF(x, y, cw, ch))
+        self._apply_preview_rotation()
+        self._refresh_pending_banner()
+
+    def clear_pending(self, path: Path | None = None) -> None:
+        self._pending_edits.pop(str(path or self._path), None)
+        self._refresh_pending_banner()
+
+    def _refresh_pending_banner(self) -> None:
+        banner = getattr(self, "_pending_banner", None)
+        if banner is None:
+            return
+        pending = self.has_pending_edits()
+        banner.setVisible(pending)
+        self._apply_btn.setProperty("Primary", pending)
+        if pending:
+            state = self._pending_edits.get(str(self._path), {})
+            bits = []
+            if state.get("trim") != (0, state.get("duration")):
+                span = (state["trim"][1] - state["trim"][0]) / 1000.0
+                bits.append(f"trimmed to {span:.2f}s")
+            if state.get("crop"):
+                bits.append("cropped")
+            if state.get("rotation"):
+                bits.append(f"rotated {state['rotation']}\u00b0")
+            banner.setText("Unapplied edits (" + ", ".join(bits)
+                           + ") \u2014 press Apply edit to write them to the file.")
+
+    # ---- rotation ----
+
+    def rotate_by(self, degrees: int) -> None:
+        """Turn the preview and remember it for the next Apply.
+
+        The scene is rotated rather than the file, so the picture you crop and trim
+        against is the picture you'll get — rotating on export alone would have you
+        drawing a crop rect on the wrong axes.
+        """
+        if self._info is None:
+            return
+        self._rotation = (self._rotation + degrees) % 360
+        self._apply_preview_rotation()
+        self._mark_pending()
+        self._refresh_trim_label()
+        self.controller._set_status(
+            f"Rotated to {self._rotation}\u00b0 \u2014 press Apply edit to write it."
+            if self._rotation else "Rotation cleared.")
+
+    def _apply_preview_rotation(self) -> None:
+        if not self._available or self._video_item is None:
+            return
+        size = self._video_item.size()
+        if size.isEmpty():
+            return
+        item = self._video_item
+        item.setTransformOriginPoint(size.width() / 2, size.height() / 2)
+        item.setRotation(self._rotation)
+        # The scene rect must follow the rotated bounds or the view crops the turn.
+        if self._rotation % 180:
+            rect = QRectF(0, 0, size.height(), size.width())
+            item.setPos((size.height() - size.width()) / 2,
+                        (size.width() - size.height()) / 2)
+        else:
+            rect = QRectF(0, 0, size.width(), size.height())
+            item.setPos(0, 0)
+        self._scene.setSceneRect(rect)
+        self._surface.fitInView(rect, Qt.KeepAspectRatio)
+        if self._crop_item is not None:
+            self._crop_item.set_bounds(rect)
+
+    # ---- crop ----
+
+    def _on_native_size(self, size) -> None:
+        """The real pixel size of the video only arrives once decoding starts; that's
+        when the scene can be sized and the crop rect given correct bounds."""
+        if size.isEmpty():
+            return
+        self._video_item.setSize(size)
+        self._scene.setSceneRect(QRectF(0, 0, size.width(), size.height()))
+        self._surface.fitInView(self._video_item, Qt.KeepAspectRatio)
+        if self._crop_item is not None:
+            self._crop_item.set_bounds(QRectF(0, 0, size.width(), size.height()))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._available and not self._video_item.size().isEmpty():
+            self._surface.fitInView(self._video_item, Qt.KeepAspectRatio)
+
+    def set_crop_enabled(self, on: bool) -> None:
+        self._aspect_combo.setVisible(on)
+        if not self._available:
+            return
+        if on:
+            size = self._video_item.size()
+            if size.isEmpty():
+                self._crop_btn.setChecked(False)
+                self.controller._set_status(
+                    "Crop needs the video's size \u2014 give it a moment to load, "
+                    "then try again.")
+                return
+            bounds = QRectF(0, 0, size.width(), size.height())
+            # Starts at the full frame, like the image crop dialog — and note
+            # set_aspect() re-fits the rect, so any initial inset would be discarded
+            # the moment an aspect preset is applied.
+            self._crop_item = CropRectItem(bounds, self._on_crop_changed)
+            self._scene.addItem(self._crop_item)
+            self._on_aspect_changed(self._aspect_combo.currentIndex())
+        elif self._crop_item is not None:
+            self._scene.removeItem(self._crop_item)
+            self._crop_item = None
+        self._refresh_trim_label()
+        self._mark_pending()
+
+    def _on_aspect_changed(self, idx: int) -> None:
+        if self._crop_item is not None and 0 <= idx < len(ASPECT_PRESETS):
+            self._crop_item.set_aspect(ASPECT_PRESETS[idx][1])
+            self._mark_pending()
+
+    def _on_crop_changed(self) -> None:
+        self._refresh_trim_label()
+        self._mark_pending()
+
+    def crop_rect(self) -> tuple[int, int, int, int] | None:
+        """(x, y, w, h) in source pixels, or None when cropping is off."""
+        if self._crop_item is None:
+            return None
+        r = self._crop_item.rect()
+        return (max(0, int(round(r.x()))), max(0, int(round(r.y()))),
+                max(2, int(round(r.width()))), max(2, int(round(r.height()))))
+
+    # ---- trim state ----
+
+    def current_target(self):
+        key = self._target_combo.currentData() if hasattr(self, "_target_combo") else ""
+        return self.controller.model_targets.get(key) if key else None
+
+    def _on_target_changed(self, _idx: int) -> None:
+        self._refresh_snap()
+        self._refresh_trim_label()
+        self._mark_pending()
+
+    def _on_trim_changed(self, in_ms: int, out_ms: int) -> None:
+        self._refresh_trim_label()
+        self._mark_pending()
+        if self._is_playing() and not (in_ms <= self._slider.position() < out_ms):
+            self._player.setPosition(in_ms)
+
+    def set_in_at_playhead(self) -> None:
+        _in, out = self._slider.trim()
+        self._slider.set_trim(self._slider.position(), out)
+
+    def set_out_at_playhead(self) -> None:
+        in_ms, _out = self._slider.trim()
+        self._slider.set_trim(in_ms, self._slider.position())
+
+    def reset_trim(self) -> None:
+        self._slider.set_trim(0, self._slider.duration())
+
+    def fit_to_target(self) -> None:
+        """Shorten the selection to the nearest legal length for the target.
+
+        The fitted window keeps its centre where the current selection was, rather
+        than snapping to the start of the clip — and because dragging the middle of
+        the trim bar moves the window without changing its length, the user can then
+        slide this legal window to whichever seconds they actually want.
+        """
+        target = self.current_target()
+        if target is None or self._info is None:
+            return
+        in_ms, out_ms = self._slider.trim()
+        duration = self._slider.duration()
+        span_s = max(0.0, (out_ms - in_ms) / 1000.0)
+        frames = target.snap_frames(
+            min(int(round(span_s * target.fps)), target.max_frames()), "down")
+        frames = max(frames, target.smallest_legal_frames())
+        span_ms = min(int(math.ceil(frames / target.fps * 1000)), duration)
+        centre = (in_ms + out_ms) // 2
+        new_in = max(0, min(centre - span_ms // 2, duration - span_ms))
+        self._slider.set_trim(new_in, new_in + span_ms)
+        self._refresh_trim_label()
+        if frames < target.min_frames():
+            # The clip can't reach the model's minimum however it's cut, so trimming
+            # further only throws away material that was already too scarce. Say so
+            # plainly instead of implying the fit succeeded.
+            self.controller._set_status(
+                f"{self._path.name if self._path else 'This clip'} is only "
+                f"{duration / 1000:.1f}s \u2014 {target.label} wants at least "
+                f"{target.seconds_for_frames(target.min_frames()):.1f}s. Snapped to "
+                f"{frames} frames, but it's below the model's minimum.")
+            return
+        self.controller._set_status(
+            f"Fitted to {frames} frames for {target.label} \u2014 drag the highlighted "
+            "region to choose which part of the clip to keep.")
+
+    def nudge_window(self, direction: int, seconds: float = 0.5) -> None:
+        """Slide the selection without changing its length, so a fitted (legal)
+        window stays legal."""
+        in_ms, out_ms = self._slider.trim()
+        span = out_ms - in_ms
+        step = int(direction * seconds * 1000)
+        new_in = max(0, min(in_ms + step, self._slider.duration() - span))
+        self._slider.set_trim(new_in, new_in + span)
+        self._slider.set_position(new_in)
+        self._seek(new_in)
+
+    def save_current_frame(self) -> None:
+        """Write the frame under the playhead wherever the user chooses."""
+        if self._path is None:
+            return
+        ms = self._slider.position()
+        # Frame number rather than a timestamp: it's what a grid-aligned dataset is
+        # counted in, and it avoids '0:03.4' style characters in filenames.
+        info = self._info
+        frame_no = int(round(ms / 1000.0 * info.fps)) if info else 0
+        suggested = f"{self._path.stem}_f{frame_no:05d}.png"
+        target, _ = QFileDialog.getSaveFileName(
+            self.controller, "Save frame",
+            str(self._path.parent / suggested),
+            "PNG image (*.png);;JPEG image (*.jpg)")
+        if not target:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ok, message = extract_single_frame(self._path, target, ms / 1000.0)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not ok:
+            QMessageBox.critical(self.controller, "Could not save the frame", message)
+            return
+        saved = Path(target)
+        # Landing it in the dataset folder is a common intent, so re-list when it
+        # does rather than leaving a file the filmstrip doesn't know about.
+        if self.controller.store is not None and saved.parent == self.controller.store.folder:
+            self.controller.images = self.controller.store.images()
+            self.controller._rebuild_filmstrip()
+            row = self.controller._row_for_path(saved)
+            if row is not None:
+                self.controller.filmstrip.setCurrentRow(row)
+        self.controller._set_status(f"Saved frame {frame_no} to {saved.name}.")
+
+    # ---- snapping to the model's frame grid ----
+
+    def _on_snap_toggled(self, on: bool) -> None:
+        self.controller.qsettings.setValue("trim_snap", bool(on))
+        self._refresh_snap()
+        self._refresh_trim_label()
+        self.controller._set_status(
+            "Trim snaps to the model's legal frame counts."
+            if on else "Trim moves frame by frame.")
+
+    def _refresh_snap(self) -> None:
+        """Arm or disarm the snap hook for the current target."""
+        target = self.current_target()
+        if target is None or not self._snap_btn.isChecked():
+            self._slider.set_snap(None)
+            self._snap_btn.setEnabled(target is not None)
+            return
+        self._snap_btn.setEnabled(True)
+        self._slider.set_snap(self._snap_trim)
+
+    def _snap_trim(self, in_ms: int, out_ms: int, which: str) -> tuple[int, int]:
+        """Pull a dragged edge so the selection lands on a legal frame count.
+
+        The grid is a length rule (frames % modulus == remainder), so the edge
+        being dragged moves and the opposite one stays put — snapping both would
+        fight the user's intent about where the clip starts.
+        """
+        target = self.current_target()
+        if target is None:
+            return in_ms, out_ms
+        duration = self._slider.duration()
+        # The floor is the model's MINIMUM usable length, not the smallest number
+        # that happens to satisfy the grid. For H3 those are 73 frames and 5: the
+        # rungs below the minimum (5, 22, 39, 56) are all grid-legal and all
+        # useless, so offering one looks like a valid choice and isn't.
+        floor = target.min_frames()
+        ceiling = target.max_frames()
+        # A clip too short to hold one legal length has nothing to snap to. Leave
+        # the selection alone and let the amber "under the model's minimum" warning
+        # explain, rather than snapping to a length the model can't train on.
+        if int(round(duration / 1000.0 * target.fps)) < floor:
+            return in_ms, out_ms
+        frames = max(1, int(round((out_ms - in_ms) / 1000.0 * target.fps)))
+        legal = max(floor, min(target.snap_frames(frames, "nearest"), ceiling))
+        span = int(round(target.seconds_for_frames(legal) * 1000))
+        if which == "out":
+            new_out = in_ms + span
+            if new_out > duration:
+                # Past the end: step down a rung rather than clamping to an
+                # illegal length.
+                lower = target.snap_frames(
+                    max(1, int((duration - in_ms) / 1000.0 * target.fps)), "down")
+                lower = max(floor, min(lower, ceiling))
+                new_out = in_ms + int(round(target.seconds_for_frames(lower) * 1000))
+            return in_ms, min(duration, new_out)
+        new_in = out_ms - span
+        if new_in < 0:
+            lower = target.snap_frames(
+                max(1, int(out_ms / 1000.0 * target.fps)), "down")
+            lower = max(floor, min(lower, ceiling))
+            new_in = out_ms - int(round(target.seconds_for_frames(lower) * 1000))
+        return max(0, new_in), out_ms
+
+    # ---- mute section ----
+
+    def _on_mute_section_toggled(self, on: bool) -> None:
+        # The label names the action, not the state: a checked button reading
+        # "Mute section" looks like it's telling you what mode you're in when it's
+        # actually the thing you press to leave.
+        self._mute_section_btn.setText("Discard mute" if on else "Mute section")
+        self._mute_section_btn.setToolTip(
+            "Drop the mute brackets without changing the clip" if on
+            else "Silence part of the clip's audio \u2014 useful when a trim cuts a "
+                 "word in half. The picture is untouched.")
+        self.set_mute_mode(on)
+
+    def set_mute_mode(self, on: bool) -> None:
+        """Show the red mute band and its controls. Leaving the mode always drops
+        any un-kept preview, so the file on disk is never left as a temp render."""
+        if on and self._path is not None and not has_audio_stream(self._path):
+            self._mute_section_btn.setChecked(False)
+            self.controller._set_status(
+                "This clip has no audio track \u2014 nothing to mute.")
+            return
+        self._slider.set_mute_visible(on)
+        if not on and self._audio is not None:
+            self._audio.setVolume(self._base_volume)
+        self._mute_apply_btn.setVisible(on)
+        self._update_mute_buttons()
+        self._refresh_trim_label()
+
+    def _update_mute_buttons(self) -> None:
+        lo, hi = self._slider.mute_range()
+        self._mute_apply_btn.setEnabled(hi - lo >= 30)
+
+    def commit_mute(self) -> None:
+        """Render the mute and swap it in, keeping the untouched original.
+
+        The render happens here and nowhere else, into the folder's own scratch
+        space, so there's never a playable stray sitting in the dataset.
+        """
+        if self._path is None:
+            return
+        in_ms, out_ms = self._slider.mute_range()
+        secs = (out_ms - in_ms) / 1000.0
+        if secs < 0.03:
+            self.controller._set_status("Drag the red brackets to choose what to mute.")
+            return
+        if QMessageBox.question(
+            self.controller, "Keep the mute",
+            f"Silence {secs:.2f}s of audio in {self._path.name}?\n\n"
+            "The picture is unchanged, and the untouched original is kept in "
+            ".original/.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        ) != QMessageBox.Yes:
+            return
+        store = self.controller.store
+        if store is None:
+            return
+        tmp = store.work_dir() / f"mute{self._path.suffix}"
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ok, message = apply_mute_span(self._path, tmp,
+                                          in_ms / 1000.0, out_ms / 1000.0)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not ok:
+            tmp.unlink(missing_ok=True)
+            QMessageBox.critical(self.controller, "Could not mute", message)
+            return
+        try:
+            store.backup_original(self._path)
+        except OSError as exc:
+            tmp.unlink(missing_ok=True)
+            QMessageBox.critical(self.controller, "Could not back up", str(exc))
+            return
+        # Release the file before replacing it — Windows will refuse otherwise.
+        self.release()
+        try:
+            os.replace(tmp, self._path)
+        except OSError as exc:
+            tmp.unlink(missing_ok=True)
+            QMessageBox.critical(self.controller, "Could not save", str(exc))
+            return
+        self._mute_section_btn.setChecked(False)
+        self._update_mute_buttons()
+        self.controller._purge_poster_cache(self._path)
+        self._load_into_player(self._path)
+        self.refresh_audio_badge()
+        self.controller._set_status(f"Muted {secs:.2f}s in {self._path.name}.")
+
+    def refresh_audio_badge(self) -> None:
+        badge = getattr(self, "_audio_badge", None)
+        if badge is None:
+            return
+        if self._info is None:
+            badge.setText("")
+            return
+        theme = self.controller.theme
+        ok, why = self.controller.audio_status()
+        has_track = False
+        if self._path is not None:
+            try:
+                has_track = has_audio_stream(self._path)
+            except Exception:
+                has_track = False
+        if not has_track:
+            badge.setText("\U0001F507 silent clip")
+            badge.setToolTip("This clip has no audio track, so there's no sound to "
+                             "caption.")
+            badge.setStyleSheet(f"color: {theme.text_secondary};")
+        elif ok:
+            badge.setText("\U0001F50A audio on")
+            badge.setToolTip("The clip's audio is sent with the frames, so dialogue "
+                             "and sound can be described.")
+            badge.setStyleSheet(f"color: {theme.success};")
+        else:
+            badge.setText("\U0001F507 audio off")
+            badge.setToolTip(why)
+            badge.setStyleSheet(f"color: {theme.warning};")
+
+    def _refresh_trim_label(self) -> None:
+        if self._info is None:
+            self._trim_label.setText("")
+            return
+        in_ms, out_ms = self._slider.trim()
+        span_s = max(0.0, (out_ms - in_ms) / 1000.0)
+        target = self.current_target()
+        if target is None:
+            frames = int(round(span_s * (self._info.fps or 0)))
+            self._trim_label.setText(f"{span_s:.2f}s \u00b7 ~{frames} frames")
+            self._trim_label.setStyleSheet(f"color: {self.controller.theme.text_secondary};")
+            return
+        frames = int(round(span_s * target.fps))
+        legal = target.is_legal_frames(frames)
+        capped = frames > target.max_frames()
+        short = frames < target.min_frames()
+        if legal and not capped and not short:
+            text = f"{frames} frames \u00b7 {span_s:.2f}s @ {target.fps:g}fps \u2713"
+            colour = self.controller.theme.success
+        else:
+            nearest = target.snap_frames(min(frames, target.max_frames()), "down")
+            reason = ("over the model's maximum" if capped
+                      else "under the model's minimum" if short
+                      else f"not on the {target.frame_modulus}n"
+                           f"+{target.frame_remainder} grid")
+            text = f"{frames} frames \u2014 {reason}; nearest {nearest}"
+            colour = self.controller.theme.warning
+        self._trim_label.setText(text)
+        self._trim_label.setStyleSheet(f"color: {colour};")
+
+    # ---- public API ----
+
+    def load(self, path: Path, info: "VideoInfo | None") -> None:
+        self._path = Path(path)
+        self._info = info
+        self._fps = info.fps if info and info.fps else 25.0
+        # A new clip starts fully selected; duration arrives from the player.
+        self._slider.set_duration(int((info.duration_s * 1000) if info else 0))
+        self._slider.set_trim(0, self._slider.duration())
+        if self._crop_btn.isChecked():
+            self._crop_btn.setChecked(False)     # also tears down the rect
+        self._rotation = 0
+        self._refresh_snap()
+        self._load_peaks()
+        self._restore_pending()
+        self._refresh_trim_label()
+        self.refresh_audio_badge()
+        for w in (self._in_btn, self._out_btn, self._reset_btn, self._fit_btn,
+                  self._apply_btn, self._target_combo, self._nudge_back,
+                  self._nudge_fwd, self._crop_btn, self._mute_section_btn,
+                  self._save_frame_btn, self._snap_btn,
+                  self._rot_ccw, self._rot_cw):
+            w.setEnabled(info is not None)
+        self._meta_label.setText(
+            f"{info.width}\u00d7{info.height} \u00b7 {info.fps:g} fps \u00b7 {info.codec}"
+            if info else "")
+        if not self._available or self._player is None:
+            poster = self.controller._video_poster(self._path)
+            self._fallback.setVisible(True)
+            if poster:
+                self._fallback.setPixmap(QPixmap(str(poster)).scaled(
+                    720, 480, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            else:
+                self._fallback.setText(
+                    "Video playback needs the QtMultimedia component of PySide6.")
+            for w in (self._play_btn, self._back_btn, self._fwd_btn, self._slider,
+                      self._mute_btn):
+                w.setEnabled(False)
+            return
+        self._load_into_player(self._path)
+
+    def _load_peaks(self) -> None:
+        """Waveform for the current clip, cached per path so scrubbing back and
+        forth doesn't re-decode."""
+        self._slider.set_peaks([])
+        if self._path is None or not self._available:
+            return
+        key = str(self._path)
+        if key not in self._peaks_cache:
+            try:
+                self._peaks_cache[key] = audio_peaks(self._path, buckets=320)
+            except Exception:
+                self._peaks_cache[key] = []
+        self._slider.set_peaks(self._peaks_cache[key])
+
+    def _load_into_player(self, path: Path | None) -> None:
+        """Point the player at a file without disturbing trim/mute state — used for
+        the initial load and for swapping between a clip and its muted preview."""
+        if self._player is None or path is None:
+            return
+        self._player.setSource(QUrl.fromLocalFile(str(path)))
+        self._player.pause()   # show first frame without autoplaying
+
+    def stop(self) -> None:
+        if self._player is not None:
+            self._player.stop()
+            self._player.setSource(QUrl())
+        self._path = None
+
+    def toggle_play(self) -> None:
+        if self._player is None:
+            return
+        from PySide6.QtMultimedia import QMediaPlayer
+        if self._player.playbackState() == QMediaPlayer.PlayingState:
+            self._player.pause()
+            return
+        # Start inside the selection, so pressing play always previews the trim
+        # rather than whatever happens to be under the playhead.
+        in_ms, out_ms = self._slider.trim()
+        if out_ms > in_ms and not (in_ms <= self._player.position() < out_ms):
+            self._player.setPosition(in_ms)
+            self._slider.set_position(in_ms)
+        self._player.play()
+
+    def toggle_mute(self) -> None:
+        if self._player is None:
+            return
+        muted = not self._audio.isMuted()
+        self._audio.setMuted(muted)
+        self._mute_btn.setIcon(lucide_icon(
+            "volume-x" if muted else "volume-2", self.controller.theme.text_secondary, 16))
+
+    def step_frames(self, frames: int) -> None:
+        """Nudge by whole frames — the precision trim work needs this."""
+        if self._player is None:
+            return
+        self._player.pause()
+        step = int(round(1000.0 / max(1.0, getattr(self, "_fps", 25.0)))) * frames
+        self._player.setPosition(
+            max(0, min(self._duration_ms, self._player.position() + step)))
+
+    # ---- internals ----
+
+    @staticmethod
+    def _fmt(ms: int) -> str:
+        total = max(0, ms // 1000)
+        h, rem = divmod(total, 3600)
+        m, sec = divmod(rem, 60)
+        return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+    def _seek(self, ms: int) -> None:
+        if self._player is not None:
+            self._player.setPosition(ms)
+
+    def _on_slider_pressed(self) -> None:
+        if self._player is not None:
+            self._player.setPosition(self._slider.value())
+
+    def _remember_volume(self) -> None:
+        """Capture the user's volume so live-mute restores it rather than a
+        hard-coded full."""
+        if self._audio is not None and self._audio.volume() > 0.01:
+            self._base_volume = self._audio.volume()
+
+    def _apply_live_mute(self, ms: int) -> None:
+        """Silence the player while the playhead is inside the mute band.
+
+        Renders nothing: you hear the cut as you scrub, and only pay for an encode
+        when you commit. Rendering first meant waiting on a full re-encode just to
+        find out the band was 200ms off.
+        """
+        if self._audio is None or not self._slider.mute_visible():
+            return
+        lo, hi = self._slider.mute_range()
+        inside = lo <= ms < hi and hi > lo
+        want = 0.0 if inside else self._base_volume
+        if abs(self._audio.volume() - want) > 0.01:
+            self._audio.setVolume(want)
+
+    def _on_position(self, ms: int) -> None:
+        self._apply_live_mute(ms)
+        # Confine playback to the selection: what plays is what the trim will keep.
+        # Looping (rather than stopping) lets you watch the cut repeatedly while
+        # nudging the handles.
+        in_ms, out_ms = self._slider.trim()
+        if self._is_playing() and out_ms > in_ms and ms >= out_ms - 40:
+            self._player.setPosition(in_ms)
+            self._slider.set_position(in_ms)
+            self._pos_label.setText(self._fmt(in_ms))
+            return
+        self._slider.set_position(ms)
+        self._pos_label.setText(self._fmt(ms))
+
+    def _is_playing(self) -> bool:
+        if self._player is None:
+            return False
+        from PySide6.QtMultimedia import QMediaPlayer
+        return self._player.playbackState() == QMediaPlayer.PlayingState
+
+    def _on_duration(self, ms: int) -> None:
+        if ms <= 0:
+            return
+        self._duration_ms = ms
+        self._slider.set_duration(ms)
+        self._len_label.setText(self._fmt(ms))
+        self._refresh_trim_label()
+
+    def apply_edit(self) -> None:
+        """Hand the current selection + target to the controller to re-encode."""
+        if self._path is None or self._info is None:
+            return
+        in_ms, out_ms = self._slider.trim()
+        self.controller.apply_video_edit(
+            self._path, self._info, in_ms / 1000.0, out_ms / 1000.0,
+            self.current_target(), self.crop_rect(), self._rotation)
+
+    def release(self) -> None:
+        """Drop the file handle so the clip can be overwritten on disk."""
+        if self._player is not None:
+            self._player.stop()
+            self._player.setSource(QUrl())
+
+    def _on_error(self, _error, message: str) -> None:
+        """Real playback failures belong in the status bar, not buried in stderr."""
+        name = self._path.name if self._path else "video"
+        self.controller._set_status(
+            f"Could not play {name}: {message}" if message
+            else f"Could not play {name}.")
+
+    def _on_state(self, state) -> None:
+        from PySide6.QtMultimedia import QMediaPlayer
+        playing = state == QMediaPlayer.PlayingState
+        self._play_btn.setIcon(lucide_icon(
+            "pause" if playing else "play", self.controller.theme.text_primary, 18))
+
+
+# Shared by the image crop dialog and the video crop overlay so the two can't
+# drift apart.
+ASPECT_PRESETS: tuple[tuple[str, float | None], ...] = (
+    ("Freeform", None),
+    ("1:1", 1.0),
+    ("3:2", 3 / 2), ("2:3", 2 / 3),
+    ("4:3", 4 / 3), ("3:4", 3 / 4),
+    ("16:9", 16 / 9), ("9:16", 9 / 16),
+    ("21:9", 21 / 9), ("9:21", 9 / 21),
+)
+
+
+class CropRectItem(QGraphicsRectItem):
+    """Interactive crop rectangle: drag inside to move, drag a corner to resize,
+    optionally constrained to a fixed aspect ratio. Lives in image-pixel scene
+    coordinates and is always clamped to the image bounds. Calls on_change() after
+    every geometry change so the dialog can sync its mask, labels and spins."""
+
+    def __init__(self, bounds: QRectF, on_change) -> None:
+        super().__init__(bounds)
+        self._bounds = QRectF(bounds)
+        self._on_change = on_change
+        self._aspect: float | None = None      # w/h, None = freeform
+        self._mode: str | None = None          # None | "move" | corner name
+        self._press_pos = QPointF()
+        self._press_rect = QRectF()
+        self.setAcceptHoverEvents(True)
+        self.setZValue(10)
+        pen = QPen(QColor("#2FC6B3"), 0)
+        pen.setCosmetic(True)
+        pen.setWidth(2)
+        self.setPen(pen)
+        self.setBrush(QBrush(Qt.NoBrush))
+
+    # -- geometry helpers -------------------------------------------------
+    def _handle_px(self) -> float:
+        """Corner hit radius in scene units, scaled so it's grabbable at any zoom."""
+        view = self.scene().views()[0] if self.scene() and self.scene().views() else None
+        if view is None:
+            return 12.0
+        return 12.0 / max(view.transform().m11(), 1e-6)
+
+    def _corners(self) -> dict[str, QPointF]:
+        r = self.rect()
+        return {"tl": r.topLeft(), "tr": r.topRight(),
+                "bl": r.bottomLeft(), "br": r.bottomRight()}
+
+    def _corner_at(self, pos: QPointF) -> str | None:
+        h = self._handle_px()
+        for name, pt in self._corners().items():
+            if abs(pos.x() - pt.x()) <= h and abs(pos.y() - pt.y()) <= h:
+                return name
+        return None
+
+    def set_bounds(self, bounds: QRectF) -> None:
+        """Re-clamp to a new frame size — a video's true size only arrives once
+        decoding starts, so the rect may be created before it's known."""
+        self._bounds = QRectF(bounds)
+        r = self.rect().intersected(self._bounds)
+        if r.isEmpty():
+            r = QRectF(self._bounds)
+        self.setRect(r)
+        self._on_change()
+
+    def set_aspect(self, aspect: float | None) -> None:
+        """Constrain to w/h (None = freeform) and refit the rect: the largest rect of
+        that aspect that fits the image, centered — predictable on every switch."""
+        self._aspect = aspect
+        b = self._bounds
+        if aspect is None:
+            self.setRect(QRectF(b))
+        else:
+            w, h = b.width(), b.height()
+            if w / h > aspect:
+                w = h * aspect
+            else:
+                h = w / aspect
+            x = b.center().x() - w / 2
+            y = b.center().y() - h / 2
+            self.setRect(QRectF(x, y, w, h))
+        self._changed()
+
+    def _changed(self) -> None:
+        self.update()
+        if self._on_change:
+            self._on_change()
+
+    # -- painting ---------------------------------------------------------
+    def paint(self, painter, option, widget=None) -> None:
+        super().paint(painter, option, widget)
+        # corner handles: small filled squares, cosmetic size
+        h = self._handle_px()
+        painter.setPen(QPen(QColor("#0F1115"), 0))
+        painter.setBrush(QBrush(QColor("#2FC6B3")))
+        s = h * 0.8
+        for pt in self._corners().values():
+            painter.drawRect(QRectF(pt.x() - s / 2, pt.y() - s / 2, s, s))
+
+    # -- interaction ------------------------------------------------------
+    def mousePressEvent(self, event) -> None:
+        pos = event.pos()
+        corner = self._corner_at(pos)
+        if corner:
+            self._mode = corner
+        elif self.rect().contains(pos):
+            self._mode = "move"
+        else:
+            self._mode = None
+        self._press_pos = pos
+        self._press_rect = QRectF(self.rect())
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._mode is None:
+            return
+        pos = event.pos()
+        b = self._bounds
+        if self._mode == "move":
+            delta = pos - self._press_pos
+            r = QRectF(self._press_rect)
+            r.translate(delta)
+            # clamp inside the image
+            dx = max(b.left() - r.left(), 0) or min(b.right() - r.right(), 0)
+            dy = max(b.top() - r.top(), 0) or min(b.bottom() - r.bottom(), 0)
+            r.translate(dx, dy)
+            self.setRect(r)
+            self._changed()
+            return
+        # corner resize: anchor the opposite corner, follow the cursor
+        anchor = {"tl": self._press_rect.bottomRight(), "tr": self._press_rect.bottomLeft(),
+                  "bl": self._press_rect.topRight(), "br": self._press_rect.topLeft()}[self._mode]
+        px = min(max(pos.x(), b.left()), b.right())
+        py = min(max(pos.y(), b.top()), b.bottom())
+        w = abs(px - anchor.x())
+        h = abs(py - anchor.y())
+        sx = 1 if px >= anchor.x() else -1
+        sy = 1 if py >= anchor.y() else -1
+        if self._aspect is not None and w > 0 and h > 0:
+            # fit the aspect inside the dragged span, then clamp to the image
+            if w / h > self._aspect:
+                w = h * self._aspect
+            else:
+                h = w / self._aspect
+            # available room from the anchor in the drag direction
+            avail_w = (b.right() - anchor.x()) if sx > 0 else (anchor.x() - b.left())
+            avail_h = (b.bottom() - anchor.y()) if sy > 0 else (anchor.y() - b.top())
+            scale = min(1.0, (avail_w / w) if w > 0 else 1.0, (avail_h / h) if h > 0 else 1.0)
+            w *= scale
+            h *= scale
+        w = max(w, 8.0)
+        h = max(h, 8.0)
+        r = QRectF(min(anchor.x(), anchor.x() + sx * w), min(anchor.y(), anchor.y() + sy * h), w, h)
+        r = r.intersected(b)
+        if r.width() >= 8 and r.height() >= 8:
+            self.setRect(r)
+            self._changed()
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._mode = None
+        event.accept()
+
+
+class CropResizeDialog(QDialog):
+    """Crop and/or resize the current image, destructively but safely: the pre-edit
+    file is copied to <folder>/.original/<name> first (first backup wins), then the
+    edited pixels replace the file in place so the dataset keeps stable filenames.
+
+    Aspect presets cover the common training buckets (1:1, 3:2, 4:3, 16:9, 21:9 and
+    their portrait counterparts) plus freeform. Output can optionally be resized;
+    the W/H spins stay linked to the crop's aspect so the result is never stretched.
+    """
+
+    ASPECTS = ASPECT_PRESETS
+
+    def __init__(self, controller, image_path: Path, theme: "Theme") -> None:
+        super().__init__(controller)
+        self.controller = controller
+        self.image_path = Path(image_path)
+        self.theme = theme
+        self.setWindowTitle(f"Crop / Resize \u2014 {self.image_path.name}")
+        self.resize(860, 620)
+
+        self._rotation = 0
+        pm = QPixmap(str(self.image_path))
+        if pm.isNull():
+            raise ValueError(f"Could not open {self.image_path}")
+        self.src_w, self.src_h = pm.width(), pm.height()
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(10)
+
+        # -- canvas -------------------------------------------------------
+        self.scene = QGraphicsScene(self)
+        self.pix_item = self.scene.addPixmap(pm)
+        self.scene.setSceneRect(QRectF(0, 0, self.src_w, self.src_h))
+        bounds = QRectF(0, 0, self.src_w, self.src_h)
+        # dim everything outside the crop (even-odd fill: outer rect minus crop rect)
+        self.mask_item = QGraphicsPathItem()
+        self.mask_item.setBrush(QBrush(QColor(0, 0, 0, 140)))
+        self.mask_item.setPen(QPen(Qt.NoPen))
+        self.mask_item.setZValue(5)
+        self.scene.addItem(self.mask_item)
+        self.crop_item = CropRectItem(bounds, self._crop_changed)
+        self.scene.addItem(self.crop_item)
+
+        self.view = QGraphicsView(self.scene)
+        self.view.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        self.view.setBackgroundBrush(QBrush(QColor(self.theme.surface_0)))
+        self.view.setFrameShape(QFrame.NoFrame)
+        lay.addWidget(self.view, 1)
+
+        # -- controls -----------------------------------------------------
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        row.addWidget(QLabel("Aspect:"))
+        self.aspect_combo = QComboBox()
+        for label, _ratio in self.ASPECTS:
+            self.aspect_combo.addItem(label)
+        self.aspect_combo.currentIndexChanged.connect(self._aspect_selected)
+        row.addWidget(self.aspect_combo)
+
+        self.crop_label = QLabel("")
+        self.crop_label.setStyleSheet(f"color: {self.theme.text_secondary};")
+        row.addWidget(self.crop_label)
+
+        reset = QPushButton("Reset crop")
+        reset.clicked.connect(self._reset_crop)
+        row.addWidget(reset)
+
+        rot_ccw = QToolButton()
+        rot_ccw.setObjectName("NavBtn")
+        rot_ccw.setIcon(lucide_icon("rotate-ccw", self.theme.text_secondary, 15))
+        rot_ccw.setToolTip("Rotate 90\u00b0 anticlockwise")
+        rot_ccw.clicked.connect(lambda: self._rotate_by(-90))
+        row.addWidget(rot_ccw)
+        rot_cw = QToolButton()
+        rot_cw.setObjectName("NavBtn")
+        rot_cw.setIcon(lucide_icon("rotate-cw", self.theme.text_secondary, 15))
+        rot_cw.setToolTip("Rotate 90\u00b0 clockwise")
+        rot_cw.clicked.connect(lambda: self._rotate_by(90))
+        row.addWidget(rot_cw)
+        self.rot_label = QLabel("")
+        self.rot_label.setStyleSheet(f"color: {self.theme.warning};")
+        row.addWidget(self.rot_label)
+        row.addStretch(1)
+
+        self.resize_check = QCheckBox("Resize output to")
+        self.resize_check.toggled.connect(self._resize_toggled)
+        row.addWidget(self.resize_check)
+        self.w_spin = QSpinBox()
+        self.w_spin.setRange(8, 32768)
+        self.h_spin = QSpinBox()
+        self.h_spin.setRange(8, 32768)
+        for s in (self.w_spin, self.h_spin):
+            s.setEnabled(False)
+            s.setSuffix(" px")
+        self.w_spin.valueChanged.connect(self._w_edited)
+        self.h_spin.valueChanged.connect(self._h_edited)
+        row.addWidget(self.w_spin)
+        row.addWidget(QLabel("\u00d7"))
+        row.addWidget(self.h_spin)
+        lay.addLayout(row)
+
+        # -- buttons ------------------------------------------------------
+        btns = QHBoxLayout()
+        self.revert_btn = QPushButton("Revert to original")
+        self.revert_btn.setToolTip("Restore the backed-up original from .original/ "
+                                   "(the backup is kept).")
+        self.revert_btn.clicked.connect(self._revert)
+        store = getattr(controller, "store", None)
+        self.revert_btn.setVisible(bool(store and store.has_original_backup(self.image_path)))
+        btns.addWidget(self.revert_btn)
+        btns.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        btns.addWidget(cancel)
+        self.apply_btn = QPushButton("Apply")
+        self.apply_btn.setDefault(True)
+        self.apply_btn.clicked.connect(self._apply)
+        btns.addWidget(self.apply_btn)
+        lay.addLayout(btns)
+
+        self._sync_guard = False
+        self._crop_changed()
+
+    # -- view fitting -----------------------------------------------------
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+
+    # -- crop/aspect sync -------------------------------------------------
+    def _aspect_selected(self, idx: int) -> None:
+        self.crop_item.set_aspect(self.ASPECTS[idx][1])
+
+    def _rotate_by(self, degrees: int) -> None:
+        """Turn the preview so the crop rect is drawn against the final orientation.
+
+        Rotating only on save would have the user cropping one picture and getting
+        another.
+        """
+        self._rotation = (self._rotation + degrees) % 360
+        self.view.resetTransform()
+        if self._rotation:
+            self.view.rotate(self._rotation)
+        self.view.fitInView(self.pix_item, Qt.KeepAspectRatio)
+        self.rot_label.setText(f"rotated {self._rotation}\u00b0"
+                               if self._rotation else "")
+        # A quarter turn swaps the output dimensions, so the resize spinboxes stop
+        # describing the result.
+        if self._rotation % 180 and self.resize_check.isChecked():
+            self.resize_check.setChecked(False)
+        self.resize_check.setEnabled(not self._rotation % 180)
+        self._crop_changed()
+
+    def _reset_crop(self) -> None:
+        # back to the full image; keep the chosen aspect constraint applied
+        self.crop_item.set_aspect(self.ASPECTS[self.aspect_combo.currentIndex()][1])
+
+    def crop_box(self) -> tuple[int, int, int, int]:
+        """Integer (left, top, right, bottom) of the crop in image pixels."""
+        r = self.crop_item.rect()
+        left = max(0, int(round(r.left())))
+        top = max(0, int(round(r.top())))
+        right = min(self.src_w, int(round(r.right())))
+        bottom = min(self.src_h, int(round(r.bottom())))
+        return left, top, max(right, left + 1), max(bottom, top + 1)
+
+    def _crop_changed(self) -> None:
+        # mask: outer rect minus crop rect (even-odd)
+        path = QPainterPath()
+        path.setFillRule(Qt.OddEvenFill)
+        path.addRect(QRectF(0, 0, self.src_w, self.src_h))
+        path.addRect(self.crop_item.rect())
+        self.mask_item.setPath(path)
+        l, t, r, b = self.crop_box()
+        w, h = r - l, b - t
+        self.crop_label.setText(f"{w} \u00d7 {h} px")
+        if not self.resize_check.isChecked():
+            self._sync_guard = True
+            self.w_spin.setValue(w)
+            self.h_spin.setValue(h)
+            self._sync_guard = False
+
+    def _resize_toggled(self, on: bool) -> None:
+        for s in (self.w_spin, self.h_spin):
+            s.setEnabled(on)
+        if on:
+            l, t, r, b = self.crop_box()
+            self._sync_guard = True
+            self.w_spin.setValue(r - l)
+            self.h_spin.setValue(b - t)
+            self._sync_guard = False
+
+    def _crop_aspect(self) -> float:
+        l, t, r, b = self.crop_box()
+        return (r - l) / max(1, (b - t))
+
+    def _w_edited(self, val: int) -> None:
+        if self._sync_guard or not self.resize_check.isChecked():
+            return
+        self._sync_guard = True
+        self.h_spin.setValue(max(8, int(round(val / self._crop_aspect()))))
+        self._sync_guard = False
+
+    def _h_edited(self, val: int) -> None:
+        if self._sync_guard or not self.resize_check.isChecked():
+            return
+        self._sync_guard = True
+        self.w_spin.setValue(max(8, int(round(val * self._crop_aspect()))))
+        self._sync_guard = False
+
+    # -- apply / revert ---------------------------------------------------
+    def output_size(self) -> tuple[int, int]:
+        l, t, r, b = self.crop_box()
+        if self.resize_check.isChecked():
+            return self.w_spin.value(), self.h_spin.value()
+        return r - l, b - t
+
+    def _save_kwargs(self) -> dict:
+        suffix = self.image_path.suffix.lower()
+        if suffix in (".jpg", ".jpeg"):
+            return {"quality": 95}
+        if suffix == ".webp":
+            return {"quality": 95}
+        return {}
+
+    def _apply(self) -> None:
+        from PIL import Image
+        l, t, r, b = self.crop_box()
+        out_w, out_h = self.output_size()
+        full = (l, t, r, b) == (0, 0, self.src_w, self.src_h)
+        rotation = self._rotation % 360
+        if full and (out_w, out_h) == (self.src_w, self.src_h) and not rotation:
+            self.reject()  # nothing to do
+            return
+        store = getattr(self.controller, "store", None)
+        try:
+            if store is not None:
+                store.backup_original(self.image_path)
+            with Image.open(self.image_path) as im:
+                im.load()
+                if not full:
+                    im = im.crop((l, t, r, b))
+                if rotation:
+                    # expand=True so a quarter turn keeps the whole picture rather
+                    # than cropping it to the original frame.
+                    im = im.rotate(-rotation, expand=True)
+                if (out_w, out_h) != im.size and not rotation:
+                    im = im.resize((out_w, out_h), Image.LANCZOS)
+                im.save(self.image_path, **self._save_kwargs())
+        except Exception as exc:
+            QMessageBox.critical(self, "Edit failed", str(exc))
+            return
+        self.accept()
+
+    def _revert(self) -> None:
+        store = getattr(self.controller, "store", None)
+        if store is None or not store.restore_original(self.image_path):
+            QMessageBox.information(self, "No backup",
+                                    "No backed-up original exists for this image.")
+            return
+        self.accept()
+
+
+class BatchResizeThread(QThread):
+    """Resizes a list of images in place, backing each up to .original/ first.
+
+    Pillow work is slow enough on big folders to block the UI, so it runs off the
+    main thread and reports progress per image. Failures are collected rather than
+    aborting the run — one unreadable file shouldn't stop a 2,000-image folder.
+    """
+
+    item_progress = Signal(int, int, str)      # index (1-based), total, filename
+    item_done = Signal(str, int, int)          # path str, new width, new height
+    item_error = Signal(str, str)              # path str, message
+    batch_finished = Signal(int, int, int, bool)  # changed, skipped, failed, cancelled
+
+    def __init__(self, store, paths, plan):
+        super().__init__()
+        self.store = store
+        self.paths = list(paths)
+        self.plan = plan   # BatchResizePlan
+
+    def run(self) -> None:
+        from PIL import Image
+        changed = skipped = failed = 0
+        total = len(self.paths)
+        for i, path in enumerate(self.paths, start=1):
+            if self.isInterruptionRequested():
+                self.batch_finished.emit(changed, skipped, failed, True)
+                return
+            self.item_progress.emit(i, total, path.name)
+            try:
+                with Image.open(path) as im:
+                    im.load()
+                    target = self.plan.target_for(im.size)
+                    if target is None:
+                        skipped += 1
+                        continue
+                    box = self.plan.crop_box_for(im.size, target)
+                    if self.store is not None:
+                        self.store.backup_original(path)
+                    out = im.crop(box) if box else im
+                    if out.size != target:
+                        out = out.resize(target, Image.LANCZOS)
+                    out.save(path, **self.plan.save_kwargs(path))
+                changed += 1
+                self.item_done.emit(str(path), target[0], target[1])
+            except Exception as exc:
+                failed += 1
+                self.item_error.emit(str(path), str(exc))
+        self.batch_finished.emit(changed, skipped, failed, False)
+
+
+class BatchResizePlan:
+    """Pure geometry for a batch resize — no I/O, so it's cheap to preview and easy
+    to test. `mode` is one of: 'longest', 'shortest', 'exact', 'percent'.
+
+    'exact' centre-crops to the target aspect before scaling so images are never
+    stretched; the other modes preserve the source aspect and never crop.
+    """
+
+    def __init__(self, mode: str, value: int = 1024, width: int = 1024,
+                 height: int = 1024, percent: int = 100, allow_upscale: bool = False):
+        self.mode = mode
+        self.value = int(value)
+        self.width = int(width)
+        self.height = int(height)
+        self.percent = int(percent)
+        self.allow_upscale = bool(allow_upscale)
+
+    def target_for(self, size: tuple[int, int]) -> tuple[int, int] | None:
+        """Output size for a source size, or None when the image should be skipped
+        (already conforming, or would need an upscale that isn't allowed)."""
+        w, h = size
+        if w <= 0 or h <= 0:
+            return None
+        if self.mode == "percent":
+            if self.percent == 100:
+                return None
+            if self.percent > 100 and not self.allow_upscale:
+                return None
+            tw = max(1, round(w * self.percent / 100))
+            th = max(1, round(h * self.percent / 100))
+        elif self.mode == "exact":
+            tw, th = max(1, self.width), max(1, self.height)
+            if not self.allow_upscale and (tw > w or th > h):
+                return None
+        else:
+            cur = max(w, h) if self.mode == "longest" else min(w, h)
+            if cur == self.value:
+                return None
+            if cur < self.value and not self.allow_upscale:
+                return None
+            scale = self.value / cur
+            tw = max(1, round(w * scale))
+            th = max(1, round(h * scale))
+        if (tw, th) == (w, h):
+            return None
+        return tw, th
+
+    def crop_box_for(self, size: tuple[int, int],
+                     target: tuple[int, int]) -> tuple[int, int, int, int] | None:
+        """Centre-crop box needed before scaling. Only 'exact' crops (to match the
+        target aspect without stretching); other modes return None."""
+        if self.mode != "exact":
+            return None
+        w, h = size
+        tw, th = target
+        src_aspect = w / h
+        dst_aspect = tw / th
+        if abs(src_aspect - dst_aspect) < 1e-6:
+            return None
+        if src_aspect > dst_aspect:      # too wide: trim the sides
+            cw = round(h * dst_aspect)
+            x = (w - cw) // 2
+            return (x, 0, x + cw, h)
+        ch = round(w / dst_aspect)       # too tall: trim top/bottom
+        y = (h - ch) // 2
+        return (0, y, w, y + ch)
+
+    def save_kwargs(self, path: Path) -> dict:
+        suffix = Path(path).suffix.lower()
+        if suffix in (".jpg", ".jpeg", ".webp"):
+            return {"quality": 95}
+        return {}
+
+
+class BatchResizeDialog(QDialog):
+    """Resize every image in the folder (or just the flagged ones) in place, with
+    each original preserved in .original/ exactly like the single-image editor.
+
+    Shows a live count of how many images the current settings would actually change
+    before anything is written, so a mis-set value is obvious up front.
+    """
+
+    MODES = (
+        ("Longest side at most", "longest"),
+        ("Shortest side at most", "shortest"),
+        ("Exact size (centre-crop to fit)", "exact"),
+        ("Scale by percentage", "percent"),
+    )
+
+    def __init__(self, controller, theme: "Theme") -> None:
+        super().__init__(controller)
+        self.controller = controller
+        self.theme = theme
+        self.setWindowTitle("Batch resize")
+        self.setMinimumWidth(560)
+        self._thread: BatchResizeThread | None = None
+        self._sizes: dict[str, tuple[int, int]] = {}
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(12)
+
+        intro = QLabel(
+            "Resizes images in place. Each original is copied to <b>.original/</b> "
+            "first, so this can always be undone."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet(f"color: {theme.text_secondary};")
+        lay.addWidget(intro)
+
+        # -- scope --------------------------------------------------------
+        scope_row = QHBoxLayout()
+        scope_row.addWidget(QLabel("Apply to:"))
+        self.scope_combo = QComboBox()
+        all_n = len(controller.images)
+        flagged = self._flagged_paths()
+        self.scope_combo.addItem(f"All images ({all_n})", "all")
+        self.scope_combo.addItem(f"Flagged for review ({len(flagged)})", "flagged")
+        self.scope_combo.currentIndexChanged.connect(self._refresh_estimate)
+        scope_row.addWidget(self.scope_combo)
+        scope_row.addStretch(1)
+        lay.addLayout(scope_row)
+
+        # -- mode ---------------------------------------------------------
+        mode_row = QHBoxLayout()
+        self.mode_combo = QComboBox()
+        for label, _key in self.MODES:
+            self.mode_combo.addItem(label)
+        self.mode_combo.currentIndexChanged.connect(self._mode_changed)
+        mode_row.addWidget(self.mode_combo)
+
+        self.value_spin = QSpinBox()
+        self.value_spin.setRange(8, 32768)
+        self.value_spin.setValue(1024)
+        self.value_spin.setSuffix(" px")
+        self.value_spin.valueChanged.connect(self._refresh_estimate)
+        mode_row.addWidget(self.value_spin)
+
+        self.w_spin = QSpinBox(); self.w_spin.setRange(8, 32768); self.w_spin.setValue(1024)
+        self.h_spin = QSpinBox(); self.h_spin.setRange(8, 32768); self.h_spin.setValue(1024)
+        for s in (self.w_spin, self.h_spin):
+            s.setSuffix(" px")
+            s.valueChanged.connect(self._refresh_estimate)
+            s.setVisible(False)
+        self.x_label = QLabel("\u00d7")
+        self.x_label.setVisible(False)
+        mode_row.addWidget(self.w_spin)
+        mode_row.addWidget(self.x_label)
+        mode_row.addWidget(self.h_spin)
+
+        self.pct_spin = QSpinBox()
+        self.pct_spin.setRange(1, 400)
+        self.pct_spin.setValue(50)
+        self.pct_spin.setSuffix(" %")
+        self.pct_spin.setVisible(False)
+        self.pct_spin.valueChanged.connect(self._refresh_estimate)
+        mode_row.addWidget(self.pct_spin)
+        mode_row.addStretch(1)
+        lay.addLayout(mode_row)
+
+        self.upscale_check = QCheckBox("Allow upscaling images that are already smaller")
+        self.upscale_check.toggled.connect(self._refresh_estimate)
+        lay.addWidget(self.upscale_check)
+
+        self.estimate = QLabel("")
+        self.estimate.setWordWrap(True)
+        lay.addWidget(self.estimate)
+
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        lay.addWidget(self.progress)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self._cancel)
+        btns.addWidget(self.cancel_btn)
+        self.run_btn = QPushButton("Resize")
+        self.run_btn.setDefault(True)
+        self.run_btn.clicked.connect(self._run)
+        btns.addWidget(self.run_btn)
+        lay.addLayout(btns)
+
+        self._refresh_estimate()
+
+    # -- scope / plan -----------------------------------------------------
+    def _flagged_paths(self) -> list[Path]:
+        proj = getattr(self.controller, "project", None)
+        if proj is None:
+            return []
+        return [p for p in self.controller.images if proj.is_review_marked(p.name)]
+
+    def target_paths(self) -> list[Path]:
+        # Pillow can't open videos; batch resize is an image operation. Video
+        # resizing arrives with the ffmpeg edit dialog.
+        if self.scope_combo.currentData() == "flagged":
+            paths = self._flagged_paths()
+        else:
+            paths = list(self.controller.images)
+        return [p for p in paths if not is_video(p)]
+
+    def plan(self) -> BatchResizePlan:
+        mode = self.MODES[self.mode_combo.currentIndex()][1]
+        return BatchResizePlan(
+            mode=mode, value=self.value_spin.value(),
+            width=self.w_spin.value(), height=self.h_spin.value(),
+            percent=self.pct_spin.value(),
+            allow_upscale=self.upscale_check.isChecked(),
+        )
+
+    def _mode_changed(self, idx: int) -> None:
+        mode = self.MODES[idx][1]
+        self.value_spin.setVisible(mode in ("longest", "shortest"))
+        for wdg in (self.w_spin, self.h_spin, self.x_label):
+            wdg.setVisible(mode == "exact")
+        self.pct_spin.setVisible(mode == "percent")
+        self._refresh_estimate()
+
+    def _image_size(self, path: Path) -> tuple[int, int] | None:
+        """Cached (w, h) read from the header only — no full decode, so the estimate
+        stays responsive on large folders."""
+        key = str(path)
+        if key not in self._sizes:
+            try:
+                from PIL import Image
+                with Image.open(path) as im:
+                    self._sizes[key] = im.size
+            except Exception:
+                self._sizes[key] = None
+        return self._sizes[key]
+
+    def _refresh_estimate(self) -> None:
+        paths = self.target_paths()
+        plan = self.plan()
+        changed = unreadable = 0
+        for p in paths:
+            size = self._image_size(p)
+            if size is None:
+                unreadable += 1
+            elif plan.target_for(size) is not None:
+                changed += 1
+        total = len(paths)
+        skipped = total - changed - unreadable
+        parts = [f"<b>{changed}</b> of {total} image(s) will be resized"]
+        if skipped:
+            parts.append(f"{skipped} already match and will be skipped")
+        if unreadable:
+            parts.append(f"{unreadable} could not be read")
+        self.estimate.setText(" \u00b7 ".join(parts) + ".")
+        self.run_btn.setEnabled(changed > 0)
+
+    # -- run --------------------------------------------------------------
+    def _run(self) -> None:
+        paths = self.target_paths()
+        plan = self.plan()
+        work = [p for p in paths
+                if (sz := self._image_size(p)) is not None and plan.target_for(sz) is not None]
+        if not work:
+            return
+        resp = QMessageBox.question(
+            self, "Resize images",
+            f"Resize {len(work)} image(s) in place?\n\n"
+            "Each original is copied to .original/ first, so this can be reverted.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if resp != QMessageBox.Yes:
+            return
+        self.run_btn.setEnabled(False)
+        self.progress.setVisible(True)
+        self.progress.setRange(0, len(work))
+        self.progress.setValue(0)
+        self._errors: list[str] = []
+        self._thread = BatchResizeThread(self.controller.store, work, plan)
+        self._thread.item_progress.connect(self._on_progress)
+        self._thread.item_done.connect(self._on_item_done)
+        self._thread.item_error.connect(lambda p, m: self._errors.append(f"{Path(p).name}: {m}"))
+        self._thread.batch_finished.connect(self._on_finished)
+        self._thread.start()
+
+    def _on_progress(self, i: int, total: int, name: str) -> None:
+        self.progress.setValue(i)
+        self.estimate.setText(f"Resizing {i} / {total} \u2014 {name}")
+
+    def _on_item_done(self, path_str: str, w: int, h: int) -> None:
+        self._sizes[path_str] = (w, h)
+        self.controller._refresh_edited_image_cached(Path(path_str))
+
+    def _on_finished(self, changed: int, skipped: int, failed: int, cancelled: bool) -> None:
+        self._thread = None
+        self.progress.setVisible(False)
+        self.controller._refresh_current_after_batch()
+        verb = "Cancelled after" if cancelled else "Resized"
+        msg = f"{verb} {changed} image(s)."
+        if skipped:
+            msg += f" {skipped} skipped."
+        if failed:
+            msg += f" {failed} failed."
+        if self._errors:
+            msg += "\n\n" + "\n".join(self._errors[:10])
+            if len(self._errors) > 10:
+                msg += f"\n… and {len(self._errors) - 10} more."
+        QMessageBox.information(self, "Batch resize", msg)
+        self.accept()
+
+    def _cancel(self) -> None:
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.requestInterruption()
+            return
+        self.reject()
+
+    def closeEvent(self, event) -> None:
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.requestInterruption()
+            self._thread.wait(5000)
+        super().closeEvent(event)
+
+
 class ToggleSwitch(QAbstractButton):
     """A checkable on/off switch styled to the token spec (track 34×19, knob 15).
 
@@ -3861,7 +6838,7 @@ class DraggableTagButton(QPushButton):
 
 
 class TriggerTextEdit(QPlainTextEdit):
-    """Per-image guidance editor where inserted triggers act as draggable chips."""
+    """Per-file guidance editor where inserted triggers act as draggable chips."""
 
     TRIGGER_MIME = "application/x-guidance-trigger"
 
@@ -4257,13 +7234,21 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = load_settings()
         self.theme = Theme(self.settings)
-        self.qsettings = QSettings("IdeogramCaptioner", "QtApp")
+        self.qsettings = QSettings("FantasticCaptioningKit", "QtApp")
         self._default_tags = self._load_default_tags()
         self.store: CaptionStore | None = None
         self.images: list[Path] = []
         self._has_source_txt = False
         self.current: Path | None = None
         self.current_caption: dict = default_caption()
+        # Plain presets keep their caption as a string; structured ones use the dict
+        # above. self.preset decides which is authoritative.
+        self.current_text: str = ""
+        self._video_info: dict[str, VideoInfo] = {}
+        # Model specs live in a user-editable JSON beside the app; built-ins are the
+        # fallback so a bad or missing file can't stop the app starting.
+        self.model_targets = load_targets(app_base_dir())
+        self.preset: CaptionPreset = get_preset(None)
         self.project: ProjectConfig = ProjectConfig()
         self.selected_element_index: int | None = None
         self.box_items: list = []
@@ -4293,22 +7278,29 @@ class MainWindow(QMainWindow):
         self._server_reachable = None
         self._server_modelless = False
 
-        self.setWindowTitle("Ideogram4 Fantastic Upgraded Captioning Kit")
+        self.setWindowTitle(APP_TITLE)
         # Restore the last window size/position (and maximized/screen state);
         # fall back to a sensible default on first run or if the saved blob is bad.
         geo = self.qsettings.value("window_geometry")
         if not (geo is not None and self.restoreGeometry(geo)):
-            self.resize(1400, 960)
+            self.resize(1600, 1000)
         self.apply_appearance(self.settings)
 
         self._build_toolbar()
+        self.setAcceptDrops(True)   # drag media anywhere onto the window
         self._build_body()
         self._restore_autosave_pref()
         self._load_guidance_presets()
         self._folder_tags: list[str] = []
+        play_sc = QShortcut(QKeySequence(Qt.Key_Space), self)
+        play_sc.setContext(Qt.WidgetWithChildrenShortcut)
+        play_sc.activated.connect(self.toggle_video_playback)
         self._build_server_status()
         self._start_server_monitor()
         self._maybe_check_llama_update()
+        # The panel is built in its structured form; sync it to the active preset so a
+        # fresh launch (plain text by default) doesn't show the JSON-only controls.
+        self._apply_preset_ui()
         self._set_status("Open a folder to begin.")
 
     # ---- layout ----------------------------------------------------------
@@ -4349,10 +7341,15 @@ class MainWindow(QMainWindow):
         save_all_action.setToolTip("Save all captions (Ctrl+Shift+S)")
         save_all_action.triggered.connect(self.save_all)
 
-        self.json_action = QAction(lucide_icon("braces", ic), "Raw JSON", self)
+        # Raw JSON now lives as a button under Background in the Caption tab; this
+        # slot became the system-prompt editor, which applies to every preset.
+        self.sysprompt_action = QAction(lucide_icon("braces", ic), "System prompt", self)
+        self.sysprompt_action.setToolTip("Edit the LLM system prompt for this preset")
+        self.sysprompt_action.triggered.connect(self.open_system_prompt)
+
+        self.json_action = QAction("LLM instructions", self)
         self.json_action.setCheckable(True)
         self.json_action.setShortcut("Ctrl+J")
-        self.json_action.setToolTip("Show raw caption JSON (Ctrl+J)")
         self.json_action.toggled.connect(self.toggle_json_panel)
 
         # Image navigation — bracket keys avoid colliding with text-field editing.
@@ -4374,6 +7371,36 @@ class MainWindow(QMainWindow):
         self.flag_action.setToolTip("Flag this image for manual review (F)")
         self.flag_action.triggered.connect(self._toggle_review_flag)
 
+        add_media_action = QAction(lucide_icon("image-plus", ic), "Add media\u2026", self)
+        add_media_action.setToolTip(
+            "Copy images or videos into this dataset folder (or just drag them in)")
+        add_media_action.setShortcut("Ctrl+Shift+O")
+        add_media_action.triggered.connect(self.open_add_media)
+
+        dupe_action = QAction(lucide_icon("copy", ic), "Duplicate / back up\u2026", self)
+        dupe_action.setToolTip(
+            "Copy this dataset to another folder, choosing what comes along")
+        dupe_action.triggered.connect(self.open_duplicate_dataset)
+
+        self.remove_action = QAction(lucide_icon("trash-2", ic), "Remove\u2026", self)
+        self.remove_action.setToolTip("Bypass this file, or delete it permanently")
+        self.remove_action.triggered.connect(lambda: self.remove_media())
+
+        self.bypass_action = QAction(lucide_icon("eye-off", ic), "Bypass", self)
+        self.bypass_action.setToolTip(
+            "Move this file out of the dataset into .bypass/ (still captionable)")
+        self.bypass_action.setShortcut("Ctrl+B")
+        self.bypass_action.triggered.connect(lambda: self.toggle_bypass())
+        self.crop_action = QAction(lucide_icon("crop", ic), "Crop / Resize", self)
+        self.crop_action.setToolTip("Crop or resize this image (original kept in .original/)")
+        self.crop_action.triggered.connect(self.open_crop_dialog)
+        self.crop_action.setEnabled(False)  # until an image is shown
+
+        self.batch_resize_action = QAction(lucide_icon("scaling", ic), "Batch resize…", self)
+        self.batch_resize_action.setToolTip(
+            "Resize every image in the folder (originals kept in .original/)")
+        self.batch_resize_action.triggered.connect(self.open_batch_resize)
+
         next_flag_action = QAction("Next flagged image", self)
         next_flag_action.setShortcut("Shift+F")
         next_flag_action.setToolTip("Jump to the next image flagged for review (Shift+F)")
@@ -4382,9 +7409,12 @@ class MainWindow(QMainWindow):
         about_action = QAction(lucide_icon("info", ic), "About", self)
         about_action.triggered.connect(self.show_about)
 
-        for act in (open_action, guidance_action, self.panels_action, fit_action,
+        for act in (open_action, add_media_action, guidance_action,
+                    self.panels_action, fit_action,
                     save_action, save_all_action, self.json_action,
-                    prev_action, next_action, self.flag_action, next_flag_action,
+                    prev_action, next_action, self.flag_action, self.bypass_action,
+                    self.remove_action, self.crop_action,
+                    self.batch_resize_action, self.sysprompt_action, next_flag_action,
                     prefs_action, about_action):
             self.addAction(act)
 
@@ -4395,8 +7425,11 @@ class MainWindow(QMainWindow):
         rlay = QVBoxLayout(rail)
         rlay.setContentsMargins(7, 10, 7, 10)
         rlay.setSpacing(6)
-        for act in (open_action, guidance_action, fit_action, self.panels_action,
-                    self.json_action, self.flag_action):
+        for act in (open_action, add_media_action, guidance_action, fit_action,
+                    self.panels_action,
+                    self.sysprompt_action, self.flag_action, self.bypass_action,
+                    self.crop_action, self.remove_action, dupe_action,
+                    self.batch_resize_action):
             rlay.addWidget(self._rail_button(act))
         rlay.addStretch(1)
         rlay.addWidget(self._rail_button(prefs_action))
@@ -4467,10 +7500,11 @@ class MainWindow(QMainWindow):
     def show_about(self) -> None:
         QMessageBox.about(
             self,
-            "Ideogram captioner",
-            "Ideogram JSON Captioner — Qt edition\n\n"
-            "A local tool for editing and generating structured JSON captions "
-            "for Ideogram 4 dataset preparation.\n\n"
+            f"About {APP_TITLE}",
+            f"{APP_TITLE}\n\n"
+            "A local tool for preparing image/caption datasets: crop and resize "
+            "images, then edit and generate captions with a local vision model. "
+            "Ships with structured Ideogram 4 JSON support.\n\n"
             "Built with PySide6 (Qt for Python), used under the LGPL v3.",
         )
 
@@ -4943,11 +7977,11 @@ class MainWindow(QMainWindow):
             editor._trigger_color = self.theme.accent
             editor._normal_color = self.theme.text_primary
             editor.setPlaceholderText(
-                "Just this image — name the specific characters or objects you want called out."
+                "Just this file \u2014 name the specific characters or objects you want called out."
             )
         else:
             editor.setPlaceholderText(
-                "Applied to every image here — art style, lighting, composition, "
+                "Applied to every file here \u2014 art style, lighting, composition, "
                 "things to always mention or avoid."
             )
         editor._pending = False
@@ -5026,18 +8060,18 @@ class MainWindow(QMainWindow):
             conv_div.setFrameShape(QFrame.HLine)
             left.addWidget(conv_div)
         folder_initial = self.project.folder_guidance if has_images else self.g_folder.toPlainText()
-        folder_ed = self._build_popup_scope(left, "folder", "Folder · all images", folder_initial)
+        folder_ed = self._build_popup_scope(left, "folder", "Folder \u00b7 all files", folder_initial)
 
         if has_images:
             start_idx = self.images.index(self.current) if self.current in self.images else 0
-            # work on a copy of the per-image guidance so edits can be discarded
-            work_per_image = dict(self.project.per_image)
-            image_initial = work_per_image.get(self.images[start_idx].name, "")
+            # work on a copy of the per-file guidance so edits can be discarded
+            work_per_file = dict(self.project.per_file)
+            image_initial = work_per_file.get(self.images[start_idx].name, "")
         else:
             start_idx = 0
-            work_per_image = {}
+            work_per_file = {}
             image_initial = ""
-        image_ed = self._build_popup_scope(left, "image", "This image", image_initial)
+        image_ed = self._build_popup_scope(left, "image", "This file", image_initial)
         state = {"idx": start_idx}
 
         if has_images:
@@ -5064,7 +8098,7 @@ class MainWindow(QMainWindow):
             refresh_omit()
 
         original_folder = folder_initial
-        original_per_image = {k: v for k, v in work_per_image.items() if v.strip()}
+        original_per_file = {k: v for k, v in work_per_file.items() if v.strip()}
         original_image = image_initial
 
         def save_image_field() -> None:
@@ -5074,9 +8108,9 @@ class MainWindow(QMainWindow):
             img = self.images[state["idx"]]
             text = image_ed.toPlainText()
             if text.strip():
-                work_per_image[img.name] = text
+                work_per_file[img.name] = text
             else:
-                work_per_image.pop(img.name, None)
+                work_per_file.pop(img.name, None)
 
         if has_images:
             dlg.resize(1180, 820)
@@ -5118,7 +8152,7 @@ class MainWindow(QMainWindow):
                 save_image_field()
                 state["idx"] = max(0, min(state["idx"] + delta, len(self.images) - 1))
                 image_ed._suppress = True
-                image_ed.setPlainText(work_per_image.get(self.images[state["idx"]].name, ""))
+                image_ed.setPlainText(work_per_file.get(self.images[state["idx"]].name, ""))
                 image_ed._suppress = False
                 image_ed._pending = False
                 image_ed._accept_btn.setEnabled(False)
@@ -5139,8 +8173,8 @@ class MainWindow(QMainWindow):
             if folder_ed.toPlainText() != original_folder:
                 return True
             if has_images:
-                current = {k: v for k, v in work_per_image.items() if v.strip()}
-                return current != original_per_image
+                current = {k: v for k, v in work_per_file.items() if v.strip()}
+                return current != original_per_file
             return image_ed.toPlainText() != original_image
 
         def apply() -> None:
@@ -5149,10 +8183,10 @@ class MainWindow(QMainWindow):
             folder_text = folder_ed.toPlainText()
             if has_images:
                 self.project.folder_guidance = folder_text
-                self.project.per_image = dict(work_per_image)
+                self.project.per_file = dict(work_per_file)
                 self.g_folder.setPlainText(folder_text)
                 if self.current is not None:
-                    self.load_per_image_guidance(self.current.name)
+                    self.load_per_file_guidance(self.current.name)
                 for img in self.images:
                     self._refresh_thumb_marker(img)
                 self._guidance_dirty = True
@@ -5161,10 +8195,10 @@ class MainWindow(QMainWindow):
                 self.g_folder.setPlainText(folder_text)
                 image_text = image_ed.toPlainText()
                 if image_text.strip():
-                    self.g_per_image.setPlainText(image_text)
-            nonlocal original_folder, original_per_image, original_image
+                    self.g_per_file.setPlainText(image_text)
+            nonlocal original_folder, original_per_file, original_image
             original_folder = folder_text
-            original_per_image = {k: v for k, v in work_per_image.items() if v.strip()}
+            original_per_file = {k: v for k, v in work_per_file.items() if v.strip()}
             original_image = image_ed.toPlainText()
 
         def gate() -> bool:
@@ -5213,13 +8247,13 @@ class MainWindow(QMainWindow):
         self.g_folder_enabled.setEnabled(False)
         self._folder_enabled_row = self._toggle_row(
             "Apply folder guidance", self.g_folder_enabled,
-            "When off, the folder guidance is ignored for every image. Enabled once you add folder guidance.",
+            "When off, the folder guidance is ignored for every file. Enabled once you add folder guidance.",
         )
-        self.g_per_image_enabled = ToggleSwitch()
-        self.g_per_image_enabled.setEnabled(False)
-        self._per_image_enabled_row = self._toggle_row(
-            "Apply this-image guidance", self.g_per_image_enabled,
-            "When off, this image's guidance is kept but not applied. Enabled once you add per-image guidance.",
+        self.g_per_file_enabled = ToggleSwitch()
+        self.g_per_file_enabled.setEnabled(False)
+        self._per_file_enabled_row = self._toggle_row(
+            "Apply this-file guidance", self.g_per_file_enabled,
+            "When off, this file's guidance is kept but not applied. Enabled once you add per-file guidance.",
         )
         self.g_mode = QComboBox()
         self.g_mode.addItems(list(GUIDANCE_MODES))
@@ -5232,14 +8266,14 @@ class MainWindow(QMainWindow):
         self.g_mode.setItemData(0, "Use the global Creative JSON preference from Settings.", Qt.ToolTipRole)
         self.g_mode.setItemData(1, "Describe only what is actually visible in the image.", Qt.ToolTipRole)
         self.g_mode.setItemData(2, "Allow the model to elaborate more imaginatively.", Qt.ToolTipRole)
-        self.g_per_image = QPlainTextEdit()
-        self.g_per_image.setObjectName("GuidanceBoxRO")
-        self.g_per_image.setReadOnly(True)
-        self.g_per_image.setFixedHeight(120)
-        self.g_per_image.setPlaceholderText("No guidance for this image — edit in Guidance Settings.")
-        self.g_per_image.setToolTip(
-            "Per-image guidance (read-only here). Edit it in Guidance Settings. Added on top "
-            "of the folder guidance for this image only."
+        self.g_per_file = QPlainTextEdit()
+        self.g_per_file.setObjectName("GuidanceBoxRO")
+        self.g_per_file.setReadOnly(True)
+        self.g_per_file.setFixedHeight(120)
+        self.g_per_file.setPlaceholderText("No guidance for this file \u2014 edit in Guidance Settings.")
+        self.g_per_file.setToolTip(
+            "Per-file guidance (read-only here). Edit it in Guidance Settings. Added on top "
+            "of the folder guidance for this file only."
         )
         # Convert mode (folder-wide): feed each image's .txt sidecar to the captioner
         # as a source caption to upgrade into structured JSON.
@@ -5279,21 +8313,21 @@ class MainWindow(QMainWindow):
         lay.addLayout(header)
         settings_btn = QPushButton("Guidance Settings")
         settings_btn.setToolTip(
-            "Open the full editor — edit folder & per-image guidance, browse images, "
+            "Open the full editor \u2014 edit folder & per-file guidance, browse files, "
             "and manage presets."
         )
         settings_btn.clicked.connect(self._open_guidance_expand)
         lay.addWidget(settings_btn)
         lay.addWidget(self._convert_row)
 
-        # ---- Global (applies to every image) ----
+        # ---- Global (applies to every file) ----
         lay.addWidget(self._folder_enabled_row)
         mode_label = self._field_label("Mode")
         mode_label.setToolTip("How closely generation should follow the image (applies to the whole folder).")
         lay.addWidget(mode_label)
         lay.addWidget(self.g_mode)
-        folder_label = self._field_label("Folder · all images")
-        folder_label.setToolTip("Guidance applied to every image in this folder.")
+        folder_label = self._field_label("Folder \u00b7 all files")
+        folder_label.setToolTip("Guidance applied to every file in this folder.")
         lay.addWidget(folder_label)
         lay.addWidget(self.g_folder)
 
@@ -5303,11 +8337,11 @@ class MainWindow(QMainWindow):
         lay.addWidget(divider)
 
         # ---- This image ----
-        lay.addWidget(self._per_image_enabled_row)
-        image_label = self._field_label("This image")
-        image_label.setToolTip("Guidance applied only to the currently selected image.")
+        lay.addWidget(self._per_file_enabled_row)
+        image_label = self._field_label("This file")
+        image_label.setToolTip("Guidance applied only to the currently selected file.")
         lay.addWidget(image_label)
-        lay.addWidget(self.g_per_image)
+        lay.addWidget(self.g_per_file)
 
         # Source caption sub-section (only visible in convert mode): a status line
         # and a read-only preview of the detected .txt, with an expand handle.
@@ -5348,9 +8382,9 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._source_caption_box)
 
         # Tags used — read-only reflection of which palette tags appear in THIS
-        # image's per-image guidance. Editing happens only in Guidance Settings.
+        # image's per-file guidance. Editing happens only in Guidance Settings.
         used_label = self._field_label("Tags used")
-        used_label.setToolTip("Trigger tags referenced in this image's guidance.")
+        used_label.setToolTip("Trigger tags referenced in this file's guidance.")
         lay.addWidget(used_label)
         # Note sits ABOVE the chips so its position is fixed — the flow host below
         # can grow/shrink rows without ever shoving this line around.
@@ -5413,14 +8447,14 @@ class MainWindow(QMainWindow):
         self.g_folder.textChanged.connect(self._mark_guidance_dirty)
         self.g_folder.textChanged.connect(self._sync_folder_toggle)
         self.g_folder.textChanged.connect(self._schedule_stale_refresh)
-        self.g_per_image.textChanged.connect(self._mark_guidance_dirty)
-        self.g_per_image.textChanged.connect(self._refresh_tags_used)
-        self.g_per_image.textChanged.connect(self._sync_per_image_toggle)
-        self.g_per_image.textChanged.connect(self._schedule_stale_refresh)
+        self.g_per_file.textChanged.connect(self._mark_guidance_dirty)
+        self.g_per_file.textChanged.connect(self._refresh_tags_used)
+        self.g_per_file.textChanged.connect(self._sync_per_file_toggle)
+        self.g_per_file.textChanged.connect(self._schedule_stale_refresh)
         self.g_folder_enabled.toggled.connect(self._on_folder_enabled_toggled)
-        self.g_per_image_enabled.toggled.connect(self._on_per_image_enabled_toggled)
+        self.g_per_file_enabled.toggled.connect(self._on_per_file_enabled_toggled)
         self.g_folder_enabled.toggled.connect(self._schedule_stale_refresh)
-        self.g_per_image_enabled.toggled.connect(self._schedule_stale_refresh)
+        self.g_per_file_enabled.toggled.connect(self._schedule_stale_refresh)
         self.g_mode.currentTextChanged.connect(self._mark_guidance_dirty)
         self._refresh_tags_used()
         return w
@@ -5525,7 +8559,7 @@ class MainWindow(QMainWindow):
         self._refresh_omit_markers()  # convert on/off flips every image's omit marker
 
     def _set_image_omit(self, name: str, omit: bool) -> None:
-        """Per-image override of convert mode. Used by the sidebar, pop-out, and
+        """Per-file override of convert mode. Used by the sidebar, pop-out, and
         dialog toggles, all kept in sync. The toggles are framed positively ("use
         this image's .txt"), so checked = not omitted."""
         if self.store is None or self.project is None:
@@ -5563,6 +8597,7 @@ class MainWindow(QMainWindow):
             item = items.get(str(path))
             if item is not None:
                 item.setData(OMIT_ROLE, self._image_is_omit_marked(path))
+                item.setToolTip(self._thumb_tooltip(path))
         vp = getattr(self, "filmstrip", None)
         if vp is not None:
             self.filmstrip.viewport().update()
@@ -5601,7 +8636,7 @@ class MainWindow(QMainWindow):
     def _refresh_tags_used(self) -> None:
         if not hasattr(self, "_used_tags_flow"):
             return
-        text = self.g_per_image.toPlainText()
+        text = self.g_per_file.toPlainText()
         known = list(getattr(self, "_folder_tags", [])) + [
             t for t in self._default_tags if t not in getattr(self, "_folder_tags", [])
         ]
@@ -5641,15 +8676,15 @@ class MainWindow(QMainWindow):
         sw.setChecked(on)
         sw.blockSignals(False)
 
-    def _sync_per_image_toggle(self, *args) -> None:
-        """Per-image toggle: interactive only when this image has guidance; reflects
-        the stored per-image override (default on)."""
-        has = bool(self.g_per_image.toPlainText().strip())
-        sw = self.g_per_image_enabled
+    def _sync_per_file_toggle(self, *args) -> None:
+        """Per-file toggle: interactive only when this image has guidance; reflects
+        the stored per-file override (default on)."""
+        has = bool(self.g_per_file.toPlainText().strip())
+        sw = self.g_per_file_enabled
         sw.setEnabled(has)
         proj = getattr(self, "project", None)
         name = self.current.name if self.current is not None else None
-        active = proj.per_image_active(name) if (proj is not None and name) else True
+        active = proj.per_file_active(name) if (proj is not None and name) else True
         sw.blockSignals(True)
         sw.setChecked(has and active)
         sw.blockSignals(False)
@@ -5662,10 +8697,10 @@ class MainWindow(QMainWindow):
         self.project.folder_guidance_enabled = checked
         self._guidance_dirty = True
 
-    def _on_per_image_enabled_toggled(self, checked: bool) -> None:
+    def _on_per_file_enabled_toggled(self, checked: bool) -> None:
         if self._loading or self.current is None:
             return
-        self.project.per_image_enabled[self.current.name] = checked
+        self.project.per_file_enabled[self.current.name] = checked
         self._guidance_dirty = True
 
     def load_project_into_ui(self) -> None:
@@ -5686,11 +8721,11 @@ class MainWindow(QMainWindow):
         self._guidance_dirty = False
         self._refresh_source_caption()
 
-    def load_per_image_guidance(self, filename: str) -> None:
+    def load_per_file_guidance(self, filename: str) -> None:
         self._loading = True
         try:
-            self.g_per_image.setPlainText(self.project.per_image_guidance(filename))
-            self._sync_per_image_toggle()
+            self.g_per_file.setPlainText(self.project.per_file_guidance(filename))
+            self._sync_per_file_toggle()
         finally:
             self._loading = False
         self._refresh_guidance_changes()
@@ -5758,7 +8793,7 @@ class MainWindow(QMainWindow):
         box.setVisible(convert_on)
         if not convert_on:
             self._close_source_popout()
-        # the per-image "use this .txt" toggle (only meaningful with a .txt present)
+        # the per-file "use this .txt" toggle (only meaningful with a .txt present)
         tog = getattr(self, "g_source_use", None)
         if tog is not None:
             has_txt = bool(convert_on and self.store is not None and self.current is not None
@@ -5930,13 +8965,13 @@ class MainWindow(QMainWindow):
         self.project.creative_json = MODE_TO_CREATIVE.get(self.g_mode.currentText())
         if self.current is not None:
             name = self.current.name
-            text = self.g_per_image.toPlainText()
+            text = self.g_per_file.toPlainText()
             if text.strip():
-                self.project.per_image[name] = text
-                self.project.per_image_enabled[name] = self.g_per_image_enabled.isChecked()
+                self.project.per_file[name] = text
+                self.project.per_file_enabled[name] = self.g_per_file_enabled.isChecked()
             else:
-                self.project.per_image.pop(name, None)
-                self.project.per_image_enabled.pop(name, None)
+                self.project.per_file.pop(name, None)
+                self.project.per_file_enabled.pop(name, None)
 
     def persist_guidance_if_dirty(self) -> None:
         if self.store is None or not self._guidance_dirty:
@@ -5987,6 +9022,13 @@ class MainWindow(QMainWindow):
         lay.addSpacing(6)
         lay.addWidget(self._field_label("Background"))
         lay.addWidget(self._attach_expand(self.cap_background, "Background"))
+        lay.addSpacing(8)
+        # Raw JSON lives here rather than the toolbar: it's a per-caption inspector,
+        # and it only means anything for structured presets.
+        self.rawjson_btn = QPushButton("View raw JSON")
+        self.rawjson_btn.setToolTip("Show the raw caption JSON for this image (Ctrl+J)")
+        self.rawjson_btn.clicked.connect(self._toggle_raw_json)
+        lay.addWidget(self.rawjson_btn)
         lay.addStretch(1)
 
         for w in (self.cap_high_level, self.cap_background):
@@ -5997,6 +9039,114 @@ class MainWindow(QMainWindow):
 
         scroll.setWidget(inner)
         return scroll
+
+    def _build_plain_tab(self) -> QWidget:
+        """Single free-text caption editor, used by plain-text presets. The caption
+        *is* the .txt sidecar's contents, so there's nothing to deconstruct."""
+        w = QWidget()
+        w.setObjectName("Panel")
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(4)
+        lay.addWidget(self._field_label("Caption"))
+        self.cap_plain = QPlainTextEdit()
+        self.cap_plain.setPlaceholderText(
+            "One caption for this image \u2014 saved as a .txt file next to it."
+        )
+        lay.addWidget(self._attach_expand(self.cap_plain, "Caption"), 1)
+        self.plain_count = QLabel("")
+        self.plain_count.setStyleSheet(f"color: {self.theme.text_secondary}; font-size: 11px;")
+        lay.addWidget(self.plain_count)
+        self.cap_plain.textChanged.connect(self._mark_dirty)
+        self.cap_plain.textChanged.connect(self._update_plain_count)
+        return w
+
+    def _build_preset_strip(self) -> QWidget:
+        """Preset selector across the top of the right panel. The choice is saved
+        per-folder, so a dataset always reopens in the format it was captioned in."""
+        bar = QFrame()
+        bar.setObjectName("PresetBar")
+        bar.setStyleSheet(
+            f"#PresetBar {{ background: {self.theme.surface_2}; "
+            f"border-bottom: 1px solid {self.theme.border}; }}"
+        )
+        # One row per selector. The right panel isn't wide enough to share: preset
+        # names run long ("MiniMax H3 — Official Prompt Structure"), and pairing the
+        # other two on one line collided their labels. A grid keeps the labels
+        # right-aligned so the combos start at a common left edge.
+        rows = QVBoxLayout(bar)
+        rows.setContentsMargins(8, 6, 8, 6)
+        rows.setSpacing(4)
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
+        grid.setColumnStretch(1, 1)
+        rows.addLayout(grid)
+
+        def _row(index: int, text: str) -> QLabel:
+            label = QLabel(text)
+            label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            grid.addWidget(label, index, 0)
+            return label
+
+        _row(0, "Preset:")
+        self.preset_combo = QComboBox()
+        for key in PRESET_ORDER:
+            self.preset_combo.addItem(PRESETS[key].label, key)
+        self.preset_combo.setToolTip("Caption format for this folder")
+        # The longest label ("MiniMax H3 — Official Prompt Structure") needs about
+        # 300px; below that Qt elides it, so the tooltip carries the full name and
+        # its blurb.
+        self.preset_combo.setMinimumWidth(240)
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        grid.addWidget(self.preset_combo, 0, 1)
+        # Stills and clips need different captioning guidance, and in a mixed folder
+        # you usually know which dataset you're building — so this is an explicit
+        # choice rather than something inferred per file.
+        self.media_label = _row(1, "Captioning:")
+        self.media_combo = QComboBox()
+        self.media_combo.addItem("Auto (follow file)", "auto")
+        self.media_combo.addItem("Photos", "image")
+        self.media_combo.addItem("Videos", "video")
+        self.media_combo.setToolTip(
+            "Which kind of dataset these captions are for. Changes the instructions "
+            "sent to the model.")
+        self.media_combo.setMinimumWidth(240)   # match the preset row's width
+        self.media_combo.currentIndexChanged.connect(self._on_media_mode_changed)
+        grid.addWidget(self.media_combo, 1, 1)
+
+        # What this dataset trains. Sits beside the format preset because the two
+        # are orthogonal: format decides the file's shape, the goal decides which
+        # details the caption omits.
+        _row(2, "Training:")
+        self.goal_combo = QComboBox()
+        for key in GOAL_ORDER:
+            goal = GOALS[key]
+            self.goal_combo.addItem(goal.label, key)
+            self.goal_combo.setItemData(
+                self.goal_combo.count() - 1, goal.summary, Qt.ToolTipRole)
+        self.goal_combo.setMinimumWidth(240)
+        self.goal_combo.currentIndexChanged.connect(self._on_goal_changed)
+        grid.addWidget(self.goal_combo, 2, 1)
+
+        self.preset_ext_label = QLabel("")
+        self.preset_ext_label.setStyleSheet(
+            f"color: {self.theme.text_secondary}; font-size: 11px;")
+        grid.addWidget(self.preset_ext_label, 0, 2)
+        outer = QWidget()
+        col = QVBoxLayout(outer)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(2)
+        col.addWidget(bar)
+        # The quick reference: the omit/describe rule in one line, where you're
+        # working, rather than buried in the system-prompt dialog.
+        self.goal_hint = QLabel("")
+        self.goal_hint.setObjectName("Hint")
+        self.goal_hint.setWordWrap(True)
+        self.goal_hint.setContentsMargins(12, 0, 12, 4)
+        col.addWidget(self.goal_hint)
+        return outer
 
     def _build_elements_tab(self) -> QWidget:
         w = QWidget()
@@ -6344,6 +9494,18 @@ class MainWindow(QMainWindow):
         self._set_read_only(running)
 
     def run_ai_job(self, operation: str) -> None:
+        if self.current is not None and is_video(self.current):
+            if operation in ("plain", "plain_video") and self.preset.is_plain:
+                operation = "plain_video"
+            else:
+                # Structured Ideogram JSON (and refine/bbox passes) are image
+                # pipelines; a clip has no single layout to ground boxes against.
+                QMessageBox.information(
+                    self, "Video captioning",
+                    "Videos caption with the plain-text presets (Plain text or the "
+                    "MiniMax H3 presets), which sample frames across the clip. The "
+                    "Ideogram JSON preset is image-only.")
+                return
         if self._job_running:
             return
         if self.store is None or self.current is None:
@@ -6355,9 +9517,14 @@ class MainWindow(QMainWindow):
         self.persist_guidance_if_dirty()
         caption_copy = copy.deepcopy(self.current_caption)
 
-        # resolved guidance (folder + per-image) applies to image->JSON generation;
-        # the per-project creative/faithful override, when set, wins over the global.
-        guidance = self.project.resolved_for(self.current.name) if operation == "json_image" else ""
+        # Guidance applies to every operation that *generates* a caption — the
+        # structured JSON pass and the plain-text ones alike. (Refine and bbox
+        # passes take their instructions from elsewhere, so they stay excluded.)
+        # This list originally held only "json_image"; the plain ops were added
+        # later and silently got no guidance at all.
+        generates_caption = operation in ("json_image", "plain", "plain_video")
+        guidance = (self.project.resolved_for(self.current.name)
+                    if generates_caption else "")
         # Convert mode: feed this image's .txt sidecar (if any) as the source caption.
         # Running the image always overwrites the in-editor caption, so no extra
         # confirmation is needed for a single run.
@@ -6366,7 +9533,9 @@ class MainWindow(QMainWindow):
             source_caption = self.store.load_source_text(self.current)
         self._job_operation = operation
         self._job_guidance = guidance
-        if operation == "json_image":
+        if generates_caption:
+            # Stamped onto the caption so "guidance changed since this was
+            # generated" stays accurate for plain presets too.
             self._job_guidance_folder = self.project.effective_folder_guidance()
             self._job_guidance_image = self.project.effective_image_guidance(self.current.name)
         else:
@@ -6404,7 +9573,18 @@ class MainWindow(QMainWindow):
             guidance=guidance,
             source_caption=source_caption,
             instructions=self.settings.json_refine_instructions,
+            system_prompt=self.effective_system_prompt(),
         )
+        if operation == "plain_video":
+            # Caption the span shown in the trim bar, so what's described is what
+            # an Apply would keep. A full-clip selection is simply (0, duration).
+            stage = getattr(self, "video_stage", None)
+            if stage is not None and stage._path == image_path and stage._slider.duration() > 0:
+                in_ms, out_ms = stage._slider.trim()
+                thread.span = (in_ms / 1000.0, out_ms / 1000.0)
+            thread.frame_count = max(2, int(getattr(
+                self.settings, "video_caption_frames", 6)))
+            thread.include_audio = self.audio_captioning_enabled()
         thread.progress.connect(self._on_job_progress)
         thread.done.connect(self._on_job_done)
         thread.error.connect(self._on_job_error)
@@ -6522,18 +9702,37 @@ class MainWindow(QMainWindow):
         if self._job_running:
             return
         if self.store is None or self.current is None:
-            self._set_status("Open a folder and select an image first.")
+            self._set_status("Open a folder and select a file first.")
             return
+        if self.current is not None and is_video(self.current) and not self.preset.is_plain:
+            QMessageBox.information(
+                self, "Video captioning",
+                "The Ideogram JSON preset is image-only. Switch to Plain text or a "
+                "MiniMax H3 preset to caption clips.")
+            return
+        plain = self.preset.is_plain
+        noun = "File" if plain else "Image"
         box = QMessageBox(self)
-        box.setWindowTitle("Run JSON Captioning")
-        box.setText("Caption the current image, or the whole folder?")
-        single_btn = box.addButton("Caption Single Image", QMessageBox.AcceptRole)
-        all_btn = box.addButton("Caption All Images", QMessageBox.AcceptRole)
+        box.setWindowTitle("Run Captioning" if plain else "Run JSON Captioning")
+        box.setText(f"Caption the current {noun.lower()}, or the whole folder?")
+        if plain and self.current is not None and is_video(self.current):
+            frames = max(2, int(getattr(self.settings, "video_caption_frames", 6)))
+            audio_ok, why = self.audio_status()
+            if audio_ok:
+                box.setInformativeText(
+                    f"Clips are captioned from {frames} sampled frames plus the "
+                    "clip's audio, so dialogue and sound can be described.")
+            else:
+                box.setInformativeText(
+                    f"Clips are captioned from {frames} sampled frames only \u2014 "
+                    f"no audio.\n\n{why}")
+        single_btn = box.addButton(f"Caption Single {noun}", QMessageBox.AcceptRole)
+        all_btn = box.addButton(f"Caption All {noun}s", QMessageBox.AcceptRole)
         box.addButton(QMessageBox.Cancel)
         box.exec()
         clicked = box.clickedButton()
         if clicked is single_btn:
-            self.run_ai_job("json_image")
+            self.run_ai_job("plain" if plain else "json_image")   # video re-routes inside
         elif clicked is all_btn:
             self.run_batch_caption()
 
@@ -6548,7 +9747,7 @@ class MainWindow(QMainWindow):
 
     def _set_filmstrip_locked(self, locked: bool) -> None:
         """Freeze image navigation while a batch runs so the selection can't move
-        out from under the per-image reloads."""
+        out from under the per-file reloads."""
         self._nav_locked = locked
         self.filmstrip.setEnabled(not locked)
 
@@ -6585,6 +9784,10 @@ class MainWindow(QMainWindow):
         self._read_only = on
         self._set_panel_editable(not on)
         self._set_canvas_locked(on)
+        if hasattr(self, "crop_action"):
+            self.crop_action.setEnabled(not on and self.current is not None)
+        if hasattr(self, "batch_resize_action"):
+            self.batch_resize_action.setEnabled(not on)
         if hasattr(self, "_readonly_banner"):
             self._readonly_banner.setVisible(on)
 
@@ -6767,11 +9970,29 @@ class MainWindow(QMainWindow):
         total = len(self.images)
         # Commit live guidance first so "changed since last caption" is accurate.
         self.commit_guidance()
+        if not self.preset.is_plain:
+            videos = [img for img in self.images if is_video(img)]
+            if videos and len(videos) == total:
+                QMessageBox.information(
+                    self, "Caption all files",
+                    "This folder contains only videos, and the Ideogram JSON preset "
+                    "is image-only. Switch to Plain text or a MiniMax H3 preset to "
+                    "caption clips.")
+                return
+            if videos:
+                self._set_status(
+                    f"{len(videos)} video(s) will be skipped \u2014 the Ideogram JSON "
+                    "preset is image-only.")
         already = [img for img in self.images if self._image_has_caption(img)]
         already_set = set(already)
         new_imgs = [img for img in self.images if img not in already_set]
         stale = [img for img in already if self.project.guidance_changed(img.name)]
-        work = list(self.images)
+        # Bypassed files are out of the dataset, so they're out of the batch —
+        # captioning them individually is still allowed.
+        work = [img for img in self.images if not self.store.is_bypassed(img)]
+        if not self.preset.is_plain:
+            work = [img for img in work if not is_video(img)]
+        total = len(work)
         convert_note = ""
         if self.project.convert_txt_to_json:
             with_txt = sum(1 for img in self.images if self.store.has_source_text(img))
@@ -6844,7 +10065,7 @@ class MainWindow(QMainWindow):
         ]
         # remember the guidance actually sent, to stamp each caption on completion
         self._batch_guidance = {str(img): g for img, g, _sc in items}
-        # the same, split by scope, so a later change can be attributed folder vs per-image
+        # the same, split by scope, so a later change can be attributed folder vs per-file
         self._batch_guidance_folder = {
             str(img): self.project.effective_folder_guidance() for img in work}
         self._batch_guidance_image = {
@@ -6874,7 +10095,11 @@ class MainWindow(QMainWindow):
         self._batch_abort_shown = False
         self._set_ai_running(True)
         self._set_job_progress(f"Captioning 0/{n}…", value=0, total=n)
-        thread = BatchCaptionThread(job_settings, items, delay_ms=delay)
+        thread = BatchCaptionThread(
+            job_settings, items, delay_ms=delay,
+            system_prompt=self.effective_system_prompt() if self.preset.is_plain else "")
+        thread.frame_count = max(2, int(getattr(self.settings, "video_caption_frames", 6)))
+        thread.include_audio = self.audio_captioning_enabled()
         thread.item_progress.connect(self._on_batch_progress)
         thread.item_done.connect(self._on_batch_item_done)
         thread.item_error.connect(self._on_batch_item_error)
@@ -6892,7 +10117,10 @@ class MainWindow(QMainWindow):
             return
         path = Path(image_path_str)
         try:
-            self.store.save_caption(path, caption)
+            if self.preset.is_plain:
+                self.store.save_plain_caption(path, self.postprocess_caption(str(caption)))
+            else:
+                self.store.save_caption(path, caption)
         except Exception as exc:
             self._set_status(f"Save failed for {path.name}: {exc}")
             return
@@ -6905,12 +10133,17 @@ class MainWindow(QMainWindow):
         image_part = getattr(self, "_batch_guidance_image", {}).get(
             image_path_str, self.project.effective_image_guidance(path.name))
         self.project.mark_generated(path.name, guidance, folder_part, image_part)   # persisted at batch end
-        # Tier 0-2 health check: flag corrupt/off-schema captions for review.
-        issues = caption_health(caption)
-        try:
-            key = serialize_caption(caption)
-        except Exception:
-            key = None
+        # Schema health is structured-only, but the duplicate-caption check catches
+        # context bleed in both formats, so it stays.
+        if self.preset.is_plain:
+            issues = []
+            key = str(caption).strip() or None
+        else:
+            issues = caption_health(caption)
+            try:
+                key = serialize_caption(caption)
+            except Exception:
+                key = None
         if key:
             prior = getattr(self, "_batch_caption_hashes", {}).get(key)
             if prior and prior != path.name:
@@ -6943,7 +10176,7 @@ class MainWindow(QMainWindow):
     def _on_batch_finished(self, success: int, fail: int, cancelled: bool) -> None:
         self._set_ai_running(False)
         self._ai_thread = None
-        # persist the per-image guidance stamps gathered during the run
+        # persist the per-file guidance stamps gathered during the run
         if self.store is not None:
             try:
                 self.store.save_project(self.project)
@@ -6978,18 +10211,25 @@ class MainWindow(QMainWindow):
         if self._job_cancelled or self.store is None or self.current is None:
             return
         try:
-            self.store.save_caption(self.current, caption)
+            if self.preset.is_plain:
+                # A plain preset's caption is text; save_caption would serialise it
+                # as JSON into the .txt sidecar.
+                self.store.save_plain_caption(self.current, self.postprocess_caption(str(caption)))
+            else:
+                self.store.save_caption(self.current, caption)
         except Exception as exc:
             QMessageBox.critical(self, "Could not save result", str(exc))
             return
         # the AI result is now on disk; drop any buffered edits and reload it
         self._pending.pop(str(self.current), None)
-        if getattr(self, "_job_operation", "") == "json_image":
+        if getattr(self, "_job_operation", "") in ("json_image", "plain", "plain_video"):
             self.project.mark_generated(
                 self.current.name, getattr(self, "_job_guidance", ""),
                 getattr(self, "_job_guidance_folder", ""),
                 getattr(self, "_job_guidance_image", ""))
-            self.project.set_flags(self.current.name, caption_health(caption))
+            # Schema health only means something for the structured preset.
+            if not self.preset.is_plain:
+                self.project.set_flags(self.current.name, caption_health(caption))
             try:
                 self.store.save_project(self.project)
             except OSError:
@@ -7109,7 +10349,7 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Horizontal)
 
-        # Left: folder + per-image guidance.
+        # Left: folder + per-file guidance.
         self.left_panel = self._build_guidance_panel()
         self.left_panel.setMinimumWidth(190)
 
@@ -7124,7 +10364,22 @@ class MainWindow(QMainWindow):
         center_lay = QVBoxLayout(center)
         center_lay.setContentsMargins(0, 0, 0, 0)
         center_lay.setSpacing(0)
-        center_lay.addWidget(self.view, 1)
+        # Images and videos each get a full-size stage in the same slot, so video
+        # controls are inline in the main window rather than behind a popup.
+        self.video_stage = VideoStage(self)
+        self.center_stack = QStackedWidget()
+        # The image page carries its edit controls beneath the canvas, matching the
+        # video stage — editing a photo shouldn't mean hunting for a modal when
+        # editing a clip is inline.
+        image_page = QWidget()
+        image_lay = QVBoxLayout(image_page)
+        image_lay.setContentsMargins(0, 0, 0, 0)
+        image_lay.setSpacing(0)
+        image_lay.addWidget(self.view, 1)
+        image_lay.addWidget(self._build_image_edit_bar())
+        self.center_stack.addWidget(image_page)         # 0: image canvas
+        self.center_stack.addWidget(self.video_stage)   # 1: video
+        center_lay.addWidget(self.center_stack, 1)
         center_lay.addWidget(self._build_nav_bar())
         # Floating tool strip: an overlay child of the view (NOT the viewport — the
         # viewport scrolls its children when panning, which would drag the strip).
@@ -7132,10 +10387,15 @@ class MainWindow(QMainWindow):
         self._toolstrip.setParent(self.view)
         self._toolstrip.raise_()
 
-        # Right: AI actions above a tabbed Caption / Elements panel.
+        # Right: preset selector + AI actions above the editor for the active preset.
+        # Structured presets get the Caption/Elements tabs; plain presets get a single
+        # free-text field, so the Ideogram-specific UI simply isn't present.
         self.right_tabs = QTabWidget()
         self.right_tabs.addTab(self._build_caption_tab(), "Caption")
         self.right_tabs.addTab(self._build_elements_tab(), "Elements")
+        self.editor_stack = QStackedWidget()
+        self.editor_stack.addWidget(self._build_plain_tab())   # index 0: plain
+        self.editor_stack.addWidget(self.right_tabs)           # index 1: structured
 
         right_container = QWidget()
         right_container.setObjectName("Panel")
@@ -7154,8 +10414,9 @@ class MainWindow(QMainWindow):
             f"padding: 7px 10px; font-size: 12px; }}"
         )
         right_lay.addWidget(self._readonly_banner)
+        right_lay.addWidget(self._build_preset_strip())
         right_lay.addWidget(self._build_ai_actions())
-        right_lay.addWidget(self.right_tabs, 1)
+        right_lay.addWidget(self.editor_stack, 1)
         right_container.setMinimumWidth(290)
 
         self.json_panel = self._build_json_panel()
@@ -7166,7 +10427,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([210, 820, 360])
+        splitter.setSizes([210, 1000, 390])
         self.splitter = splitter
         splitter.splitterMoved.connect(
             lambda *_: self.qsettings.setValue("splitter_state_v2", self.splitter.saveState())
@@ -7178,8 +10439,8 @@ class MainWindow(QMainWindow):
         body_lay.setSpacing(0)
         body_lay.addWidget(self.rail)
         body_lay.addWidget(splitter, 1)
-        self._json_tab = VerticalTab("RAW JSON")
-        self._json_tab.setToolTip("Show raw caption JSON (Ctrl+J)")
+        self._json_tab = VerticalTab("LLM INSTRUCTIONS")
+        self._json_tab.setToolTip("Show the instructions sent to the LLM (Ctrl+J)")
         self._json_tab.clicked.connect(self.json_action.toggle)
         body_lay.addWidget(self._json_tab)
         self._body = body
@@ -7312,23 +10573,27 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(6)
-        header = QLabel("Raw caption JSON")
+        header = QLabel("LLM instructions")
         header.setObjectName("SectionLabel")
         lay.addWidget(header)
+        self._instr_sub = QLabel("")
+        self._instr_sub.setWordWrap(True)
+        self._instr_sub.setStyleSheet(
+            f"color: {self.theme.text_secondary}; font-size: 11px;")
+        lay.addWidget(self._instr_sub)
         self.json_view = QPlainTextEdit()
         self.json_view.setReadOnly(True)
-        self.json_view.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.json_view.setFont(QFont(self.settings.mono_font_family or "Monospace"))
         lay.addWidget(self.json_view, 1)
         row = QHBoxLayout()
         copy_btn = QPushButton("Copy")
-        copy_btn.setToolTip("Copy the JSON to the clipboard.")
+        copy_btn.setToolTip("Copy these instructions to the clipboard.")
         copy_btn.clicked.connect(self._copy_json)
-        save_btn = QPushButton("Save as…")
-        save_btn.setToolTip("Save the JSON to a file.")
-        save_btn.clicked.connect(self._save_json_as)
+        edit_btn = QPushButton("Edit…")
+        edit_btn.setToolTip("Edit the system prompt for this preset.")
+        edit_btn.clicked.connect(self.open_system_prompt)
         row.addWidget(copy_btn)
-        row.addWidget(save_btn)
+        row.addWidget(edit_btn)
         row.addStretch(1)
         lay.addLayout(row)
         return panel
@@ -7397,10 +10662,12 @@ class MainWindow(QMainWindow):
         if getattr(self, "_json_tab", None) is not None:
             self._json_tab.set_on(checked)
             self._json_tab.setToolTip(
-                "Hide raw caption JSON (Ctrl+J)" if checked else "Show raw caption JSON (Ctrl+J)"
+                "Hide the LLM instructions (Ctrl+J)" if checked
+                else "Show the instructions sent to the LLM (Ctrl+J)"
             )
         self.json_action.setToolTip(
-            "Hide raw caption JSON (Ctrl+J)" if checked else "Show raw caption JSON (Ctrl+J)"
+            "Hide the LLM instructions (Ctrl+J)" if checked
+            else "Show the instructions sent to the LLM (Ctrl+J)"
         )
 
     def _reposition_json_overlay(self) -> None:
@@ -7417,21 +10684,54 @@ class MainWindow(QMainWindow):
             panel.raise_()
 
     def _refresh_json_view(self) -> None:
+        """Render what would actually be sent to the model right now: the preset's
+        system prompt assembled with the guidance in effect for the current image."""
         if not getattr(self, "json_panel", None) or not self.json_panel.isVisible():
             return
-        try:
-            pretty = json.dumps(json.loads(serialize_caption(self.current_caption)),
-                                indent=2, ensure_ascii=False)
-        except Exception:
-            pretty = ""
+        text = self.current_llm_instructions()
         sb = self.json_view.verticalScrollBar()
         pos = sb.value()
-        self.json_view.setPlainText(pretty)
+        self.json_view.setPlainText(text)
         sb.setValue(min(pos, sb.maximum()))
+        if hasattr(self, "_instr_sub"):
+            name = self.current.name if self.current is not None else "no image selected"
+            self._instr_sub.setText(f"{self.preset.label} \u00b7 {name}")
+
+    def current_llm_instructions(self) -> str:
+        """The system message the captioning run would send for the current image and
+        preset — assembled from the same helpers the run path uses, so what's shown
+        here is what's actually sent, not a paraphrase."""
+        guidance = ""
+        if self.project is not None and self.current is not None:
+            try:
+                guidance = self.project.resolved_for(self.current.name) or ""
+            except Exception:
+                guidance = ""
+        if self.preset.is_plain:
+            parts = [self.effective_system_prompt().strip()]
+            if guidance.strip():
+                parts.append("Additional guidance for this image:\n" + guidance.strip())
+            return "\n\n".join(p for p in parts if p)
+        # Structured presets build their prompt from the template files, exactly as
+        # the run path does.
+        try:
+            prompts = load_prompts()
+            convert = (self.current is not None
+                       and self._image_uses_source(self.current))
+            key = "image_to_json_convert_system" if convert else "image_to_json_system"
+            if key not in prompts:
+                key = "image_to_json_system"
+            text = json_system_prompt(prompts, key, self.settings, guidance=guidance)
+        except Exception as exc:
+            return f"(Could not assemble the prompt: {exc})"
+        extra = self.system_prompt_for_preset().strip()
+        if extra:
+            text += "\n\n" + extra
+        return text
 
     def _copy_json(self) -> None:
         QApplication.clipboard().setText(self.json_view.toPlainText())
-        self._set_status("Caption JSON copied to clipboard.")
+        self._set_status("LLM instructions copied to clipboard.")
 
     def _save_json_as(self) -> None:
         if self.current is not None:
@@ -7450,70 +10750,94 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Could not save JSON", str(exc))
 
     def open_folder(self) -> None:
+        if not self.confirm_discard_video_edits("open another folder"):
+            return
         start_dir = self.qsettings.value("last_folder", "", str)
         if start_dir and not Path(start_dir).is_dir():
             start_dir = ""
         folder = QFileDialog.getExistingDirectory(self, "Open image folder", start_dir)
         if not folder:
             return
+        self.load_folder_path(Path(folder))
+
+    def load_folder_path(self, folder: Path) -> None:
+        """Open a specific folder. Split out of open_folder so callers that already
+        know the path (duplicating a dataset, a future recent-folders list) don't
+        have to go through a file dialog to get there."""
+        folder = str(folder)
         self.qsettings.setValue("last_folder", folder)
         try:
-            self.store = CaptionStore(Path(folder), self.settings_caption_ext())
+            # Read the project first: the folder's saved preset decides which
+            # sidecar extension the store reads and writes.
+            probe = CaptionStore(Path(folder), self.settings_caption_ext())
+            project = probe.load_project()
+            self.preset = get_preset(project.preset)
+            self.store = CaptionStore(Path(folder), self.preset.extension)
+            # Clear anything an interrupted render left behind before listing.
+            self.store.sweep_work_files()
             self.images = self.store.images()
-            self.project = self.store.load_project()
+            self.project = project
+            self._apply_preset_ui()
             self._load_folder_tags()
         except Exception as exc:  # Tier 2: surface failures readably.
             QMessageBox.critical(self, "Could not open folder", str(exc))
             return
 
         self.load_project_into_ui()
-        self.filmstrip.clear()
-        self._pending = {}
-        self._thumb_items = {}
-        self._thumb_base = {}
-        for _a in self._dirty_dot_anims.values():
-            _a.stop()
-        self._dirty_dot_anims = {}
-        self._dirty_dot = {}
-        self._preview_cache = {}
-        self._hover_item = None
-        self._hover_preview.hide()
-        if not self.images:
-            self._set_status(f"No images found in {folder}")
-            self._update_count_label()
-            return
-
-        for path in self.images:
-            self._thumb_base[str(path)] = self._thumb_pixmap(path)
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, str(path))
-            item.setData(UNSAVED_ROLE, False)
-            item.setData(STALE_ROLE, self.project.guidance_changed(path.name))
-            # Re-validate the caption file on disk (catches hand-edits / corruption
-            # since the last run), not just the flags stamped at generation time.
-            _issues = self.store.caption_file_issues(path)
-            self.project.set_flags(path.name, _issues)
-            _flagged = self.project.is_review_marked(path.name)
-            item.setData(REVIEW_ROLE, bool(_issues))
-            item.setData(FLAG_ROLE, _flagged)
-            item.setData(OMIT_ROLE, self._image_is_omit_marked(path))
-            item.setToolTip("")  # marker meanings now live in the hover-preview banners
-            self.filmstrip.addItem(item)
-            self._thumb_items[str(path)] = item
-            item.setIcon(self._decorated_thumb(path))
-            item.setText(self._thumb_label(path))
+        self._rebuild_filmstrip()
         self.filmstrip.setCurrentRow(0)
         self._set_status(f"{len(self.images)} images in {Path(folder).name}")
         self._update_count_label()
 
     def settings_caption_ext(self) -> str:
-        return ".json"
+        return self.preset.extension
 
     def _thumb_pixmap(self, path: Path) -> QPixmap:
-        pm = QPixmap(str(path))
+        if is_video(path):
+            pm = QPixmap(str(self._video_poster(path))) if self._video_poster(path) else QPixmap()
+            if pm.isNull():
+                pm = self._video_placeholder()
+        else:
+            pm = QPixmap(str(path))
         if pm.isNull():
             return QPixmap(THUMB, THUMB)
         return pm.scaled(THUMB, THUMB, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+    def _poster_cache_dir(self) -> Path | None:
+        if self.store is None:
+            return None
+        return self.store.project_dir() / "thumbs"
+
+    def _video_poster(self, path: Path) -> Path | None:
+        """Poster frame for a video, extracted once and cached in .captioner/thumbs
+        (keyed by name + mtime, so an edited clip regenerates). None without ffmpeg."""
+        cache = self._poster_cache_dir()
+        if cache is None:
+            return None
+        try:
+            stamp = int(path.stat().st_mtime)
+        except OSError:
+            stamp = 0
+        out = cache / f"{path.stem}.{stamp}.jpg"
+        if out.exists():
+            return out
+        # drop stale posters for this clip
+        for old in cache.glob(f"{path.stem}.*.jpg"):
+            old.unlink(missing_ok=True)
+        if not ffmpeg_available():
+            return None
+        return out if extract_poster(path, out) else None
+
+    def _video_placeholder(self) -> QPixmap:
+        """Neutral film-strip tile shown when ffmpeg isn't available yet."""
+        pm = QPixmap(THUMB, THUMB)
+        pm.fill(QColor(self.theme.surface_2))
+        painter = QPainter(pm)
+        painter.drawPixmap(
+            (THUMB - 28) // 2, (THUMB - 28) // 2,
+            lucide_pixmap("film", self.theme.text_secondary, 28))
+        painter.end()
+        return pm
 
     def _maybe_wasd_navigate(self, event) -> bool:
         """A = previous image, D = next image — from anywhere in the main window or
@@ -7630,40 +10954,960 @@ class MainWindow(QMainWindow):
         if current is None:
             return
         if self.current is not None:
-            self.commit_caption_fields()
-            self.commit_element_fields()
+            self._commit_active_caption()
             if self._autosave:
                 if self._dirty:
                     self.save_current(silent=True)
             elif self._dirty:
                 # keep edits in memory; do NOT write to disk until the user saves
-                self._pending[str(self.current)] = self.current_caption
+                self._pending[str(self.current)] = (
+                    self.current_text if self.preset.is_plain else self.current_caption)
                 self._refresh_thumb_marker(self.current)
         self.persist_guidance_if_dirty()
         path = Path(current.data(Qt.UserRole))
         self.show_image(path)
         self.load_caption_for(path)
-        self.load_per_image_guidance(path.name)
+        self.load_per_file_guidance(path.name)
         self._sync_flag_action()
 
     def show_image(self, path: Path) -> None:
         self.current = path
+        if is_video(path):
+            self.video_stage.load(path, self._video_info.get(str(path)))
+            self.center_stack.setCurrentIndex(1)
+            if getattr(self, "_toolstrip", None) is not None:
+                self._toolstrip.setVisible(False)
+            self._show_video_meta(path)
+            self._refresh_json_view()
+            return
+        # leaving a video: release the file and its audio device
+        if self.center_stack.currentIndex() == 1:
+            self.video_stage.stop()
+            self.center_stack.setCurrentIndex(0)
+        if getattr(self, "_toolstrip", None) is not None:
+            self._toolstrip.setVisible(self.preset.has_boxes)
         pm = QPixmap(str(path))
         self.scene.clear()
         self.pixmap_item = None
         self.box_items = []
         if pm.isNull():
             self._set_status(f"Could not open {path.name}")
+            self.crop_action.setEnabled(False)
             return
+        self._image_rotation = 0
+        self._image_crop_item = None
+        if hasattr(self, "img_crop_btn") and self.img_crop_btn.isChecked():
+            self.img_crop_btn.blockSignals(True)
+            self.img_crop_btn.setChecked(False)
+            self.img_crop_btn.blockSignals(False)
+            self.img_aspect.setVisible(False)
         self.pixmap_item = self.scene.addPixmap(pm)
         self.scene.setSceneRect(self.pixmap_item.boundingRect())
         self._user_zoomed = False
         self.view.resetTransform()
         self.view.fitInView(self.pixmap_item, Qt.KeepAspectRatio)
         self._refresh_title()
-        self._set_status(f"{path.name}  ·  {pm.width()}×{pm.height()}")
+        self._set_status(f"{path.name}  \u00b7  {pm.width()}\u00d7{pm.height()}")
         self._update_count_label()
         self._update_zoom_label()
+        self.crop_action.setEnabled(not getattr(self, "_read_only", False))
+        if hasattr(self, "image_edit_bar"):
+            editable = not getattr(self, "_read_only", False)
+            for widget in (self.img_crop_btn, self.img_rot_ccw, self.img_rot_cw,
+                           self.img_reset_btn):
+                widget.setEnabled(editable)
+            self._seed_size_fields()
+            # Apply follows whether there's anything to apply, so it's set last.
+            self._refresh_image_edit_label()
+
+    def _build_image_edit_bar(self) -> QWidget:
+        """Crop, rotate and resize for the picture on screen — the same shape as the
+        video edit bar, so both media types are edited the same way."""
+        t = self.theme
+        bar = QFrame()
+        bar.setObjectName("ImageEditBar")
+        bar.setStyleSheet(
+            f"#ImageEditBar {{ background: {t.surface_1}; "
+            f"border-top: 1px solid {t.border}; }}")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(12, 6, 12, 6)
+        row.setSpacing(8)
+
+        self.img_crop_btn = QPushButton("Crop")
+        self.img_crop_btn.setCheckable(True)
+        self.img_crop_btn.setToolTip("Draw a crop region on the image")
+        self.img_crop_btn.toggled.connect(self.set_image_crop_enabled)
+        row.addWidget(self.img_crop_btn)
+
+        self.img_aspect = QComboBox()
+        for label, _ratio in ASPECT_PRESETS:
+            self.img_aspect.addItem(label)
+        self.img_aspect.setToolTip("Constrain the crop to an aspect ratio")
+        self.img_aspect.setVisible(False)
+        self.img_aspect.currentIndexChanged.connect(self._on_image_aspect)
+        row.addWidget(self.img_aspect)
+
+        self.img_rot_ccw = QToolButton()
+        self.img_rot_ccw.setObjectName("NavBtn")
+        self.img_rot_ccw.setIcon(lucide_icon("rotate-ccw", t.text_secondary, 15))
+        self.img_rot_ccw.setToolTip("Rotate 90\u00b0 anticlockwise")
+        self.img_rot_ccw.clicked.connect(lambda: self.rotate_image_by(-90))
+        row.addWidget(self.img_rot_ccw)
+        self.img_rot_cw = QToolButton()
+        self.img_rot_cw.setObjectName("NavBtn")
+        self.img_rot_cw.setIcon(lucide_icon("rotate-cw", t.text_secondary, 15))
+        self.img_rot_cw.setToolTip("Rotate 90\u00b0 clockwise")
+        self.img_rot_cw.clicked.connect(lambda: self.rotate_image_by(90))
+        row.addWidget(self.img_rot_cw)
+
+        # Resize inline, with no enabling checkbox: the boxes hold the current size,
+        # so changing them IS the request. A checkbox was a second thing to click
+        # that only ever said "I meant it".
+        row.addWidget(QLabel("Size:"))
+        self.img_w = QSpinBox()
+        self.img_w.setRange(1, 32768)
+        self.img_w.setMaximumWidth(80)
+        self.img_w.setToolTip("Output width")
+        self.img_w.valueChanged.connect(lambda v: self._on_size_typed("w", v))
+        row.addWidget(self.img_w)
+        times = QLabel("\u00d7")
+        times.setStyleSheet(f"color: {t.text_secondary};")
+        row.addWidget(times)
+        self.img_h = QSpinBox()
+        self.img_h.setRange(1, 32768)
+        self.img_h.setMaximumWidth(80)
+        self.img_h.setToolTip("Output height")
+        self.img_h.valueChanged.connect(lambda v: self._on_size_typed("h", v))
+        row.addWidget(self.img_h)
+        px = QLabel("px")
+        px.setStyleSheet(f"color: {t.text_secondary};")
+        row.addWidget(px)
+        self.img_lock = QToolButton()
+        self.img_lock.setObjectName("NavBtn")
+        self.img_lock.setCheckable(True)
+        self.img_lock.setChecked(True)
+        self.img_lock.setIcon(lucide_icon("link", t.text_secondary, 15))
+        self.img_lock.setToolTip("Keep the aspect ratio when resizing")
+        row.addWidget(self.img_lock)
+
+        self.img_reset_btn = QPushButton("Reset")
+        self.img_reset_btn.setToolTip("Drop the crop and rotation")
+        self.img_reset_btn.clicked.connect(self.reset_image_edit)
+        row.addWidget(self.img_reset_btn)
+
+        self.img_edit_label = QLabel("")
+        self.img_edit_label.setObjectName("Hint")
+        row.addWidget(self.img_edit_label, 1)
+
+        self.img_revert_btn = QPushButton("Restore original")
+        self.img_revert_btn.setToolTip(
+            "Undo every edit: put the pre-edit file back and drop the backup")
+        self.img_revert_btn.clicked.connect(self.restore_original_media)
+        row.addWidget(self.img_revert_btn)
+
+        more = QPushButton("More\u2026")
+        more.setToolTip("Open the full crop/resize dialog for exact pixel sizes")
+        more.clicked.connect(self.open_crop_dialog)
+        row.addWidget(more)
+
+        self.img_apply_btn = QPushButton("Apply edit\u2026")
+        self.img_apply_btn.setToolTip("Write the crop and rotation to the file")
+        self.img_apply_btn.clicked.connect(self.apply_image_edit)
+        row.addWidget(self.img_apply_btn)
+        self._image_rotation = 0
+        self._image_crop_item = None
+        self.image_edit_bar = bar
+        return bar
+
+    # ---- image editing ----
+
+    def set_image_crop_enabled(self, on: bool) -> None:
+        self.img_aspect.setVisible(on)
+        if on:
+            if self.pixmap_item is None:
+                self.img_crop_btn.setChecked(False)
+                return
+            bounds = self.pixmap_item.boundingRect()
+            self._image_crop_item = CropRectItem(bounds, self._refresh_image_edit_label)
+            self.scene.addItem(self._image_crop_item)
+            self._on_image_aspect(self.img_aspect.currentIndex())
+        elif self._image_crop_item is not None:
+            self.scene.removeItem(self._image_crop_item)
+            self._image_crop_item = None
+        self._refresh_image_edit_label()
+
+    def _on_image_aspect(self, idx: int) -> None:
+        if self._image_crop_item is not None and 0 <= idx < len(ASPECT_PRESETS):
+            self._image_crop_item.set_aspect(ASPECT_PRESETS[idx][1])
+            self._refresh_image_edit_label()
+
+    def image_crop_box(self) -> tuple[int, int, int, int] | None:
+        if self._image_crop_item is None or self.pixmap_item is None:
+            return None
+        r = self._image_crop_item.rect()
+        return (max(0, int(round(r.x()))), max(0, int(round(r.y()))),
+                max(1, int(round(r.width()))), max(1, int(round(r.height()))))
+
+    def _seed_size_fields(self) -> None:
+        """Put the picture's real size in the boxes, so they read as current state
+        rather than an empty form."""
+        if self.pixmap_item is None:
+            return
+        rect = self.pixmap_item.boundingRect()
+        for box, value in ((self.img_w, int(rect.width())),
+                           (self.img_h, int(rect.height()))):
+            box.blockSignals(True)
+            box.setValue(value)
+            box.blockSignals(False)
+        self._base_size = (int(rect.width()), int(rect.height()))
+
+    def _on_size_typed(self, which: str, value: int) -> None:
+        if self.img_lock.isChecked() and getattr(self, "_base_size", None):
+            bw, bh = self._base_size
+            if bw and bh:
+                other, target = ((self.img_h, round(value * bh / bw)) if which == "w"
+                                 else (self.img_w, round(value * bw / bh)))
+                other.blockSignals(True)
+                other.setValue(max(1, target))
+                other.blockSignals(False)
+        self._refresh_image_edit_label()
+
+    def output_size(self) -> tuple[int, int]:
+        return int(self.img_w.value()), int(self.img_h.value())
+
+    def rotate_image_by(self, degrees: int) -> None:
+        """Turn the view so the crop rect is drawn against the final orientation."""
+        if self.pixmap_item is None:
+            return
+        self._image_rotation = (self._image_rotation + degrees) % 360
+        self.view.resetTransform()
+        if self._image_rotation:
+            self.view.rotate(self._image_rotation)
+        self.view.fitInView(self.pixmap_item, Qt.KeepAspectRatio)
+        self._refresh_image_edit_label()
+
+    def reset_image_edit(self) -> None:
+        self._image_rotation = 0
+        self._seed_size_fields()
+        self.view.resetTransform()
+        if self.img_crop_btn.isChecked():
+            self.img_crop_btn.setChecked(False)
+        if self.pixmap_item is not None:
+            self.view.fitInView(self.pixmap_item, Qt.KeepAspectRatio)
+        self._refresh_image_edit_label()
+
+    def _refresh_image_edit_label(self) -> None:
+        bits = []
+        crop = self.image_crop_box()
+        if crop and self.pixmap_item is not None:
+            full = self.pixmap_item.boundingRect()
+            if (crop[2], crop[3]) != (int(full.width()), int(full.height())):
+                bits.append(f"crop {crop[2]}\u00d7{crop[3]}")
+        if self._image_rotation:
+            bits.append(f"rotated {self._image_rotation}\u00b0")
+        if getattr(self, "_base_size", None) and self.output_size() != self._base_size:
+            w, h = self.output_size()
+            bits.append(f"resize to {w}\u00d7{h}")
+        self.img_edit_label.setText(
+            "Unapplied: " + ", ".join(bits) if bits else "")
+        self.img_edit_label.setStyleSheet(
+            f"color: {self.theme.warning};" if bits
+            else f"color: {self.theme.text_secondary};")
+        self.img_apply_btn.setEnabled(bool(bits))
+
+    def apply_image_edit(self) -> None:
+        """Write crop + rotation in place, keeping the untouched original."""
+        if self.current is None or self.pixmap_item is None:
+            return
+        crop = self.image_crop_box()
+        rotation = self._image_rotation % 360
+        full = self.pixmap_item.boundingRect()
+        cropping = bool(crop and (crop[2], crop[3]) != (int(full.width()),
+                                                        int(full.height())))
+        out_w, out_h = self.output_size()
+        resizing = bool(getattr(self, "_base_size", None)
+                        and (out_w, out_h) != self._base_size)
+        if not cropping and not rotation and not resizing:
+            self._set_status("Nothing to apply.")
+            return
+        changes = []
+        if cropping:
+            changes.append(f"crop to {crop[2]}\u00d7{crop[3]}")
+        if rotation:
+            changes.append(f"rotate {rotation}\u00b0")
+        if resizing:
+            changes.append(f"resize to {out_w}\u00d7{out_h}")
+        if QMessageBox.question(
+            self, "Apply image edit",
+            f"{', '.join(changes).capitalize()} on {self.current.name}?\n\n"
+            "The untouched original is kept in .original/.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        ) != QMessageBox.Yes:
+            return
+        from PIL import Image
+        try:
+            if self.store is not None:
+                self.store.backup_original(self.current)
+            with Image.open(self.current) as im:
+                im.load()
+                if cropping:
+                    x, y, cw, ch = crop
+                    im = im.crop((x, y, x + cw, y + ch))
+                if rotation:
+                    im = im.rotate(-rotation, expand=True)
+                if resizing and not rotation:
+                    # After a quarter turn the requested size describes the
+                    # pre-rotation frame, so it no longer applies.
+                    im = im.resize((out_w, out_h), Image.LANCZOS)
+                im.save(self.current)
+        except Exception as exc:
+            QMessageBox.critical(self, "Edit failed", str(exc))
+            return
+        self.reset_image_edit()
+        self._refresh_edited_image_cached(self.current)
+        self.show_image(self.current)
+        self._set_status(f"{self.current.name}: {', '.join(changes)}.")
+
+    def toggle_video_playback(self) -> None:
+        if self.center_stack.currentIndex() == 1:
+            self.video_stage.toggle_play()
+
+    def _show_video_meta(self, path: Path) -> None:
+        """Title/status/action state for a video, matching what show_image does for
+        an image. Crop is Pillow-based and image-only; video editing is its own tool."""
+        self._refresh_title()
+        info = self._video_info.get(str(path))
+        if info is not None:
+            self._set_status(
+                f"{path.name}  \u00b7  {info.width}\u00d7{info.height}  \u00b7  "
+                f"{info.duration_label}  \u00b7  {info.fps:g} fps  \u00b7  {info.codec}")
+        else:
+            self._set_status(f"{path.name}  \u00b7  video (install ffmpeg for details)")
+        self._update_count_label()
+        self._update_zoom_label()
+        self.crop_action.setEnabled(False)
+
+    def _refresh_edited_image_cached(self, path: Path) -> None:
+        """Refresh one image's cached thumbnail/preview after its pixels changed on
+        disk, without touching the canvas. Used per-item during a batch so the
+        filmstrip updates live but the view isn't rebuilt hundreds of times."""
+        key = str(path)
+        self._preview_cache.pop(key, None)
+        self._thumb_base[key] = self._thumb_pixmap(path)
+        item = self._thumb_items.get(key)
+        if item is not None:
+            item.setIcon(self._decorated_thumb(path))
+
+    def _refresh_current_after_batch(self) -> None:
+        """Re-show the current image once a batch finishes, so the canvas reflects
+        any new pixel dimensions."""
+        if self.current is not None and self.current.exists():
+            self.show_image(self.current)
+            self.rebuild_boxes()
+
+    def open_batch_resize(self) -> None:
+        if self.store is None or not self.images:
+            QMessageBox.information(self, "Batch resize", "Open a folder of images first.")
+            return
+        if getattr(self, "_read_only", False):
+            return
+        BatchResizeDialog(self, self.theme).exec()
+
+    # ---- caption presets ----
+
+    def _sync_preset_model_target(self) -> None:
+        """Arm the trim controls with the preset's model, so choosing 'MiniMax H3
+        video' also conforms clips to H3 rather than leaving that a separate step."""
+        stage = getattr(self, "video_stage", None)
+        if stage is None or not hasattr(stage, "_target_combo"):
+            return
+        key = self.preset.model_target
+        if not key or key not in self.model_targets:
+            return
+        idx = stage._target_combo.findData(key)
+        if idx >= 0 and stage._target_combo.currentIndex() != idx:
+            stage._target_combo.setCurrentIndex(idx)
+
+    def _apply_preset_ui(self) -> None:
+        """Show the editor the active preset needs and hide what it doesn't use."""
+        plain = self.preset.is_plain
+        self._sync_preset_model_target()
+        self._clear_stale_review_flags()
+        self._refresh_spec_markers()
+        if hasattr(self, "editor_stack"):
+            self.editor_stack.setCurrentIndex(0 if plain else 1)
+        if hasattr(self, "preset_ext_label"):
+            self.preset_ext_label.setText(self.preset.extension)
+        if hasattr(self, "preset_combo"):
+            # Recoverable when the label is elided.
+            tip = self.preset.label
+            if self.preset.blurb:
+                tip += f"\n\n{self.preset.blurb}"
+            self.preset_combo.setToolTip(tip)
+        if hasattr(self, "goal_combo"):
+            key = getattr(self.project, "training_goal", DEFAULT_GOAL) if self.project else DEFAULT_GOAL
+            idx = self.goal_combo.findData(key)
+            if idx >= 0 and self.goal_combo.currentIndex() != idx:
+                self.goal_combo.blockSignals(True)
+                self.goal_combo.setCurrentIndex(idx)
+                self.goal_combo.blockSignals(False)
+            self._refresh_goal_hint()
+        if hasattr(self, "media_combo"):
+            # Only meaningful when the preset actually has separate guidance.
+            show = self.preset.has_media_variants
+            self.media_combo.setVisible(show)
+            self.media_label.setVisible(show)
+            mode = getattr(self.project, "media_mode", "auto") if self.project else "auto"
+            idx = self.media_combo.findData(mode)
+            if idx >= 0 and self.media_combo.currentIndex() != idx:
+                self.media_combo.blockSignals(True)
+                self.media_combo.setCurrentIndex(idx)
+                self.media_combo.blockSignals(False)
+        if hasattr(self, "preset_combo"):
+            idx = self.preset_combo.findData(self.preset.key)
+            if idx >= 0 and self.preset_combo.currentIndex() != idx:
+                self.preset_combo.blockSignals(True)
+                self.preset_combo.setCurrentIndex(idx)
+                self.preset_combo.blockSignals(False)
+        # Bounding boxes are Ideogram-only: hide the canvas tools and clear any boxes.
+        ts = getattr(self, "_toolstrip", None)
+        if ts is not None:
+            ts.setVisible(self.preset.has_boxes)
+        if plain:
+            for it in list(getattr(self, "box_items", [])):
+                if it.scene() is not None:
+                    it.scene().removeItem(it)
+            self.box_items = []
+        self._sync_preset_actions()
+
+    def _sync_preset_actions(self) -> None:
+        """Show only the AI actions the active preset actually supports, and label them
+        for that preset. Refine and Locate are JSON-schema operations, so they have no
+        meaning for a plain-text caption; the convert-from-.txt row is likewise hidden,
+        since there a .txt sidecar is the app's own output, not a source to convert."""
+        structured = not self.preset.is_plain
+        run = getattr(self, "btn_run_captioning", None)
+        if run is not None:
+            run.setText("Run JSON Captioning" if structured else "Run Captioning")
+            run.setToolTip(
+                "Generate the Ideogram JSON from the image. Choose one image or the "
+                "whole folder."
+                if structured else
+                "Write a caption for the image. Choose one image or the whole folder."
+            )
+        for attr in ("btn_refine", "btn_locate"):
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                btn.setVisible(structured)
+        conv = getattr(self, "_convert_row", None)
+        if conv is not None:
+            conv.setVisible(structured)
+        # The LLM-instructions bar is deliberately preset-agnostic — it always shows
+        # what would be sent for the active preset — so it stays enabled and visible.
+        # Only the raw-JSON inspector (a structured-caption view) is gated.
+        if hasattr(self, "rawjson_btn"):
+            self.rawjson_btn.setVisible(structured)
+
+    def _on_preset_changed(self, _idx: int) -> None:
+        key = self.preset_combo.currentData()
+        if not key or key == self.preset.key:
+            return
+        new = get_preset(key)
+        if self.store is not None and self.images and new.extension != self.preset.extension:
+            resp = QMessageBox.question(
+                self, "Change caption preset",
+                f"Switch this folder to \u201c{new.label}\u201d?\n\n"
+                f"Captions will be read from and written to {new.extension} files. "
+                f"Existing {self.preset.extension} captions are left untouched on disk.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if resp != QMessageBox.Yes:
+                self._apply_preset_ui()   # revert the combo
+                return
+        if self.current is not None:
+            self._commit_active_caption()
+        self.preset = new
+        if self.project is not None:
+            self.project.preset = new.key
+        if self.store is not None:
+            self.store.extension = new.extension
+            try:
+                self.store.save_project(self.project)
+            except OSError:
+                pass
+        self._pending = {}
+        self._apply_preset_ui()
+        self._refresh_json_view()
+        if self.current is not None:
+            self.load_caption_for(self.current)
+        self._refresh_all_markers()
+        self._set_status(f"Preset: {new.label} ({new.extension})")
+
+    def _refresh_all_markers(self) -> None:
+        for path in getattr(self, "images", []):
+            self._refresh_thumb_marker(path)
+
+    def _update_plain_count(self) -> None:
+        if not hasattr(self, "plain_count"):
+            return
+        text = self.cap_plain.toPlainText().strip()
+        words = len(text.split()) if text else 0
+        self.plain_count.setText(f"{words} words \u00b7 {len(text)} characters")
+
+    def _commit_active_caption(self) -> None:
+        """Fold live edits into the in-memory caption for whichever editor is active."""
+        if self.preset.is_plain:
+            self.current_text = self.cap_plain.toPlainText().strip()
+        else:
+            self.commit_caption_fields()
+            self.commit_element_fields()
+
+    def _toggle_raw_json(self) -> None:
+        """Raw caption JSON in its own popup — an inspector for the current caption,
+        separate from the persistent LLM-instructions bar."""
+        if self.preset.is_plain:
+            return
+        self._commit_active_caption()
+        try:
+            pretty = json.dumps(json.loads(serialize_caption(self.current_caption)),
+                                indent=2, ensure_ascii=False)
+        except Exception as exc:
+            pretty = f"(Could not render the caption as JSON: {exc})"
+        name = self.current.name if self.current is not None else ""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Raw caption JSON \u2014 {name}" if name else "Raw caption JSON")
+        dlg.resize(720, 560)
+        lay = QVBoxLayout(dlg)
+        view = QPlainTextEdit()
+        view.setReadOnly(True)
+        view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        view.setFont(QFont(self.settings.mono_font_family or "Monospace"))
+        view.setPlainText(pretty)
+        lay.addWidget(view, 1)
+        row = QHBoxLayout()
+        copy_btn = QPushButton("Copy")
+        copy_btn.clicked.connect(
+            lambda: QApplication.clipboard().setText(view.toPlainText()))
+        row.addWidget(copy_btn)
+        save_btn = QPushButton("Save as\u2026")
+        save_btn.clicked.connect(self._save_json_as)
+        row.addWidget(save_btn)
+        row.addStretch(1)
+        close = QPushButton("Close")
+        close.setDefault(True)
+        close.clicked.connect(dlg.accept)
+        row.addWidget(close)
+        lay.addLayout(row)
+        dlg.exec()
+
+    def open_system_prompt(self) -> None:
+        """Edit the system prompt the LLM is given for the active preset. Stored per
+        preset in QSettings so switching presets brings back its own prompt."""
+        media = self.current_media_kind()
+        current = self.system_prompt_for_preset(media)
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"System prompt \u2014 {self.preset.label}")
+        dlg.setMinimumWidth(620)
+        dlg.resize(720, 520)
+        lay = QVBoxLayout(dlg)
+        hint = QLabel(
+            "Sent to the model as the system message when captioning with this preset. "
+            "Photos and clips have separate prompts \u2014 switch between them below."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {self.theme.text_secondary};")
+        lay.addWidget(hint)
+
+        media_row = QHBoxLayout()
+        media_row.addWidget(QLabel("Editing prompt for:"))
+        media_combo = QComboBox()
+        media_combo.addItem("Photos", "image")
+        media_combo.addItem("Videos", "video")
+        media_combo.setCurrentIndex(1 if media == "video" else 0)
+        media_row.addWidget(media_combo, 1)
+        media_row.addStretch(1)
+        lay.addLayout(media_row)
+        edit = QPlainTextEdit()
+        edit.setPlainText(current)
+        lay.addWidget(edit, 1)
+        if not self.preset.is_plain:
+            note = QLabel(
+                "This preset builds its prompt from the structured templates in "
+                "captioner_prompts/; edits here are used as an extra instruction."
+            )
+            note.setWordWrap(True)
+            note.setStyleSheet(f"color: {self.theme.warning}; font-size: 11px;")
+            lay.addWidget(note)
+        pending: dict[str, str] = {}
+
+        def _on_media_changed(_idx: int) -> None:
+            nonlocal media
+            pending[media] = edit.toPlainText()      # keep unsaved edits per media
+            media = media_combo.currentData()
+            edit.setPlainText(pending.get(media, self.system_prompt_for_preset(media)))
+
+        media_combo.currentIndexChanged.connect(_on_media_changed)
+
+        btns = QHBoxLayout()
+        reset = QPushButton("Reset to default")
+        reset.setToolTip("Restore this preset's built-in prompt for the media above")
+        reset.clicked.connect(
+            lambda: edit.setPlainText(self.default_system_prompt_for_preset(media)))
+        btns.addWidget(reset)
+        btns.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(dlg.reject)
+        btns.addWidget(cancel)
+        save = QPushButton("Save")
+        save.setDefault(True)
+        save.clicked.connect(dlg.accept)
+        btns.addWidget(save)
+        lay.addLayout(btns)
+        if dlg.exec() == QDialog.Accepted:
+            pending[media] = edit.toPlainText()
+            for kind, text in pending.items():
+                self.qsettings.setValue(self._prompt_settings_key(kind), text)
+            self._set_status(
+                f"System prompt saved ({', '.join(sorted(pending))}).")
+
+    def audio_captioning_enabled(self) -> bool:
+        """Audio goes out only when the user wants it AND the model can actually
+        hear — a vision-only model errors on an audio part rather than ignoring it.
+
+        The profile's flag states intent; the mmproj states fact, so when the
+        projector is on disk it wins. That matters for community Omni conversions:
+        they can register under a vision architecture and ship a projector with no
+        audio tower, which would otherwise fail only at request time.
+        """
+        return self.audio_status()[0]
+
+    def audio_status(self) -> tuple[bool, str]:
+        """(will audio be sent, why not). Captioning a clip without sound is a
+        legitimate choice, but it should never be a surprise — a vision-only model
+        describes lips moving and invents nothing, which reads like a broken
+        caption unless you know audio was never sent."""
+        if not getattr(self.settings, "send_clip_audio", True):
+            return False, ("'Send clip audio' is off in Preferences \u2192 Pipeline.")
+        try:
+            config = runtime_config_for_task(self.settings, "caption")
+        except Exception:
+            return False, "No captioning model is configured."
+        # Profile labels are picker text ("Download: … (~20GB)"); strip the framing
+        # so the name reads naturally inside a sentence.
+        label = (config.label or config.api_model or "the selected model")
+        label = re.sub(r"^(Download|Use|Server):\s*", "", label).strip()
+        label = re.sub(r"\s*\([^)]*\)\s*$", "", label).strip() or "The selected model"
+        detected = self._detected_mmproj_audio()
+        if detected is False:
+            return False, (f"{label} has no audio encoder \u2014 its projector is "
+                           "vision-only. Choose an Omni profile to caption sound.")
+        if detected is None and not config.supports_audio:
+            return False, (f"{label} is a vision-only model. Choose an Omni profile "
+                           "(Qwen3-Omni) to include dialogue and sound.")
+        return True, ""
+
+    def _detected_mmproj_audio(self) -> bool | None:
+        """True/False from the resolved projector, or None when it isn't on disk
+        yet (nothing downloaded, or it can't be read)."""
+        try:
+            path = existing_mmproj_path(self.settings, "caption")
+        except Exception:
+            return None
+        if path is None:
+            return None
+        cached = getattr(self, "_mmproj_audio_cache", {})
+        key = str(path)
+        if key not in cached:
+            cached[key] = mmproj_has_audio_encoder(path)
+            self._mmproj_audio_cache = cached
+        return cached[key]
+
+    def current_goal(self) -> "TrainingGoal":
+        key = getattr(self.project, "training_goal", None) if self.project else None
+        return get_goal(key)
+
+    def goal_rules_text(self) -> str:
+        """The active goal's policy text, or "" for General."""
+        goal = self.current_goal()
+        return goal.rules.strip() if goal.has_rules else ""
+
+    def effective_system_prompt(self, media: str | None = None) -> str:
+        """What the run actually sends: the preset's format prompt, then the goal's
+        content policy.
+
+        Kept apart from system_prompt_for_preset() on purpose — that one is the
+        *editable* prompt shown in the System prompt dialog, and folding the goal
+        into it would bake a policy into the saved text where it couldn't be
+        changed by switching goals.
+        """
+        parts = [self.system_prompt_for_preset(media).strip(), self.goal_rules_text()]
+        return "\n\n".join(p for p in parts if p)
+
+    def current_media_kind(self) -> str:
+        """Which guidance to use: the folder's explicit choice, or the selected
+        file's own kind when that's left on Auto."""
+        mode = getattr(self.project, "media_mode", "auto") if self.project else "auto"
+        if mode in ("image", "video"):
+            return mode
+        if self.current is not None and is_video(self.current):
+            return "video"
+        return "image"
+
+    def _on_goal_changed(self, _idx: int) -> None:
+        key = self.goal_combo.currentData() or DEFAULT_GOAL
+        if self.project is None or key == getattr(self.project, "training_goal", None):
+            return
+        self.project.training_goal = key
+        if self.store is not None:
+            try:
+                self.store.save_project(self.project)
+            except OSError:
+                pass
+        self._refresh_goal_hint()
+        self._refresh_json_view()
+        # A different goal means materially different captions, so anything
+        # captioned under the old one is stale in exactly the way edited guidance is.
+        self._refresh_guidance_changes()
+        self._set_status(f"Training goal: {GOALS[key].label}. "
+                         "Captions made under the previous goal are marked changed.")
+
+    def _refresh_goal_hint(self) -> None:
+        hint = getattr(self, "goal_hint", None)
+        if hint is None:
+            return
+        goal = self.current_goal()
+        hint.setText(goal.summary)
+        hint.setStyleSheet(
+            f"color: {self.theme.text_secondary}; font-size: 11px;")
+        hint.setToolTip(goal.rules or goal.summary)
+
+    def _on_media_mode_changed(self, _idx: int) -> None:
+        mode = self.media_combo.currentData() or "auto"
+        if self.project is None or mode == self.project.media_mode:
+            return
+        self.project.media_mode = mode
+        if self.store is not None:
+            try:
+                self.store.save_project(self.project)
+            except OSError:
+                pass
+        self._refresh_json_view()          # instructions bar follows immediately
+        label = {"auto": "each file's own type", "image": "photos",
+                 "video": "videos"}[mode]
+        self._set_status(f"Captioning instructions now written for {label}.")
+
+    def default_system_prompt_for_preset(self, media: str | None = None) -> str:
+        return self.preset.prompt_for(media or self.current_media_kind())
+
+    def _prompt_settings_key(self, media: str) -> str:
+        # Per preset AND per media: an edited photo prompt must not overwrite the
+        # clip prompt for the same preset.
+        return f"system_prompt/{self.preset.key}/{media}"
+
+    def system_prompt_for_preset(self, media: str | None = None) -> str:
+        media = media or self.current_media_kind()
+        return self.qsettings.value(
+            self._prompt_settings_key(media),
+            self.default_system_prompt_for_preset(media), str)
+
+    # ---- video support ----
+
+    def apply_video_edit(self, path: Path, info: VideoInfo, start_s: float,
+                         end_s: float, target, crop=None, rotate: int = 0) -> None:
+        """Re-encode a clip in place, backing up the untouched original first.
+
+        Same contract as image crop: the dataset keeps one file per clip (which is
+        what the trainers want), and .original/ holds the pristine source so the
+        edit is always reversible.
+        """
+        if self.store is None:
+            return
+        if target is not None:
+            plan = plan_for_target(info, target, start_s, end_s, crop=crop)
+            plan = replace(plan, rotate=rotate)
+        else:
+            plan = VideoEditPlan(start_s=start_s, end_s=end_s, crop=crop,
+                                 rotate=rotate)
+        changes = plan.changes(info)
+        if not changes:
+            self._set_status("Nothing to apply \u2014 the clip already matches.")
+            return
+        detail = "\n".join(f"  \u2022 {c}" for c in changes)
+        warning = ""
+        if target is not None and plan.frame_limit:
+            if plan.frame_limit < target.min_frames():
+                warning = (
+                    f"\n\nWarning: {plan.frame_limit} frames is "
+                    f"{target.seconds_for_frames(plan.frame_limit):.2f}s, below "
+                    f"{target.label}'s minimum of "
+                    f"{target.seconds_for_frames(target.min_frames()):.2f}s. The clip "
+                    "is too short for this target and may be rejected or padded in "
+                    "training.")
+            elif target.exact_fps and abs((info.fps or 0) - target.fps) > 0.01:
+                warning = (f"\n\n{target.label} needs exactly {target.fps:g}.000 fps; "
+                           f"this clip will be resampled from {info.fps:g}.")
+        already = self.store.has_original_backup(path)
+        note = ("\n\nThe original is already backed up in .original/ from an earlier "
+                "edit; that backup is kept." if already else
+                "\n\nThe untouched original will be copied to .original/ first.")
+        if QMessageBox.question(
+            self, "Apply video edit",
+            f"Re-encode {path.name} with:\n\n{detail}{warning}{note}",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        ) != QMessageBox.Yes:
+            return
+        # The player must let go of the file before we can replace it (Windows
+        # especially will refuse otherwise).
+        self.video_stage.release()
+        try:
+            self.store.backup_original(path)
+        except OSError as exc:
+            QMessageBox.critical(self, "Could not back up", str(exc))
+            return
+        progress = QProgressDialog(
+            f"Re-encoding {path.name} \u2026", None, 0, 0, self)
+        progress.setWindowTitle("Applying video edit")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        thread = _VideoEditThread(path, plan)
+        thread.start()
+        while thread.isRunning():
+            QApplication.processEvents()
+            thread.wait(50)
+        thread.wait()
+        progress.close()
+        if not thread.ok:
+            QMessageBox.critical(self, "Edit failed",
+                                 thread.message or "ffmpeg failed.")
+            self._reload_video_metadata()
+            return
+        self.video_stage.clear_pending(path)
+        self._refresh_video_edit_marker(path)
+        self._purge_poster_cache(path)
+        self._reload_video_metadata()
+        self._refresh_spec_markers()
+        self._set_status(f"{path.name}: {', '.join(changes)}.")
+
+    def _refresh_video_edit_marker(self, path: Path | None) -> None:
+        if path is None:
+            return
+        item = getattr(self, "_thumb_items", {}).get(str(path))
+        if item is None:
+            return
+        stage = getattr(self, "video_stage", None)
+        pending = bool(stage and stage.has_pending_edits(path))
+        item.setData(VIDEO_EDIT_ROLE, pending)
+        item.setToolTip(self._thumb_tooltip(path))
+        strip = getattr(self, "filmstrip", None)
+        if strip is not None:
+            strip.viewport().update()
+
+    def pending_video_edits(self) -> list[Path]:
+        stage = getattr(self, "video_stage", None)
+        if stage is None:
+            return []
+        return [Path(p) for p in stage._pending_edits]
+
+    def confirm_discard_video_edits(self, action: str) -> bool:
+        """Ask before an action that would drop unapplied clip edits.
+
+        Pending edits survive switching between clips, so this only fires where they
+        genuinely can't: leaving the folder or closing the app.
+        """
+        pending = self.pending_video_edits()
+        if not pending:
+            return True
+        names = ", ".join(p.name for p in pending[:4])
+        if len(pending) > 4:
+            names += f", and {len(pending) - 4} more"
+        return QMessageBox.question(
+            self, "Unapplied video edits",
+            f"{len(pending)} clip(s) have edits that haven't been written:\n\n"
+            f"{names}\n\nThey'll be lost if you {action}. Apply them first?",
+            QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Cancel,
+        ) == QMessageBox.Discard
+
+    def _purge_poster_cache(self, path: Path) -> None:
+        cache = self._poster_cache_dir()
+        if cache is None:
+            return
+        for old in cache.glob(f"{path.stem}.*.jpg"):
+            old.unlink(missing_ok=True)
+
+    def _offer_ffmpeg_install(self) -> None:
+        """Folder has videos but no ffmpeg: offer the one-click managed download,
+        mirroring the llama.cpp flow. Declining still lists the videos (placeholder
+        thumbs, no metadata)."""
+        resp = QMessageBox.question(
+            self, "ffmpeg needed for videos",
+            "This folder contains videos, but ffmpeg isn't installed yet.\n\n"
+            "ffmpeg powers video thumbnails, metadata and editing. Download a "
+            "portable build now (~100 MB, kept inside the app folder)?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if resp != QMessageBox.Yes:
+            self._set_status("Videos listed without ffmpeg \u2014 thumbnails and "
+                             "editing need it (Preferences any time).")
+            return
+        progress = QProgressDialog("Downloading ffmpeg \u2026", None, 0, 0, self)
+        progress.setWindowTitle("Installing ffmpeg")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        thread = _FfmpegInstallThread()
+        thread.status.connect(progress.setLabelText)
+        thread.start()
+        while thread.isRunning():
+            QApplication.processEvents()
+            thread.wait(50)
+        thread.wait()
+        progress.close()
+        if thread.ok:
+            self._set_status("ffmpeg installed.")
+            self._reload_video_metadata()   # posters/badges fill in
+        else:
+            QMessageBox.critical(self, "ffmpeg install failed", thread.message)
+
+    def _reload_video_metadata(self) -> None:
+        for path in self.images:
+            if not is_video(path):
+                continue
+            info = probe_video(path)
+            if info is not None:
+                self._video_info[str(path)] = info
+            item = self._thumb_items.get(str(path))
+            if item is not None:
+                item.setData(DURATION_ROLE, info.duration_label if info else "video")
+                self._thumb_base[str(path)] = self._thumb_pixmap(path)
+                item.setIcon(self._decorated_thumb(path))
+        if self.current is not None and is_video(self.current):
+            self.show_image(self.current)
+
+    def open_crop_dialog(self) -> None:
+        """Crop/resize the current image. Backed by .original/ (first backup wins);
+        after an edit, every cached view of the image is refreshed in place."""
+        if self.current is None or getattr(self, "_read_only", False):
+            return
+        try:
+            dlg = CropResizeDialog(self, self.current, self.theme)
+        except ValueError as exc:
+            QMessageBox.critical(self, "Crop / Resize", str(exc))
+            return
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self._refresh_edited_image(self.current)
+
+    def _refresh_edited_image(self, path: Path) -> None:
+        """Reload one image everywhere after its pixels changed on disk: filmstrip
+        thumbnail (re-decorated), hover-preview cache, and the main canvas."""
+        key = str(path)
+        self._preview_cache.pop(key, None)
+        self._thumb_base[key] = self._thumb_pixmap(path)
+        item = self._thumb_items.get(key)
+        if item is not None:
+            item.setIcon(self._decorated_thumb(path))
+        self.show_image(path)
+        # the caption didn't change, but show_image cleared the canvas boxes
+        self.rebuild_boxes()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -7702,7 +11946,7 @@ class MainWindow(QMainWindow):
 
     def _thumb_label(self, path: Path) -> str:
         # red shadowed text + glow now signal "unsaved"; keep the dot for guidance
-        prefix = "• " if self.project.has_per_image_guidance(path.name) else ""
+        prefix = "• " if self.project.has_per_file_guidance(path.name) else ""
         return prefix + path.name[:14]
 
     def _decorated_thumb(self, path: Path) -> QIcon:
@@ -7721,6 +11965,15 @@ class MainWindow(QMainWindow):
         out: list[tuple] = []
         if self.project.is_review_marked(name):
             out.append(("Flagged for review", FLAG_COLOR, "#ffffff", ""))
+        stage = getattr(self, "video_stage", None)
+        if stage is not None and stage.has_pending_edits(path):
+            out.append(("Unapplied edits", self.theme.warning, dark,
+                        "Trim, crop or rotation set but not written to the file yet "
+                        "\u2014 open the clip and press Apply edit."))
+        spec = self.spec_issues_for(path)
+        if spec:
+            out.append(("Doesn't meet the model's specs", SPEC_COLOR, dark,
+                        "\u2022 " + "\n\u2022 ".join(spec)))
         issues = self.project.caption_issues(name)
         if issues:
             tip = "\u2022 " + "\n\u2022 ".join(issues)
@@ -7741,6 +11994,564 @@ class MainWindow(QMainWindow):
         if self._image_is_omit_marked(path):
             out.append((".txt caption omitted", OMIT_COLOR, dark, ""))
         return out
+
+    def spec_issues_for(self, path: Path) -> list[str]:
+        """How this clip fails the active preset's model target, or [] if it's fine.
+
+        Deliberately narrow: only the things a trainer will NOT fix for you.
+        Trainers bucket by aspect ratio and resize during latent caching, so an
+        arbitrary source resolution is a non-issue and flagging it was noise. What
+        they don't handle is the temporal axis — LTX silently truncates or pads an
+        off-grid frame count, and H3 wants exactly 24.000 fps.
+
+        Checked live against the target rather than at import, because the answer
+        changes the moment the preset changes — the same clip is legal for LTX and
+        illegal for Wan. Only clips are checked; stills have no fps or frame grid.
+        """
+        target = self._preset_model_target()
+        if target is None or not is_video(path):
+            return []
+        info = self._video_info.get(str(path))
+        if info is None:
+            return []
+        issues: list[str] = []
+        if target.exact_fps and abs(info.fps - target.fps) > 0.01:
+            issues.append(
+                f"{info.fps:g} fps \u2014 {target.label} needs exactly "
+                f"{target.fps:g}.000 fps")
+        elif abs(info.fps - target.fps) > 0.01:
+            issues.append(f"{info.fps:g} fps \u2014 {target.label} trains at "
+                          f"{target.fps:g}")
+        frames_at_target = int(round(info.duration_s * target.fps))
+        if frames_at_target > target.max_frames():
+            issues.append(
+                f"{info.duration_s:.2f}s is over {target.label}'s maximum of "
+                f"{target.seconds_for_frames(target.max_frames()):.2f}s")
+        elif frames_at_target < target.min_frames():
+            issues.append(
+                f"{info.duration_s:.2f}s is under {target.label}'s minimum of "
+                f"{target.seconds_for_frames(target.min_frames()):.2f}s")
+        elif not target.is_legal_frames(frames_at_target):
+            issues.append(
+                f"{frames_at_target} frames isn't on {target.label}'s "
+                f"{target.frame_modulus}n+{target.frame_remainder} grid")
+        return issues
+
+    def _preset_model_target(self):
+        """The model the spec flag judges clips against.
+
+        The trim target wins when one is armed: the preset seeds it, but choosing a
+        different one in the video stage is an explicit statement of what you're
+        building for, and the amber warning should agree with it rather than keep
+        answering for the preset.
+        """
+        stage = getattr(self, "video_stage", None)
+        if stage is not None:
+            chosen = stage.current_target()
+            if chosen is not None:
+                return chosen
+        key = self.preset.model_target
+        return self.model_targets.get(key) if key else None
+
+    def postprocess_caption(self, text: str) -> str:
+        """Preset-specific tidy-up applied to a freshly generated caption.
+
+        H3 reads a newline as a shot change, so wrapped prose invents cuts. The
+        prompt asks for single-line fields, but instruction-following varies by
+        model, so the output is normalised rather than trusted.
+        """
+        if text and self.preset.key.startswith("minimax_h3"):
+            return normalise_h3_caption(text)
+        return text
+
+    def caption_issues_for(self, path: Path) -> list[str]:
+        """Schema health for a caption, or [] when the active preset has no schema.
+
+        The checks parse the file as Ideogram JSON, so running them against a plain
+        .txt caption reports "corrupt — could not parse JSON" on every well-formed
+        file. Only the validating preset gets flagged; everyone else is unflagged
+        rather than wrongly flagged.
+        """
+        if self.store is None or not self.preset.validates:
+            return []
+        return self.store.caption_file_issues(path)
+
+    def _refresh_spec_markers(self) -> None:
+        """Re-evaluate every clip against the active preset's target.
+
+        Runs on preset change because the verdict follows the target, not the file:
+        a 30fps clip is fine under no target, wrong under Wan, and wrong differently
+        under H3.
+        """
+        items = getattr(self, "_thumb_items", {})
+        if not items:
+            return
+        flagged = 0
+        for path in getattr(self, "images", []):
+            item = items.get(str(path))
+            if item is None:
+                continue
+            issues = self.spec_issues_for(path)
+            item.setData(SPEC_ROLE, bool(issues))
+            item.setToolTip(self._thumb_tooltip(path))
+            flagged += 1 if issues else 0
+        strip = getattr(self, "filmstrip", None)
+        if strip is not None:
+            strip.viewport().update()
+        target = self._preset_model_target()
+        if target is not None and flagged:
+            self._set_status(
+                f"{flagged} clip(s) don't meet {target.label}'s specs \u2014 hover the "
+                "amber triangle, or use Fit to target and Apply edit.")
+
+    def _clear_stale_review_flags(self) -> None:
+        """Drop review flags recorded under a validating preset when the active one
+        has no schema, so old red dots don't linger after a preset switch."""
+        if self.project is None or self.preset.validates:
+            return
+        changed = False
+        for path in getattr(self, "images", []):
+            if self.project.caption_issues(path.name):
+                self.project.set_flags(path.name, [])
+                changed = True
+        if changed and self.store is not None:
+            try:
+                self.store.save_project(self.project)
+            except OSError:
+                pass
+
+    def _thumb_tooltip(self, path: Path) -> str:
+        """Plain-text tooltip naming every marker on this thumbnail.
+
+        The hover preview shows the same states as coloured banners, but a dot in a
+        corner with no tooltip is unreadable — you have to already know the code to
+        look it up. Built from _thumb_banners so the wording can't drift.
+        """
+        lines: list[str] = []
+        for text, _bg, _fg, tip in self._thumb_banners(path):
+            marker = {
+                "Flagged for review": "\U0001F6A9 bottom-right flag",
+                "Doesn't meet the model's specs": "\u25b2 amber triangle (right edge)",
+                "Unapplied edits": "\u25dc amber arc (bottom-left)",
+                "Caption may have problems": "\u25cf red dot (bottom-left)",
+                "Unsaved changes": "\u25cf amber dot (top-right)",
+                "Guidance changed": "\u25cf violet dot (top-left)",
+                "Folder guidance changed": "\u25cf violet dot (top-left)",
+                "This image's guidance changed": "\u25cf violet dot (top-left)",
+                ".txt caption omitted": "\u25cf violet slashed dot (left)",
+            }.get(text, "")
+            line = f"{text} \u2014 {marker}" if marker else text
+            if tip:
+                line += "\n" + "\n".join(f"   {t}" for t in tip.splitlines())
+            lines.append(line)
+        if not lines:
+            return path.name
+        return f"{path.name}\n\n" + "\n".join(lines)
+
+    def _rebuild_filmstrip(self) -> None:
+        """Populate the strip from self.images, inserting the bypass divider."""
+        self.filmstrip.clear()
+        self._pending = {}
+        self._thumb_items = {}
+        self._thumb_base = {}
+        for _a in self._dirty_dot_anims.values():
+            _a.stop()
+        self._dirty_dot_anims = {}
+        self._dirty_dot = {}
+        self._preview_cache = {}
+        self._hover_item = None
+        self._hover_preview.hide()
+        if not self.images:
+            # The folder comes from the store: this runs on any re-list (a bypass,
+            # a delete, an import), not only from open_folder where a local existed.
+            where = self.store.folder if self.store is not None else "this folder"
+            self._set_status(f"No images found in {where}")
+            self._update_count_label()
+            return
+
+        self._video_info: dict[str, VideoInfo] = {}
+        has_videos = any(is_video(p) for p in self.images)
+        if has_videos and not ffmpeg_available():
+            self._offer_ffmpeg_install()
+        divider_added = False
+        for path in self.images:
+            self._thumb_base[str(path)] = self._thumb_pixmap(path)
+            item = QListWidgetItem()
+            item.setData(Qt.UserRole, str(path))
+            if is_video(path):
+                info = probe_video(path) if ffmpeg_available() else None
+                if info is not None:
+                    self._video_info[str(path)] = info
+                item.setData(DURATION_ROLE, info.duration_label if info else "video")
+            item.setData(UNSAVED_ROLE, False)
+            item.setData(STALE_ROLE, self.project.guidance_changed(path.name))
+            # Re-validate the caption file on disk (catches hand-edits / corruption
+            # since the last run), not just the flags stamped at generation time.
+            _issues = self.caption_issues_for(path)
+            self.project.set_flags(path.name, _issues)
+            _flagged = self.project.is_review_marked(path.name)
+            item.setData(REVIEW_ROLE, bool(_issues))
+            item.setData(FLAG_ROLE, _flagged)
+            item.setData(OMIT_ROLE, self._image_is_omit_marked(path))
+            item.setData(SPEC_ROLE, bool(self.spec_issues_for(path)))
+            bypassed = self.store.is_bypassed(path)
+            item.setData(BYPASS_ROLE, bypassed)
+            if bypassed and not divider_added:
+                divider = QListWidgetItem()
+                divider.setData(SEPARATOR_ROLE, True)
+                divider.setFlags(Qt.NoItemFlags)   # not selectable, not a file
+                divider.setSizeHint(QSize(46, self.filmstrip.iconSize().height() + 44))
+                self.filmstrip.addItem(divider)
+                divider_added = True
+            item.setToolTip(self._thumb_tooltip(path))
+            self.filmstrip.addItem(item)
+            self._thumb_items[str(path)] = item
+            item.setIcon(self._decorated_thumb(path))
+            item.setText(self._thumb_label(path))
+
+    # ---- adding media ----
+
+    def open_duplicate_dataset(self) -> None:
+        """Copy this dataset somewhere else, choosing what comes along.
+
+        Two jobs in one: a backup (take everything) and a variant for a training run
+        (media only, or media without captions to re-caption differently). Which one
+        you're doing is expressed by the toggles rather than by two separate tools.
+        """
+        if self.store is None or not self.images:
+            self._set_status("Open a folder with some files first.")
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Duplicate / back up dataset")
+        dlg.setMinimumWidth(560)
+        lay = QVBoxLayout(dlg)
+
+        intro = QLabel(
+            f"Copies {len(self.images)} file(s) from {self.store.folder.name} to a "
+            "new folder. Nothing in this folder is changed.")
+        intro.setObjectName("Hint")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+
+        dest_row = QHBoxLayout()
+        dest_row.addWidget(QLabel("Copy to:"))
+        dest_edit = QLineEdit(str(self.store.folder.parent /
+                                  f"{self.store.folder.name}-copy"))
+        dest_row.addWidget(dest_edit, 1)
+        browse = QPushButton("Browse\u2026")
+
+        def pick():
+            chosen = QFileDialog.getExistingDirectory(
+                dlg, "Choose destination", str(self.store.folder.parent))
+            if chosen:
+                dest_edit.setText(chosen)
+        browse.clicked.connect(pick)
+        dest_row.addWidget(browse)
+        lay.addLayout(dest_row)
+        lay.addSpacing(8)
+
+        keep_captions = QCheckBox("Keep captions")
+        keep_captions.setChecked(True)
+        keep_captions.setToolTip(
+            "Copy each file's caption sidecar. Turn off to duplicate the media for "
+            "captioning a different way.")
+        keep_settings = QCheckBox("Keep captioner settings (preset, guidance, flags)")
+        keep_settings.setChecked(True)
+        keep_settings.setToolTip(
+            "Copy .captioner/project.json, so the copy opens with the same preset, "
+            "training goal and guidance.")
+        keep_originals = QCheckBox("Keep original backups (.original/)")
+        keep_originals.setChecked(False)
+        keep_originals.setToolTip(
+            "Copy the pre-edit files kept by crop, resize, rotate and mute. Useful "
+            "for a true backup; dead weight for a training copy.")
+        keep_bypassed = QCheckBox("Keep bypassed files (.bypass/)")
+        keep_bypassed.setChecked(True)
+        keep_bypassed.setToolTip(
+            "Copy files you've excluded from the dataset. They stay excluded in "
+            "the copy.")
+        for box in (keep_captions, keep_settings, keep_originals, keep_bypassed):
+            lay.addWidget(box)
+
+        lay.addSpacing(8)
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        go = buttons.addButton("Copy", QDialogButtonBox.AcceptRole)
+        buttons.rejected.connect(dlg.reject)
+        buttons.accepted.connect(dlg.accept)
+        lay.addWidget(buttons)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+        dest = Path(dest_edit.text().strip()).expanduser()
+        if not self._duplicate_destination_ok(dest):
+            return
+        self._run_duplicate(dest, keep_captions.isChecked(), keep_settings.isChecked(),
+                            keep_originals.isChecked(), keep_bypassed.isChecked())
+
+    def _duplicate_destination_ok(self, dest: Path) -> bool:
+        """Refuse the destinations that would damage or endlessly recurse."""
+        if not str(dest):
+            return False
+        source = self.store.folder.resolve()
+        try:
+            resolved = dest.resolve()
+        except OSError:
+            resolved = dest
+        if resolved == source:
+            QMessageBox.warning(self, "Choose a different folder",
+                                "That's the folder you're copying from.")
+            return False
+        if source in resolved.parents:
+            QMessageBox.warning(
+                self, "Choose a folder outside this one",
+                "Copying a folder into itself would recurse. Pick a destination "
+                "beside it instead.")
+            return False
+        if resolved.is_dir() and any(resolved.iterdir()):
+            return QMessageBox.question(
+                self, "Folder isn't empty",
+                f"{resolved.name} already has files in it. Copy into it anyway?\n\n"
+                "Files with matching names will be overwritten.",
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
+            ) == QMessageBox.Yes
+        return True
+
+    def _run_duplicate(self, dest: Path, captions: bool, settings: bool,
+                       originals: bool, bypassed: bool) -> None:
+        bar = QProgressDialog("Copying\u2026", "Cancel", 0, 100, self)
+        bar.setWindowTitle("Duplicate dataset")
+        bar.setWindowModality(Qt.WindowModal)
+        bar.setMinimumDuration(0)
+        bar.setValue(0)
+
+        def tick(done: int, total: int, name: str) -> bool:
+            bar.setMaximum(max(1, total))
+            bar.setValue(done)
+            bar.setLabelText(f"Copying {name}\u2026")
+            QApplication.processEvents()
+            return not bar.wasCanceled()
+
+        try:
+            counts = self.store.duplicate_to(
+                dest, keep_captions=captions, keep_settings=settings,
+                keep_originals=originals, keep_bypassed=bypassed, progress=tick)
+        except OSError as exc:
+            bar.close()
+            QMessageBox.critical(self, "Could not copy", str(exc))
+            return
+        bar.close()
+        parts = [f"{counts[k]} {k}" for k in
+                 ("media", "captions", "originals", "bypassed", "settings")
+                 if counts.get(k)]
+        summary = ", ".join(parts) or "nothing"
+        if counts.get("cancelled"):
+            QMessageBox.information(
+                self, "Copy cancelled",
+                f"Stopped partway. {summary} had already been copied to "
+                f"{dest}.\n\nThe partial copy was left in place.")
+            self._set_status(f"Copied {summary} to {dest}.")
+            return
+        note = (f"\n\n{counts['skipped']} file(s) could not be copied."
+                if counts.get("skipped") else "")
+        # Which folder you want to be in afterwards depends on why you copied:
+        # a backup means stay, a variant means switch. Only the user knows which,
+        # so ask rather than guess — and default to staying, since that's the
+        # non-destructive answer if the dialog is dismissed.
+        box = QMessageBox(self)
+        box.setWindowTitle("Copy finished")
+        box.setIcon(QMessageBox.Information)
+        box.setText(f"Copied {summary} to {dest.name}.{note}")
+        box.setInformativeText(
+            "Open the copy now, or keep working in the original folder?")
+        switch_btn = box.addButton("Open the copy", QMessageBox.AcceptRole)
+        stay_btn = box.addButton("Stay here", QMessageBox.RejectRole)
+        box.setDefaultButton(stay_btn)
+        box.exec()
+        if box.clickedButton() is switch_btn:
+            self.load_folder_path(dest)
+            self._set_status(f"Copied {summary} \u2014 now working in {dest.name}.")
+            return
+        self._set_status(f"Copied {summary} to {dest}.")
+
+    def open_add_media(self) -> None:
+        """File picker for adding media to the dataset."""
+        if self.store is None:
+            self._set_status("Open a folder first.")
+            return
+        exts = sorted(set(IMAGE_EXTENSIONS) | VIDEO_EXTENSIONS)
+        pattern = " ".join(f"*{e}" for e in exts)
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Add media to this dataset", "",
+            f"Images and video ({pattern});;All files (*)")
+        if paths:
+            self.add_media([Path(p) for p in paths])
+
+    def add_media(self, sources: list[Path]) -> None:
+        """Copy files in, re-list, and select the first one added."""
+        if self.store is None or not sources:
+            return
+        if getattr(self, "_read_only", False):
+            self._set_status("Read-only mode \u2014 nothing was added.")
+            return
+        try:
+            added, skipped = self.store.import_media(sources)
+        except Exception as exc:
+            QMessageBox.critical(self, "Could not add media", str(exc))
+            return
+        if not added:
+            QMessageBox.information(
+                self, "Nothing added",
+                "None of those could be added:\n\n" + "\n".join(skipped[:10])
+                if skipped else "No images or videos were found.")
+            return
+        self.images = self.store.images()
+        self._rebuild_filmstrip()
+        row = self._row_for_path(added[0])
+        if row is not None:
+            self.filmstrip.setCurrentRow(row)
+        message = f"Added {len(added)} file(s)."
+        if skipped:
+            message += f" Skipped {len(skipped)}: {skipped[0]}"
+            if len(skipped) > 1:
+                message += f" (+{len(skipped) - 1} more)"
+        self._set_status(message)
+
+    def _media_from_mime(self, mime) -> list[Path]:
+        if not mime.hasUrls():
+            return []
+        return [Path(url.toLocalFile()) for url in mime.urls()
+                if url.isLocalFile() and url.toLocalFile()]
+
+    def dragEnterEvent(self, event) -> None:
+        if self.store is not None and self._media_from_mime(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:
+        if self.store is not None and self._media_from_mime(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:
+        paths = self._media_from_mime(event.mimeData())
+        if self.store is None or not paths:
+            super().dropEvent(event)
+            return
+        event.acceptProposedAction()
+        # A single dropped folder with no folder open would more likely mean "open
+        # this" than "copy its contents into the current dataset".
+        self.add_media(paths)
+
+    def restore_original_media(self, path: Path | None = None) -> None:
+        """Revert a file to its pre-edit state and forget the backup."""
+        path = path or self.current
+        if self.store is None or path is None:
+            return
+        if not self.store.has_original_backup(path):
+            self._set_status(f"{path.name} has no backup \u2014 it hasn't been edited.")
+            return
+        if QMessageBox.question(
+            self, "Restore original",
+            f"Undo every edit to {path.name} and put the original back?\n\n"
+            "The backup is removed, so this can't be undone again.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        if not self.store.revert_to_original(path):
+            QMessageBox.critical(self, "Could not restore", "The backup has gone.")
+            return
+        self._refresh_edited_image_cached(path)
+        if is_video(path):
+            self._reload_video_metadata()
+            self._refresh_spec_markers()
+        else:
+            self.show_image(path)
+        self._set_status(f"{path.name} restored to its original.")
+
+    def remove_media(self, path: Path | None = None) -> None:
+        """Offer the two ways to take a file out: reversibly, or for good."""
+        path = path or self.current
+        if self.store is None or path is None:
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Remove from dataset")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"Take {path.name} out of the dataset?")
+        box.setInformativeText(
+            "Bypass keeps the file and its caption in .bypass/, so you can bring "
+            "them back.\n\nDelete removes the file, its caption and any backup "
+            "from disk permanently.")
+        bypass_btn = box.addButton("Bypass", QMessageBox.AcceptRole)
+        delete_btn = box.addButton("Delete permanently", QMessageBox.DestructiveRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(bypass_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is bypass_btn:
+            self.toggle_bypass(path)
+            return
+        if clicked is not delete_btn:
+            return
+        # Second confirmation: this one can't be undone.
+        if QMessageBox.question(
+            self, "Delete permanently",
+            f"Permanently delete {path.name}, its caption and any backup?\n\n"
+            "This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
+        ) != QMessageBox.Yes:
+            return
+        removed = self.store.delete_media(path)
+        self.images = self.store.images()
+        self._rebuild_filmstrip()
+        if self.images:
+            self.filmstrip.setCurrentRow(0)
+        self._set_status(f"Deleted {len(removed)} file(s) for {path.name}.")
+
+    def toggle_bypass(self, path: Path | None = None) -> None:
+        """Move a file out of the dataset (or bring it back).
+
+        The file physically moves to .bypass/ with its caption, because the trainer
+        reads the folder — a flag in project.json wouldn't actually exclude it.
+        """
+        path = path or self.current
+        if self.store is None or path is None:
+            return
+        bypassed = self.store.is_bypassed(path)
+        try:
+            new_path = (self.store.unbypass(path) if bypassed
+                        else self.store.bypass(path))
+        except OSError as exc:
+            QMessageBox.critical(self, "Could not move the file", str(exc))
+            return
+        verb = "restored to the dataset" if bypassed else "bypassed"
+        self._reload_folder_keeping(new_path)
+        self._set_status(f"{new_path.name} {verb}.")
+
+    def _reload_folder_keeping(self, path: Path) -> None:
+        """Re-list the folder and reselect the file at its new location.
+
+        A full re-list rather than patching one row: the move changes ordering (the
+        bypassed group sorts last) and inserts or removes the divider, so the row
+        indices shift.
+        """
+        if self.store is None:
+            return
+        self.images = self.store.images()
+        self._rebuild_filmstrip()
+        row = self._row_for_path(path)
+        if row is not None:
+            self.filmstrip.setCurrentRow(row)
+
+    def _row_for_path(self, path: Path) -> int | None:
+        """Filmstrip row for a file. Rows and image indices diverge once the divider
+        is present, so look the item up rather than assuming they match."""
+        for row in range(self.filmstrip.count()):
+            item = self.filmstrip.item(row)
+            if item is not None and item.data(Qt.UserRole) == str(path):
+                return row
+        return None
 
     def _toggle_review_flag(self, *args) -> None:
         if self.store is None or self.current is None:
@@ -7795,9 +12606,34 @@ class MainWindow(QMainWindow):
         path = Path(item.data(Qt.UserRole))
         menu = QMenu(self)
         marked = self.project.is_review_marked(path.name)
-        act = menu.addAction("Clear review flag" if marked else "Flag for review")
-        if menu.exec(self.filmstrip.mapToGlobal(pos)) == act:
+        flag_act = menu.addAction("Clear review flag" if marked else "Flag for review")
+        bypassed = self.store.is_bypassed(path)
+        bypass_act = menu.addAction(
+            "Restore to dataset" if bypassed else "Bypass (exclude from dataset)")
+        revert_act = None
+        if self.store.has_original_backup(path):
+            revert_act = menu.addAction("Restore original (undo edits)")
+        menu.addSeparator()
+        remove_act = menu.addAction("Remove\u2026")
+        # Editing lives on an unlabelled icon in the left rail, which is easy to
+        # miss — offer it where the file actually is.
+        edit_act = None
+        if not is_video(path):
+            menu.addSeparator()
+            edit_act = menu.addAction("Crop / rotate / resize\u2026")
+        chosen = menu.exec(self.filmstrip.mapToGlobal(pos))
+        if chosen == flag_act:
             self._toggle_review_flag_for(path)
+        elif chosen == bypass_act:
+            self.toggle_bypass(path)
+        elif revert_act is not None and chosen == revert_act:
+            self.restore_original_media(path)
+        elif chosen == remove_act:
+            self.remove_media(path)
+        elif edit_act is not None and chosen == edit_act:
+            if self.current != path and path in self.images:
+                self.filmstrip.setCurrentRow(self.images.index(path))
+            self.open_crop_dialog()
 
     def _refresh_thumb_marker(self, path: Path | None) -> None:
         if path is None:
@@ -7813,7 +12649,8 @@ class MainWindow(QMainWindow):
             item.setData(REVIEW_ROLE, bool(issues))
             item.setData(FLAG_ROLE, flagged)
             item.setData(OMIT_ROLE, self._image_is_omit_marked(path))
-            item.setToolTip("")  # marker meanings now live in the hover-preview banners
+            item.setData(SPEC_ROLE, bool(self.spec_issues_for(path)))
+            item.setToolTip(self._thumb_tooltip(path))
             item.setText(self._thumb_label(path))
             item.setIcon(self._decorated_thumb(path))
             if now != was:
@@ -7829,7 +12666,7 @@ class MainWindow(QMainWindow):
             self.title_label.setText("")
             self.title_label.setStyleSheet("")
             return
-        dot = "● " if self.project.has_per_image_guidance(path.name) else ""
+        dot = "● " if self.project.has_per_file_guidance(path.name) else ""
         if self._has_unsaved(path):
             self.title_label.setText(f"{dot}{path.name} - Unsaved Changes")
             self.title_label.setStyleSheet(f"color: {self.theme.warning};")
@@ -7844,7 +12681,7 @@ class MainWindow(QMainWindow):
     def _refresh_stale_state(self) -> None:
         """Recompute guidance staleness for every thumbnail and the current pane.
         Commits the live editor text into the in-memory project first so a folder
-        or per-image edit flags immediately, before it's persisted to disk."""
+        or per-file edit flags immediately, before it's persisted to disk."""
         if self.store is None:
             self._refresh_guidance_changes()
             return
@@ -7854,6 +12691,7 @@ class MainWindow(QMainWindow):
             stale = self.project.guidance_changed(Path(key).name)
             if bool(item.data(STALE_ROLE)) != stale:
                 item.setData(STALE_ROLE, stale)
+                item.setToolTip(self._thumb_tooltip(path))
                 self._repaint_thumb(key)
         self._refresh_guidance_changes()
 
@@ -8011,6 +12849,23 @@ class MainWindow(QMainWindow):
         if self.store is None:
             return
         key = str(path)
+        if self.preset.is_plain:
+            if key in self._pending:
+                text, message, pending = self._pending[key], None, True
+            else:
+                text, message = self.store.load_plain_caption(path)
+                pending = False
+            self.current_text = text
+            self._loading = True
+            try:
+                self.cap_plain.setPlainText(text)
+            finally:
+                self._loading = False
+            self._update_plain_count()
+            self._dirty = pending
+            if message:
+                self._set_status(message)
+            return
         if key in self._pending:
             caption, message, pending = self._pending[key], None, True
         else:
@@ -8028,7 +12883,7 @@ class MainWindow(QMainWindow):
         # On-disk loads: re-validate the file so an external edit/corruption updates the
         # review marker (buffered edits are validated when generated/saved instead).
         if not pending:
-            self.project.set_flags(path.name, self.store.caption_file_issues(path))
+            self.project.set_flags(path.name, self.caption_issues_for(path))
         self._refresh_thumb_marker(path)
         self._refresh_json_view()
         if message:
@@ -8076,10 +12931,12 @@ class MainWindow(QMainWindow):
     def save_current(self, *args, silent: bool = False) -> None:
         if self.store is None or self.current is None:
             return
-        self.commit_caption_fields()
-        self.commit_element_fields()
+        self._commit_active_caption()
         try:
-            path = self.store.save_caption(self.current, self.current_caption)
+            if self.preset.is_plain:
+                path = self.store.save_plain_caption(self.current, self.current_text)
+            else:
+                path = self.store.save_caption(self.current, self.current_caption)
         except Exception as exc:  # Tier 2: readable save failure.
             QMessageBox.critical(self, "Could not save caption", str(exc))
             return
@@ -8102,15 +12959,18 @@ class MainWindow(QMainWindow):
             return 0
         # fold the current image's live edits into the buffer first
         if self.current is not None:
-            self.commit_caption_fields()
-            self.commit_element_fields()
+            self._commit_active_caption()
             if self._dirty:
-                self._pending[str(self.current)] = self.current_caption
+                self._pending[str(self.current)] = (
+                    self.current_text if self.preset.is_plain else self.current_caption)
         saved = 0
         failed = []
         for key, caption in list(self._pending.items()):
             try:
-                self.store.save_caption(Path(key), caption)
+                if self.preset.is_plain:
+                    self.store.save_plain_caption(Path(key), caption)
+                else:
+                    self.store.save_caption(Path(key), caption)
                 saved += 1
             except Exception as exc:
                 failed.append(f"{Path(key).name}: {exc}")
@@ -8147,6 +13007,9 @@ class MainWindow(QMainWindow):
             self._server_proc = None
 
     def closeEvent(self, event) -> None:
+        if not self.confirm_discard_video_edits("close the app"):
+            event.ignore()
+            return
         self.qsettings.setValue("window_geometry", self.saveGeometry())
         if getattr(self, "splitter", None) is not None:
             self.qsettings.setValue("splitter_state_v2", self.splitter.saveState())
@@ -8747,11 +13610,12 @@ class MainWindow(QMainWindow):
                 nav.setText("0 / 0")
         elif self.current is not None and self.current in self.images:
             idx = self.images.index(self.current) + 1
-            self._count_label.setText(f"Image {idx} / {total}")
+            # "File", not "Image": a folder can hold clips as well as stills.
+            self._count_label.setText(f"File {idx} / {total}")
             if nav is not None:
                 nav.setText(f"{idx} / {total}")
         else:
-            self._count_label.setText(f"{total} images")
+            self._count_label.setText(f"{total} files")
             if nav is not None:
                 nav.setText(f"— / {total}")
 

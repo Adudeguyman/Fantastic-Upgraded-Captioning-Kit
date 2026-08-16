@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from ideogram_captioner.schema import caption_health, normalize_caption, parse_palette_text, serialize_caption
+from captioning_kit.schema import caption_health, normalize_caption, parse_palette_text, serialize_caption
 
 
 class SchemaTests(unittest.TestCase):

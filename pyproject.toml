@@ -3,13 +3,13 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ideogram-captioner"
+name = "fantastic-captioning-kit"
 version = "0.1.0"
-description = "Desktop editor for image-caption pairs in Ideogram 4 JSON caption format."
+description = "Desktop kit for image/caption dataset prep: crop, resize and caption with a local vision model."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
-keywords = ["captioning", "ideogram", "image-dataset", "qt", "pyside6"]
+keywords = ["captioning", "ideogram", "image-dataset", "dataset-prep", "qt", "pyside6"]
 dependencies = ["Pillow>=10.0", "openai>=1.0", "huggingface_hub>=0.23", "PySide6>=6.6"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -26,13 +26,13 @@ classifiers = [
 # llama.cpp's prebuilt CUDA llama-server links libnccl.so.2 but the release does
 # not bundle it, so a CUDA launch fails on machines without NCCL. The app finds
 # any libnccl.so.2 already in the env (e.g. PyTorch's), but a clean env may have
-# none — `pip install ideogram-captioner[cuda]` supplies it. Linux x86_64 only:
+# none — `pip install fantastic-captioning-kit[cuda]` supplies it. Linux x86_64 only:
 # there is no Windows/macOS NCCL wheel, and Vulkan/CPU backends don't need it.
 [project.optional-dependencies]
 cuda = ["nvidia-nccl-cu12; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 
 [project.scripts]
-ideogram-captioner = "ideogram_captioner.app:main"
+captioning-kit = "captioning_kit.app:main"
 
 [tool.setuptools.packages.find]
-include = ["ideogram_captioner"]
+include = ["captioning_kit"]

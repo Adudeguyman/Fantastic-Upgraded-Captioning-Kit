@@ -1,22 +1,26 @@
-# Ideogram JSON Captioner
+# Fantastic Upgraded Captioning Kit
 
-A local desktop app for building and curating image-caption datasets in
-Ideogram 4's structured JSON caption format. Open a folder of images, write or
-generate captions, draw bounding boxes, and keep your original text captions
-alongside the structured JSON — all on your own machine.
+A local desktop app for building and curating caption datasets for image and
+video model training. Open a folder of stills or clips, write or generate
+captions in the format your target model expects, trim and conform clips to its
+frame grid, and keep everything on your own machine.
+
+Supports **Ideogram 4** (structured JSON with bounding boxes), **MiniMax H3**,
+**Wan 2.2**, **LTX-2**, and plain text — each with its own caption format and,
+for the video models, its own fps and frame-count rules.
 
 Auto-captioning is optional and runs against an OpenAI-compatible model server
 that **you** control (local llama.cpp, LM Studio, vLLM, or Ollama). Nothing
 leaves your machine except the requests to the endpoint you configure.
 
-![Ideogram JSON Captioner screenshot](ideogramCaptionerScreenshot.png)
+![Fantastic Upgraded Captioning Kit screenshot](captioningKitScreenshot.png)
 
 ## Contents
 
 - [Features](#features)
 - [Requirements](#requirements)
 - [Installation](#installation)
-  - [Quickest start — auto-launcher (venv)](#quickest-start--auto-launcher-venv)
+  - [Quickest start — `start.sh` / `start.bat`](#quickest-start--startsh--startbat)
   - [Option A — venv](#option-a--venv)
   - [Option B — conda](#option-b--conda)
   - [Optional — CUDA acceleration](#optional--cuda-acceleration-for-the-built-in-server-nvidia-linux)
@@ -29,7 +33,17 @@ leaves your machine except the requests to the endpoint you configure.
 
 ## Features
 
-- **Dataset browsing** — Step through an image folder with keyboard shortcuts.
+- **Images and video** — One folder can hold both. Clips get a player with a
+  waveform, trim brackets, crop, rotate, and a mute-section tool for clipping a
+  half-spoken word off the end of a trim.
+- **Model-aware conforming** — Each video model has an fps and a legal frame-count
+  grid (Wan 4n+1, LTX 8n+1, MiniMax H3 17n+5). Trim handles snap to lengths the
+  model accepts, and clips that can't work as-is are flagged with the reason.
+- **Training goals** — A second caption axis alongside the format preset: caption
+  for a character likeness, a concept, a motion, an art style or a video look.
+  Each encodes what to describe and what to leave out, since what you caption
+  stays promptable and what you omit gets bound to the trigger.
+- **Dataset browsing** — Step through a folder with keyboard shortcuts.
   Sort and filter by name, date, missing captions, or failed jobs, and search
   inside caption sidecars to jump straight to the images you mean.
 - **Structured caption editing** — Edit every Ideogram JSON field (description,
@@ -52,6 +66,12 @@ leaves your machine except the requests to the endpoint you configure.
   another image's caption — are automatically flagged for review after a run, with
   a summary listing them. You can also browse and flag images yourself while a batch
   is still running, then jump straight between flagged images to fix them.
+- **Bypass and backup** — Move files out of the dataset into `.bypass/` without
+  deleting them (still individually captionable), and duplicate or back up a
+  whole dataset choosing what comes along: captions, settings, originals.
+- **Editable model rules** — Frame grids, fps and caption prompts live in data you
+  can edit and share as a JSON bundle, so a model released next week doesn't have
+  to wait for an app release.
 - **Bring your own model** — Pick from suggested Hugging Face GGUF models
   (auto-downloaded and served via llama.cpp), point at local GGUF files, or
   connect to a server you're already running. Your model choices live in a
@@ -73,25 +93,36 @@ Clone the repository, then set up an environment with **either** venv or conda.
 PySide6 is a large wheel (~150–200 MB), so the first install takes a minute.
 
 ```bash
-git clone https://github.com/Adudeguyman/Ideogram-fantastic-upgraded-captioning-kit.git
-cd Ideogram-fantastic-upgraded-captioning-kit
+git clone https://github.com/Adudeguyman/Fantastic-Upgraded-Captioning-Kit.git
+cd Fantastic-Upgraded-Captioning-Kit
 ```
 
-### Quickest start — auto-launcher (venv)
+### Quickest start — `start.sh` / `start.bat`
 
-If you just want to run the app, use the bundled auto-launcher. On its first run
-it creates a local `.venv`, installs the requirements, and starts the app; every
-run after that launches straight away.
+One script does everything. On its **first run** it asks whether you'd like to use
+conda or a venv, installs accordingly, and remembers your choice in
+`.captioner_env`. **Every run after that** it just launches the app.
 
-- **Windows:** double-click `run_captioner_venv.bat`, or run it from a terminal.
+- **Windows:** double-click `start.bat`.
 - **Linux / macOS:**
   ```bash
-  chmod +x run_captioner_venv.sh   # once
-  ./run_captioner_venv.sh
+  chmod +x start.sh   # once
+  ./start.sh
   ```
 
-Prefer to manage the environment yourself? Set it up manually with venv or conda
-below.
+Useful flags:
+
+| Flag | What it does |
+| --- | --- |
+| `--setup` | Redo setup / switch between conda and venv |
+| `--repair` | Reinstall dependencies into the current environment |
+| `--cuda` | During setup, also install the NVIDIA NCCL runtime (Linux) |
+
+If the environment goes missing (deleted `.venv`, removed conda env), the script
+notices and rebuilds it rather than failing.
+
+Prefer to drive things yourself? Set the environment up manually with venv or
+conda below, then run `python -m captioning_kit`.
 
 ### Option A — venv
 
@@ -112,8 +143,8 @@ pip install -r requirements.txt
 ### Option B — conda
 
 ```bash
-conda create -n id4caption python=3.11
-conda activate id4caption
+conda create -n fantastic-captioner python=3.11
+conda activate fantastic-captioner
 pip install -r requirements.txt
 ```
 
@@ -139,7 +170,7 @@ backends and external servers like LM Studio don't need it).
 With your environment activated (venv or conda), launch the app with:
 
 ```bash
-python -m ideogram_captioner
+python -m captioning_kit
 ```
 
 or equivalently:
@@ -147,31 +178,6 @@ or equivalently:
 ```bash
 python run_captioner.py
 ```
-
-**venv convenience launchers:** `run_captioner_venv.sh` (Linux / macOS) and
-`run_captioner_venv.bat` (Windows) need no activation — on first run they create a
-local `.venv`, install the requirements, and start the app; every run after that
-launches straight away (the same auto-launcher described in *Quickest start* above):
-
-```bash
-chmod +x run_captioner_venv.sh   # once
-./run_captioner_venv.sh
-```
-
-On Windows, double-click `run_captioner_venv.bat` (or run it from a terminal).
-
-**conda convenience launchers:** `run_captioner_conda.sh` (Linux / macOS) and
-`run_captioner_conda.bat` (Windows) activate the `id4caption` environment for
-you, then start the app:
-
-```bash
-chmod +x run_captioner_conda.sh   # once
-./run_captioner_conda.sh
-```
-
-On Windows, double-click `run_captioner_conda.bat` (or run it from a terminal).
-It prefers the env's `python.exe` directly and falls back to `call conda
-activate id4caption`.
 
 ## Basic use
 
@@ -195,7 +201,7 @@ activate id4caption`.
      once and reference as needed while writing an image's guidance, so recurring
      instructions don't have to be retyped per image.
 
-   ![Guidance Settings — folder-level and per-image guidance with reusable tags](ideogramCaptionerScreenshot2.png)
+   ![Guidance Settings — folder-level and per-image guidance with reusable tags](captioningKitScreenshot2.png)
 
 4. *(Optional, when available)* **Use existing `.txt` captions as a starting point.**
    If your folder already has plain-text caption files — one `.txt` per image, named
@@ -207,7 +213,7 @@ activate id4caption`.
    toggle is only enabled when the folder actually contains matching `.txt` files;
    any image without one simply falls back to image-only captioning.
 
-   ![Existing-caption mode — the source .txt is detected and used to generate structured JSON](ideogramCaptionerScreenshot3.png)
+   ![Existing-caption mode — the source .txt is detected and used to generate structured JSON](captioningKitScreenshot3.png)
 
 5. Click **Run JSON Captioning** and choose **Caption Single Image** (the current
    image) or **Caption All Images**. If you run the whole folder and some images

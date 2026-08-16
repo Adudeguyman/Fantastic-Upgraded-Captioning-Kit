@@ -15,6 +15,36 @@
       "vram_gb": 20
     },
     {
+      "id": "ggml-qwen3-omni-30b",
+      "label": "Download: Qwen3-Omni 30B-A3B Q4 \u2014 hears audio, for video captions (~20GB)",
+      "tasks": [
+        "caption"
+      ],
+      "kind": "hf",
+      "api_model": "ggml-qwen3-omni-30b",
+      "hf_repo": "ggml-org/Qwen3-Omni-30B-A3B-Instruct-GGUF",
+      "model_filename": "Qwen3-Omni-30B-A3B-Instruct-Q4_K_M.gguf",
+      "mmproj_filename": "mmproj-Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf",
+      "vram_gb": 22,
+      "supports_audio": true,
+      "note": "Vision + audio. Lets video captions include spoken dialogue and the soundscape instead of guessing from frames alone."
+    },
+    {
+      "id": "huihui-qwen3-omni-30b-thinking-abliterated",
+      "label": "Download: Huihui Qwen3-Omni 30B Thinking abliterated Q4_K_M (~21GB)",
+      "tasks": [
+        "caption"
+      ],
+      "kind": "hf",
+      "api_model": "huihui-qwen3-omni-30b-thinking",
+      "hf_repo": "mradermacher/Huihui-Qwen3-Omni-30B-A3B-Thinking-abliterated-GGUF",
+      "model_filename": "Huihui-Qwen3-Omni-30B-A3B-Thinking-abliterated.Q4_K_M.gguf",
+      "mmproj_filename": "Huihui-Qwen3-Omni-30B-A3B-Thinking-abliterated.mmproj-f16.gguf",
+      "vram_gb": 23,
+      "supports_audio": true,
+      "note": "Uncensored Omni. Thinking variant \u2014 reasoning blocks are stripped, but it needs a larger max-tokens budget and is slower than Instruct."
+    },
+    {
       "id": "unsloth-qwen3vl-8b-q4",
       "label": "Download: Qwen3-VL 8B Q4 \u2014 Ideogram 4 text encoder (~8GB)",
       "tasks": [
@@ -113,6 +143,21 @@
       "model_filename": "Qwen3.6-27B-NEO-CODE-HERE-2T-OT-Q6_K.gguf",
       "mmproj_filename": "mmproj-F16.gguf",
       "vram_gb": 26
+    },
+    {
+      "id": "hauhaucs-gemma4-12b-qat-balanced-q4km",
+      "label": "Download: HauhauCS Gemma 4 12B QAT Uncensored (Balanced) Q4_K_M (~9GB)",
+      "tasks": [
+        "caption"
+      ],
+      "kind": "hf",
+      "api_model": "hauhaucs-gemma4-12b-qat",
+      "hf_repo": "HauhauCS/Gemma4-12B-QAT-Uncensored-HauhauCS-Balanced",
+      "model_filename": "Gemma4-12B-QAT-Uncensored-HauhauCS-Balanced-Q4_K_M.gguf",
+      "mmproj_filename": "mmproj-Gemma4-12B-QAT-Uncensored-HauhauCS-Balanced-BF16.gguf",
+      "vram_gb": 9,
+      "supports_audio": true,
+      "note": "QAT base, quantised to Q4_K_M rather than the naive q4_0 that loses part of the QAT benefit. BF16 projector."
     },
     {
       "id": "server-qwen3vl",
