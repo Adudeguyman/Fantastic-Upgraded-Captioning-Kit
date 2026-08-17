@@ -40,7 +40,7 @@ GENERAL = TrainingGoal(
     key="general",
     label="General",
     summary="Describe everything. No omissions — for broad quality or realism "
-            "adapters rather than one isolated concept.",
+            "training runs rather than one isolated concept.",
     rules="",
 )
 
@@ -50,8 +50,9 @@ CHARACTER = TrainingGoal(
     summary="Omit the face and build so they bind to the trigger; describe pose, "
             "clothing and setting so those stay promptable.",
     rules="""\
-This dataset trains a character likeness, so the adapter must own the person's
-identity while everything else stays promptable.
+This dataset trains a character likeness. The training will learn the person's
+identity from the pictures themselves, so leave it out of the caption; everything
+else should be described so it stays controllable later.
 
 Do NOT describe: facial features, face shape, eye colour or shape, hair colour or
 length, skin tone, body build, or permanent marks such as scars, freckles and
@@ -71,11 +72,13 @@ CONCEPT = TrainingGoal(
     summary="Omit the object's defining traits; describe where it sits, how it's "
             "lit and what surrounds it.",
     rules="""\
-This dataset trains a specific object or concept, so the adapter must own the
-thing itself while its context stays promptable.
+This dataset trains a specific object or concept. The training will learn the
+thing itself from the pictures, so leave its appearance out of the caption;
+describe its surroundings so those stay controllable later.
 
 Do NOT describe: the object's own shape, colour, materials, markings, logos or
-construction. Those are what the adapter is for.
+construction. Describing them would teach the model to treat those words as the
+source of the object, rather than learning the object from the pictures.
 
 DO describe fully: where the object sits and how it's placed, its scale relative
 to the scene, what surrounds it, the background and setting, lighting and
@@ -90,11 +93,13 @@ MOTION = TrainingGoal(
     summary="Omit the movement itself; describe the performer, clothing and "
             "setting in full so identity doesn't bind to the motion.",
     rules="""\
-This dataset trains a movement, so the adapter must own the action while
-everyone and everything performing it stays promptable.
+This dataset trains a movement. The training will learn the action from the
+clips, so leave it out of the caption; describe whoever and whatever is
+performing it so those stay controllable later.
 
 Do NOT describe: the movement, choreography, action or gesture being trained.
-Naming it would attribute it to your words instead of the adapter.
+Naming it would tie the movement to those words instead of letting it be learned
+from the footage.
 
 DO describe fully: the performer's appearance including face, hair, build and
 skin tone; their clothing and footwear; the location and every notable object in
@@ -110,8 +115,9 @@ ART_STYLE = TrainingGoal(
     summary="Omit style words entirely; describe subject matter thoroughly so the "
             "rendering treatment is the only unexplained signal.",
     rules="""\
-This dataset trains a visual style, so the adapter must own the rendering
-treatment while the subject matter stays promptable.
+This dataset trains a visual style. The training will learn the rendering
+treatment from the pictures, so leave it out of the caption; describe what is
+depicted so the subject matter stays controllable later.
 
 Do NOT describe: the style, medium, rendering technique, brushwork, line quality,
 grain, palette or era. Naming the style makes the model attach it to those words
@@ -130,8 +136,9 @@ VIDEO_STYLE = TrainingGoal(
     summary="Omit the grade and texture; describe content, action and camera so "
             "the look is what's left unexplained.",
     rules="""\
-This dataset trains a cinematographic look, so the adapter must own the visual
-treatment while the content stays promptable.
+This dataset trains a cinematographic look. The training will learn the visual
+treatment from the clips, so leave it out of the caption; describe the content so
+it stays controllable later.
 
 Do NOT describe: colour grade, film stock, grain, contrast, halation, bloom,
 lens character, or mood words for the look.

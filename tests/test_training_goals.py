@@ -523,3 +523,51 @@ class GoalOverlayTests(unittest.TestCase):
         loaded = load_goals(self.base)
         self.assertIn("ok", loaded)
         self.assertIn("character", loaded)
+
+
+class GoalRuleReadabilityTests(unittest.TestCase):
+    """The rules text is sent to the captioning model, which has no idea what
+    'adapter' means or which one you have in mind. It's the right word in the
+    module docstring and the wrong one in an instruction."""
+
+    def test_no_rules_text_uses_training_jargon(self):
+        for key, goal in GOALS.items():
+            self.assertNotIn("adapter", goal.rules.lower(), key)
+
+    def test_no_summary_uses_training_jargon(self):
+        for key, goal in GOALS.items():
+            self.assertNotIn("adapter", goal.summary.lower(), key)
+
+    def test_each_rule_still_explains_why_not_just_what(self):
+        """A model follows an omission better when told what the omission achieves."""
+        for key, goal in GOALS.items():
+            if not goal.has_rules:
+                continue
+            reason = any(word in goal.rules.lower()
+                         for word in ("will learn", "would teach", "would tie",
+                                      "binds", "instead of"))
+            self.assertTrue(reason, f"{key} states the rule without the reason")
+
+
+class GoalRuleReadabilityTests(unittest.TestCase):
+    """The rules text is sent to the captioning model, which has no idea what
+    'adapter' means or which one you have in mind. It's the right word in the
+    module docstring and the wrong one in an instruction."""
+
+    def test_no_rules_text_uses_training_jargon(self):
+        for key, goal in GOALS.items():
+            self.assertNotIn("adapter", goal.rules.lower(), key)
+
+    def test_no_summary_uses_training_jargon(self):
+        for key, goal in GOALS.items():
+            self.assertNotIn("adapter", goal.summary.lower(), key)
+
+    def test_each_rule_still_explains_why_not_just_what(self):
+        """A model follows an omission better when told what the omission achieves."""
+        for key, goal in GOALS.items():
+            if not goal.has_rules:
+                continue
+            reason = any(word in goal.rules.lower()
+                         for word in ("will learn", "would teach", "would tie",
+                                      "binds", "instead of"))
+            self.assertTrue(reason, f"{key} states the rule without the reason")
