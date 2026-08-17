@@ -960,7 +960,7 @@ class ModelPickerLayoutTests(unittest.TestCase):
     def _picker(self, mode):
         self.win.settings.server_start_mode = mode
         self.cap.clear()
-        self.win.open_preferences("Models")
+        self.win.open_preferences("LLM Models")
         prefs = self.cap["d"]
         self.cap.clear()
         prefs._open_model_picker("caption")
@@ -1031,7 +1031,7 @@ class PathShorteningTests(unittest.TestCase):
         win = A.MainWindow()
         cap = {}
         QDialog.exec = lambda dlg: (cap.__setitem__("d", dlg), 0)[1]
-        win.open_preferences("Models")
+        win.open_preferences("LLM Models")
         self.prefs = cap["d"]
 
     def test_short_paths_are_left_alone(self):
@@ -1116,7 +1116,7 @@ class PickerRowWidthTests(unittest.TestCase):
     def _picker(self):
         from PySide6.QtWidgets import QApplication
         self.cap.clear()
-        self.win.open_preferences("Models")
+        self.win.open_preferences("LLM Models")
         prefs = self.cap["d"]
         self.cap.clear()
         prefs._open_model_picker("caption")
@@ -1176,7 +1176,7 @@ class PickerDownloadedSectionTests(unittest.TestCase):
     def _sections(self):
         from PySide6.QtWidgets import QLabel
         self.cap.clear()
-        self.win.open_preferences("Models")
+        self.win.open_preferences("LLM Models")
         prefs = self.cap["d"]
         self.cap.clear()
         prefs._open_model_picker("caption")
@@ -1221,7 +1221,7 @@ class ModelsPageLabelTests(unittest.TestCase):
         A.default_profiles_path = lambda: Path(tf.mkdtemp()) / "p.json"
         cap = {}
         QDialog.exec = lambda dlg: (cap.__setitem__("d", dlg), 0)[1]
-        A.MainWindow().open_preferences("Models")
+        A.MainWindow().open_preferences("LLM Models")
         self.dlg = cap["d"]
 
     def _texts(self):

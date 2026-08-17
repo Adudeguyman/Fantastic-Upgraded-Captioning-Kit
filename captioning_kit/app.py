@@ -1539,7 +1539,7 @@ class PreferencesDialog(QDialog):
             ("server_startup_timeout", "Startup timeout (s)", "float", (0.0, 100000.0)),
             ("stop_server_after_job", "Stop server after job", "bool", None),
         )),
-        ("Models", ()),
+        ("LLM Models", ()),
         ("Pipeline", (
             ("creative_json", "Creative JSON (off = faithful)", "bool", None),
             ("disable_thinking", "Disable thinking", "bool", None),
@@ -1648,7 +1648,7 @@ class PreferencesDialog(QDialog):
         families = ["(auto)"] + sorted(set(QFontDatabase.families()))
         for name, fields in self.GROUPS:
             self.nav.addItem(name)
-            if name == "Models":
+            if name == "LLM Models":
                 page = self._build_models_page()
             elif name == "Tags":
                 page = self._build_tags_page()
@@ -3008,7 +3008,7 @@ class PreferencesDialog(QDialog):
         its server-mode-dependent UI from the current Connection/Server selections,
         so the user never has to Apply just to see the right model fields."""
         item = self.nav.item(row) if (row is not None and row >= 0) else None
-        if item is not None and item.text() == "Models" and self._profile_combos:
+        if item is not None and item.text() == "LLM Models" and self._profile_combos:
             self._apply_models_mode()
 
     def _on_server_mode_changed(self) -> None:
@@ -3525,7 +3525,7 @@ class PreferencesDialog(QDialog):
             add_section("Detected models")
             if not found:
                 add_hint("No downloaded GGUF files found. Add your server's model folders on "
-                         "the Models page (Browse\u2026 / Detect model folders).")
+                         "the LLM Models page (Browse\u2026 / Detect model folders).")
             else:
                 for path in found:
                     add_row(make_detected_row(path))
@@ -4013,7 +4013,7 @@ class PreferencesDialog(QDialog):
         elif find_llama_server() is None:
             return  # button is disabled in this state anyway
         elif not has_model_config(main.settings, "caption"):
-            items = self.nav.findItems("Models", Qt.MatchExactly)
+            items = self.nav.findItems("LLM Models", Qt.MatchExactly)
             if items:
                 self.nav.setCurrentRow(self.nav.row(items[0]))
             return
@@ -10211,7 +10211,7 @@ class MainWindow(QMainWindow):
             "No captioning model is configured yet.\n\nOpen Model settings to pick "
             "a model (or point at one you've already downloaded), then start again.",
         )
-        self.open_preferences("Models")
+        self.open_preferences("LLM Models")
         return False
 
     def _confirm_model_download(self) -> bool:
@@ -10248,7 +10248,7 @@ class MainWindow(QMainWindow):
         box.setInformativeText(
             f"These files aren't downloaded yet:\n\n{listing}\n\n"
             f"They'll be saved to:\n{where}\n\n"
-            "Change this with 'Model download location' on the Models page.")
+            "Change this with 'Model download location' on the LLM Models page.")
         yes = box.addButton("Download", QMessageBox.AcceptRole)
         box.addButton(QMessageBox.Cancel)
         box.setDefaultButton(yes)

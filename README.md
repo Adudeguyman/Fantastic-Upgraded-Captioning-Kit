@@ -186,7 +186,7 @@ python run_captioner.py
 ## Basic use
 
 1. In **Preferences**, set up your server (Connection/Server) and choose the model
-   it will use (Models). For an existing server, click **Refresh** to pick from the
+   it will use (LLM Models). For an existing server, click **Refresh** to pick from the
    models it reports. Use **Test Server** to verify the connection. The server status
    is always shown in the bottom-right corner of the main window.
 
