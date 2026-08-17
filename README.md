@@ -72,8 +72,8 @@ leaves your machine except the requests to the endpoint you configure.
   to wait for an app release.
 - **Bring your own model** — Pick from suggested Hugging Face GGUF models
   (auto-downloaded and served via llama.cpp), point at local GGUF files, or
-  connect to a server you're already running. Your model choices live in a
-  local, git-ignored profile file.
+  connect to a server you're already running. Your model choices are saved
+  locally.
 
 Manual captioning and box editing work fully offline; a model server is only
 needed for the auto-captioning features.
@@ -266,9 +266,8 @@ amber triangle; hover it for the specific reason.
 
 ## Configuration
 
-Both of these are local, git-ignored, and seeded from tracked `*.example`
-templates, so your settings survive `git pull` and are never uploaded by
-accident:
+Both are created on first run from the bundled `*.example` templates and stay
+on your machine:
 
 - **Model profiles** — `captioner_model_profiles.json`
   (*Preferences → Models → Open Profiles File*), seeded from
