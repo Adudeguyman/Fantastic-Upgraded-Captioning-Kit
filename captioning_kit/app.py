@@ -2257,6 +2257,15 @@ class PreferencesDialog(QDialog):
         target_row.addWidget(self._pe_target, 1)
         lay.addLayout(target_row)
 
+        self._pe_generated = QLabel(
+            "Built from the caption schema at run time, so it isn't editable here. "
+            "Shown for reference \u2014 adjust it with folder or per-file guidance "
+            "instead.")
+        self._pe_generated.setObjectName("Hint")
+        self._pe_generated.setWordWrap(True)
+        self._pe_generated.setVisible(False)
+        lay.addWidget(self._pe_generated)
+
         self._pe_edit = QPlainTextEdit()
         self._pe_edit.setLineWrapMode(QPlainTextEdit.NoWrap)
         lay.addWidget(self._pe_edit, 1)
@@ -2277,6 +2286,23 @@ class PreferencesDialog(QDialog):
         lay.addLayout(row)
         self._pe_reload()
         return w
+
+    def _generated_prompt_preview(self, preset_key: str) -> str:
+        """The instructions a schema-driven preset actually sends, for reading."""
+        # Built the same way the run does, rather than borrowing whatever the main
+        # window currently has selected — that showed the wrong preset's prompt.
+        try:
+            prompts = load_prompts()
+            key = "image_to_json_system"
+            if key not in prompts:
+                key = next(iter(prompts), "")
+            text = json_system_prompt(prompts, key, self.settings)
+            if text.strip():
+                return text
+        except Exception:
+            pass
+        return ("These instructions are generated from the caption schema when a "
+                "run starts, so there's nothing stored to edit here.")
 
     def _pe_all(self) -> dict:
         merged = dict(PRESETS)
@@ -2379,7 +2405,7 @@ class PreferencesDialog(QDialog):
 
     def _pe_reload(self) -> None:
         """Keep unsaved edits per (preset, media) while switching between them."""
-        if self._pe_current is not None:
+        if self._pe_current is not None and not self._pe_edit.isReadOnly():
             self._pe_pending[self._pe_current] = self._pe_edit.toPlainText()
         preset = self._pe_preset.currentData()
         media = self._pe_media.currentData()
@@ -2388,7 +2414,18 @@ class PreferencesDialog(QDialog):
         if self._pe_current in self._pe_pending:
             self._pe_edit.setPlainText(self._pe_pending[self._pe_current])
             return
-        default = self._pe_all().get(preset, get_preset(preset)).prompt_for(media)
+        source = self._pe_all().get(preset, get_preset(preset))
+        default = source.prompt_for(media)
+        if not default.strip() and source.editor == "structured":
+            # Ideogram 4's instructions are generated from the schema at run time,
+            # not stored as a prompt. Showing an empty box made it look as though
+            # the prompt had vanished, so show the real thing and say it's built.
+            self._pe_edit.setPlainText(self._generated_prompt_preview(preset))
+            self._pe_edit.setReadOnly(True)
+            self._pe_generated.setVisible(True)
+            return
+        self._pe_edit.setReadOnly(False)
+        self._pe_generated.setVisible(False)
         stored = self._qsettings.value(self._pe_key(preset, media), default, str)
         self._pe_edit.setPlainText(stored)
 
@@ -2399,7 +2436,7 @@ class PreferencesDialog(QDialog):
 
     def _pe_commit(self) -> None:
         """Write every touched prompt, and the user's presets. Called from Save."""
-        if self._pe_current is not None:
+        if self._pe_current is not None and not self._pe_edit.isReadOnly():
             self._pe_pending[self._pe_current] = self._pe_edit.toPlainText()
         # A custom preset's prompts live in the preset file, not QSettings, so the
         # preset is self-contained and travels with an export.

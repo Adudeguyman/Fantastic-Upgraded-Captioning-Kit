@@ -388,3 +388,54 @@ class CustomPresetTests(unittest.TestCase):
         self.assertTrue(custom_presets_path(self.base).exists())
         save_custom_presets(self.base, {})
         self.assertFalse(custom_presets_path(self.base).exists())
+
+
+class GeneratedPromptVisibilityTests(unittest.TestCase):
+    """Ideogram 4's instructions are built from the caption schema at run time,
+    not stored as a preset prompt. The editor showed an empty box for it, which
+    read as though the prompt had been lost."""
+
+    def setUp(self):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication, QDialog
+        QApplication.instance() or QApplication([])
+        import tempfile as tf
+        import captioning_kit.app as A
+        A.default_profiles_path = lambda: Path(tf.mkdtemp()) / "p.json"
+        win = A.MainWindow()
+        cap = {}
+        QDialog.exec = lambda dlg: (cap.__setitem__("d", dlg), 0)[1]
+        win.open_preferences("LLM Instructions")
+        self.dlg = cap["d"]
+
+    def _select(self, key):
+        self.dlg._pe_preset.setCurrentIndex(self.dlg._pe_preset.findData(key))
+        return self.dlg._pe_edit.toPlainText()
+
+    def test_the_schema_driven_prompt_is_shown_not_blank(self):
+        text = self._select("ideogram4")
+        self.assertGreater(len(text), 500)
+        self.assertIn("Ideogram", text)
+
+    def test_it_is_read_only_because_editing_would_not_persist(self):
+        self._select("ideogram4")
+        self.assertTrue(self.dlg._pe_edit.isReadOnly())
+
+    def test_the_right_preset_prompt_is_shown(self):
+        """It previously borrowed whatever the main window had selected, which
+        showed the plain-text prompt under the Ideogram entry."""
+        self.assertIn("Wan 2.2", self._select("wan22"))
+        self.assertIn("Ideogram", self._select("ideogram4"))
+
+    def test_editable_presets_stay_editable(self):
+        self._select("wan22")
+        self.assertFalse(self.dlg._pe_edit.isReadOnly())
+
+    def test_a_read_only_prompt_is_never_saved_as_an_edit(self):
+        """Otherwise switching through Ideogram would stash the generated text as a
+        user override for a preset that doesn't use one."""
+        self._select("ideogram4")
+        self.dlg._pe_reload()
+        self.assertNotIn(("ideogram4", "image"), self.dlg._pe_pending)
+        self.assertNotIn(("ideogram4", "video"), self.dlg._pe_pending)
