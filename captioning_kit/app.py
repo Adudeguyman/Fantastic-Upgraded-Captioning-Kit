@@ -10055,13 +10055,28 @@ class MainWindow(QMainWindow):
             label = label.split(":", 1)[1].strip()
         name = label or "the selected model"
         listing = "\n".join(f"  \u2022 {fn}" for fn in missing)
-        resp = QMessageBox.question(
-            self, "Download model files?",
-            f"Starting the server will fetch {name} from Hugging Face. "
-            f"These files aren't downloaded yet:\n\n{listing}\n\nDownload them now?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
-        )
-        return resp == QMessageBox.Yes
+        # Name the destination. Without it you can't tell whether a download went
+        # to your models folder or the shared Hugging Face cache, which is exactly
+        # the confusion that makes a finished download look like it did nothing.
+        target = getattr(settings, "model_download_target", "") or ""
+        if target == MODEL_TARGET_HF:
+            where = ("the shared Hugging Face cache\n(~/.cache/huggingface/hub, or "
+                     "wherever HF_HOME points)")
+        else:
+            where = str(Path(settings.models_dir).expanduser())
+        box = QMessageBox(self)
+        box.setWindowTitle("Download model files?")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"Starting the server will fetch {name} from Hugging Face.")
+        box.setInformativeText(
+            f"These files aren't downloaded yet:\n\n{listing}\n\n"
+            f"They'll be saved to:\n{where}\n\n"
+            "Change this with 'Model download location' on the Models page.")
+        yes = box.addButton("Download", QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(yes)
+        box.exec()
+        return box.clickedButton() is yes
 
     def _launch_local_server(self, model_less: bool = False) -> None:
         if self._server_is_running():

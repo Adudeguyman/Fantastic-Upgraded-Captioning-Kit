@@ -1653,3 +1653,74 @@ class SharedMediaWordingTests(unittest.TestCase):
         literals = " ".join(re.findall(r'"([^"\n]*)"', source))
         found = [phrase for phrase in self.STALE if phrase in literals]
         self.assertEqual(found, [], f"image-only wording on shared strings: {found}")
+
+
+class DownloadConfirmationTests(unittest.TestCase):
+    """Nothing downloads without a yes, and the yes says where it's going.
+
+    The prompt named the model and the files but not the destination, so a
+    finished download could land in the shared HF cache while you were watching
+    your models folder — which looks exactly like nothing happened.
+    """
+
+    def setUp(self):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance() or QApplication([])
+        import tempfile as tf
+        import captioning_kit.app as A
+        A.default_profiles_path = lambda: Path(tf.mkdtemp()) / "p.json"
+        self.win = A.MainWindow()
+        self.win.settings.server_start_mode = "local"
+        self.win.settings.auto_start_server = True
+        self.win.settings.models_dir = "/tmp/some-models-dir"
+        self.win.settings.caption_profile_id = "hauhaucs-gemma4-12b-qat-balanced-q4km"
+        self.seen = {}
+
+    def _ask(self, target, click="Download"):
+        from PySide6.QtWidgets import QMessageBox
+        self.win.settings.model_download_target = target
+
+        def fake_exec(box):
+            self.seen["text"] = box.text()
+            self.seen["info"] = box.informativeText()
+            return 0
+        QMessageBox.exec = fake_exec
+        QMessageBox.clickedButton = lambda box: next(
+            b for b in box.buttons() if click in b.text())
+        return self.win._confirm_model_download()
+
+    def test_app_folder_destination_is_shown_by_path(self):
+        from captioning_kit.llm_captioning import MODEL_TARGET_APP
+        self._ask(MODEL_TARGET_APP)
+        self.assertIn("/tmp/some-models-dir", self.seen["info"])
+
+    def test_hf_cache_destination_is_named(self):
+        from captioning_kit.llm_captioning import MODEL_TARGET_HF
+        self._ask(MODEL_TARGET_HF)
+        self.assertIn("Hugging Face cache", self.seen["info"])
+
+    def test_it_says_where_to_change_the_destination(self):
+        from captioning_kit.llm_captioning import MODEL_TARGET_APP
+        self._ask(MODEL_TARGET_APP)
+        self.assertIn("Model download location", self.seen["info"])
+
+    def test_the_model_is_named_not_just_described(self):
+        from captioning_kit.llm_captioning import MODEL_TARGET_APP
+        self._ask(MODEL_TARGET_APP)
+        self.assertIn("Gemma 4 12B QAT", self.seen["text"])
+
+    def test_cancelling_declines_the_download(self):
+        from captioning_kit.llm_captioning import MODEL_TARGET_APP
+        self.assertFalse(self._ask(MODEL_TARGET_APP, click="Cancel"))
+
+    def test_no_prompt_when_the_files_are_already_present(self):
+        """Only a real download should interrupt."""
+        import captioning_kit.app as A
+        original = A.missing_model_files
+        A.missing_model_files = lambda settings, task: []
+        try:
+            self.assertTrue(self.win._confirm_model_download())
+        finally:
+            A.missing_model_files = original
