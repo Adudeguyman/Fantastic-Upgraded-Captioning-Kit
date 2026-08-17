@@ -5,7 +5,7 @@ video model training. Open a folder of stills or clips, write or generate
 captions in the format your target model expects, trim and conform clips to its
 frame grid, and keep everything on your own machine.
 
-Supports **Ideogram 4** (structured JSON with bounding boxes), **MiniMax H3**,
+Supports **Ideogram 4** (structured fields with bounding boxes), **MiniMax H3**,
 **Wan 2.2**, **LTX-2**, and plain text — each with its own caption format and,
 for the video models, its own fps and frame-count rules.
 
@@ -47,26 +47,23 @@ leaves your machine except the requests to the endpoint you configure.
 - **Dataset browsing** — Step through a folder with keyboard shortcuts.
   Sort and filter by name, date, missing captions, or failed jobs, and search
   inside caption sidecars to jump straight to the images you mean.
-- **Structured caption editing** — Edit every Ideogram JSON field (description,
-  style, background, elements, rendered text, color palette) in proper fields
-  rather than raw text, with a live raw-JSON view alongside. Original text
-  captions (`.txt`, `.original`) stay separate from the structured JSON.
-- **Bounding boxes** — Draw, move, resize, delete, and numerically edit
-  object/text boxes directly on the image, with overlap-aware selection.
+- **Ideogram 4's structured format** — When that preset is selected, captions are
+  edited as proper fields (description, style, background, elements, rendered
+  text, colour palette) rather than raw text, with a live raw view alongside and
+  bounding boxes you can draw, move, resize and edit numerically on the image.
+  Every other preset writes a plain `.txt` beside the file.
 - **Caption guidance** — Attach folder-wide and per-image guidance (style,
   characters, things to always mention or avoid) that steers generation, plus
   reusable tag/trigger chips.
-- **Local auto-captioning** — Generate the structured Ideogram JSON straight from
-  an image, refine an existing caption, and run a bounding-box pass over the
-  described elements (regenerate every box, or fill only the missing ones) — all
-  through a local vision-language model you control. Caption the current image or
-  the whole folder; when re-running an already-captioned folder you can limit it to
-  new images, changed + new, or re-caption everything, and cancel a run at any time.
-- **Caption review** — Captions that come back off-schema or corrupt — empty, a
-  flat text blob instead of structured JSON, a model refusal, or a duplicate of
-  another image's caption — are automatically flagged for review after a run, with
-  a summary listing them. You can also browse and flag images yourself while a batch
-  is still running, then jump straight between flagged images to fix them.
+- **Local auto-captioning** — Caption a file or a whole folder through a vision
+  model you control, refine what comes back, and re-run selectively: only new
+  files, changed and new, or everything. Cancel a run at any point. For Ideogram
+  4 there's also a bounding-box pass that can regenerate every box or fill in
+  only the missing ones.
+- **Caption review** — Captions that come back empty, malformed, a model refusal,
+  or a duplicate of another file's are flagged automatically after a run, with a
+  summary listing them. You can also flag files yourself while a batch is still
+  running, then jump straight between flagged ones to fix them.
 - **Bypass and backup** — Move files out of the dataset into `.bypass/` without
   deleting them (still individually captionable), and duplicate or back up a
   whole dataset choosing what comes along: captions, settings, originals.
@@ -199,7 +196,7 @@ python run_captioner.py
    the next time you open that folder.
 
 3. Pick a **preset** and a **training goal** at the top of the right-hand panel.
-   The preset decides the caption's *format* — Ideogram 4 JSON, MiniMax H3, Wan 2.2,
+   The preset decides the caption's *format* — Ideogram 4, MiniMax H3, Wan 2.2,
    LTX-2, or plain text. The goal decides its *content*: what to describe and what
    to leave out, depending on whether you're training a character, a concept, a
    motion, an art style or a video look. The two are independent, so any goal works
@@ -219,21 +216,20 @@ python run_captioner.py
    ![Guidance Settings — folder-level and per-image guidance with reusable tags](captioningKitScreenshot2.png)
 
 5. *(Optional, when available)* **Use existing `.txt` captions as a starting point.**
-   If your folder already has plain-text caption files — one `.txt` per image, named
-   to match the image's filename — the captioner can read each one and rewrite it
-   into Ideogram-4 structured JSON, instead of describing the image from scratch. The
+   If your folder already has plain-text caption files — one `.txt` per file, named
+   to match it — the captioner can read each one and rewrite it into the selected
+   format, instead of describing the file from scratch. The
    detected source caption is shown in the guidance panel (and in a pop-out you can
    keep open while you browse). Turn it on with the **Use existing .txt captions as
    guidance** toggle in the Caption Guidance panel or in **Guidance Settings**. The
    toggle is only enabled when the folder actually contains matching `.txt` files;
    any image without one simply falls back to image-only captioning.
 
-   ![Existing-caption mode — the source .txt is detected and used to generate structured JSON](captioningKitScreenshot3.png)
+   ![Existing-caption mode — the source .txt is detected and used as the starting point](captioningKitScreenshot3.png)
 
-6. Click **Run JSON Captioning** and choose **Caption Single Image** (the current
-   image) or **Caption All Images**. If you run the whole folder and some images
-   already have captions, a follow-up prompt lets you do *only new* images,
-   *changed + new*, or *re-caption everything*.
+6. Click **Run Captioning** and choose the current file or the whole folder. If
+   you run the folder and some files already have captions, a follow-up prompt
+   lets you do *only new* files, *changed + new*, or *re-caption everything*.
 
 7. While the folder runs, captions appear as they're generated. The caption editor
    is **read-only** during a run (a banner indicates this), but you can flag any
@@ -294,7 +290,7 @@ accident:
   keyboards without arrow keys); also navigates the source-caption pop-out
 - `F` — flag the current image for review
 - `Shift+F` — jump to the next flagged image
-- `Ctrl+J` — toggle the raw JSON view
+- `Ctrl+J` — toggle the raw caption view (Ideogram 4)
 - `Ctrl+0` — fit the image to the canvas
 - `Ctrl+\` — collapse / expand the guidance panel
 - `Ctrl+,` — open Preferences
@@ -327,10 +323,10 @@ accident:
   CPU rather than aborting; set a fixed value in Preferences to override.
 - **Empty output or `finish_reason=length`** — raise the context size / output
   tokens, lower the reasoning budget, or try a smaller image or model.
-- **JSON errors after generation** — filter to failed captions and use
+- **Malformed captions after generation** — filter to failed captions and use
   **Retry Failed** with a stronger model or a larger context.
-- **No bounding boxes** — confirm the selected model profile supports
-  vision/bbox and has access to its `mmproj` file.
+- **No bounding boxes** (Ideogram 4) — confirm the selected model profile
+  supports vision and has access to its `mmproj` file.
 
 ## License
 
