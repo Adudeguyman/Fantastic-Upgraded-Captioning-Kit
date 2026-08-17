@@ -55,6 +55,7 @@ ffmpeg/
 
 # Written by the app at runtime, not source
 model_targets.json
+captioner_custom_presets.json
 captioner_guidance_presets.json
 .bypass/
 .captioner/

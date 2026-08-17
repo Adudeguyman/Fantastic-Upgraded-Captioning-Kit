@@ -183,3 +183,112 @@ def caption_extensions() -> set[str]:
     """Every extension a preset might write — used to keep caption sidecars out of
     the image listing."""
     return {p.extension for p in PRESETS.values()}
+
+
+# --- user-defined presets -----------------------------------------------------
+#
+# Stored alongside the app so a preset for a model that shipped last week doesn't
+# have to wait for a release. Deliberately plain-text only: the structured editor
+# and bounding boxes are Ideogram-4 machinery that can't be described by filling
+# in a form.
+
+CUSTOM_PRESETS_FILENAME = "captioner_custom_presets.json"
+
+
+def custom_presets_path(base_dir) -> "Path":
+    from pathlib import Path
+    return Path(base_dir) / CUSTOM_PRESETS_FILENAME
+
+
+def make_custom_preset(key: str, label: str, image_prompt: str = "",
+                       video_prompt: str = "", model_target: str = "",
+                       blurb: str = "") -> CaptionPreset:
+    """A plain-text preset defined by the user.
+
+    model_target may be empty: a stills-only preset has no frame grid to conform
+    to, and forcing a choice would invent a constraint that doesn't exist.
+    """
+    return CaptionPreset(
+        key=key,
+        label=label,
+        extension=".txt",
+        editor="plain",
+        has_boxes=False,
+        validates=False,
+        system_prompt=video_prompt or image_prompt,
+        image_prompt=image_prompt,
+        video_prompt=video_prompt,
+        model_target=model_target or "",
+        blurb=blurb or "Added by you.",
+    )
+
+
+def _custom_from_dict(raw: dict) -> CaptionPreset | None:
+    key = str(raw.get("key") or "").strip()
+    label = str(raw.get("label") or "").strip()
+    if not key or not label or key in PRESETS:
+        return None          # never let a user entry shadow a built-in
+    return make_custom_preset(
+        key=key,
+        label=label,
+        image_prompt=str(raw.get("image_prompt") or ""),
+        video_prompt=str(raw.get("video_prompt") or ""),
+        model_target=str(raw.get("model_target") or ""),
+        blurb=str(raw.get("blurb") or ""),
+    )
+
+
+def load_custom_presets(base_dir) -> dict[str, CaptionPreset]:
+    """Read user presets. A malformed entry is skipped, not fatal — one bad hand
+    edit shouldn't stop the app opening."""
+    import json
+    path = custom_presets_path(base_dir)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    out: dict[str, CaptionPreset] = {}
+    for raw in (data.get("presets") or []):
+        if isinstance(raw, dict):
+            preset = _custom_from_dict(raw)
+            if preset is not None:
+                out[preset.key] = preset
+    return out
+
+
+def save_custom_presets(base_dir, presets: dict[str, CaptionPreset]) -> None:
+    import json
+    path = custom_presets_path(base_dir)
+    if not presets:
+        path.unlink(missing_ok=True)
+        return
+    payload = {
+        "_format": 1,
+        "presets": [
+            {
+                "key": p.key,
+                "label": p.label,
+                "image_prompt": p.image_prompt,
+                "video_prompt": p.video_prompt,
+                "model_target": p.model_target,
+                "blurb": p.blurb,
+            }
+            for p in presets.values()
+        ],
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def all_presets(base_dir=None) -> dict[str, CaptionPreset]:
+    """Built-ins plus user presets, built-ins first."""
+    merged = dict(PRESETS)
+    if base_dir is not None:
+        merged.update(load_custom_presets(base_dir))
+    return merged
+
+
+def preset_order(base_dir=None) -> tuple[str, ...]:
+    order = list(PRESET_ORDER)
+    if base_dir is not None:
+        order += [k for k in load_custom_presets(base_dir) if k not in order]
+    return tuple(order)

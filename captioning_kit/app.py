@@ -150,7 +150,16 @@ from .llm_captioning import (
     default_models_dir,
     profile_seed_data,
 )
-from .presets import PRESET_ORDER, PRESETS, CaptionPreset, get_preset
+from .presets import (
+    PRESET_ORDER,
+    PRESETS,
+    CaptionPreset,
+    all_presets,
+    get_preset,
+    load_custom_presets,
+    make_custom_preset,
+    save_custom_presets,
+)
 from .training_goals import DEFAULT_GOAL, GOAL_ORDER, GOALS, TrainingGoal, get_goal
 from .video_tools import (
     VideoInfo,
@@ -2214,18 +2223,39 @@ class PreferencesDialog(QDialog):
         lay = QVBoxLayout(w)
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(6)
+        self._pe_custom = load_custom_presets(app_base_dir())
         picker = QHBoxLayout()
         picker.addWidget(QLabel("Preset:"))
         self._pe_preset = QComboBox()
-        for key in PRESET_ORDER:
-            self._pe_preset.addItem(PRESETS[key].label, key)
+        self._pe_repopulate()
         picker.addWidget(self._pe_preset, 1)
+        add_btn = QPushButton("Add\u2026")
+        add_btn.setToolTip("Create a caption preset for a model the app doesn't ship")
+        add_btn.clicked.connect(self._pe_add)
+        picker.addWidget(add_btn)
+        self._pe_remove_btn = QPushButton("Remove")
+        self._pe_remove_btn.setToolTip("Delete a preset you added")
+        self._pe_remove_btn.clicked.connect(self._pe_remove)
+        picker.addWidget(self._pe_remove_btn)
         picker.addWidget(QLabel("For:"))
         self._pe_media = QComboBox()
         self._pe_media.addItem("Photos", "image")
         self._pe_media.addItem("Videos", "video")
         picker.addWidget(self._pe_media)
         lay.addLayout(picker)
+
+        # Which model's frame rules this preset conforms clips to. Optional: a
+        # stills-only preset has no frame grid, and forcing a choice would invent a
+        # constraint that doesn't exist.
+        target_row = QHBoxLayout()
+        target_row.addWidget(QLabel("Frame rules:"))
+        self._pe_target = QComboBox()
+        self._pe_target.setToolTip(
+            "Conform clips captioned with this preset to a model's fps and "
+            "frame-count grid. Leave as None for a photos-only preset.")
+        self._pe_target.currentIndexChanged.connect(self._pe_target_changed)
+        target_row.addWidget(self._pe_target, 1)
+        lay.addLayout(target_row)
 
         self._pe_edit = QPlainTextEdit()
         self._pe_edit.setLineWrapMode(QPlainTextEdit.NoWrap)
@@ -2248,6 +2278,102 @@ class PreferencesDialog(QDialog):
         self._pe_reload()
         return w
 
+    def _pe_all(self) -> dict:
+        merged = dict(PRESETS)
+        merged.update(self._pe_custom)
+        return merged
+
+    def _pe_repopulate(self, select: str | None = None) -> None:
+        keep = select or self._pe_preset.currentData()
+        self._pe_preset.blockSignals(True)
+        self._pe_preset.clear()
+        for key in PRESET_ORDER:
+            self._pe_preset.addItem(PRESETS[key].label, key)
+        for key, preset in self._pe_custom.items():
+            self._pe_preset.addItem(f"{preset.label}  (added)", key)
+        idx = self._pe_preset.findData(keep)
+        self._pe_preset.setCurrentIndex(max(0, idx))
+        self._pe_preset.blockSignals(False)
+
+    def _pe_refresh_target(self) -> None:
+        """Offer every model the app has rules for, built-in and user-added alike —
+        a preset for a new model is useless if it can't point at that model."""
+        key = self._pe_preset.currentData()
+        preset = self._pe_all().get(key)
+        self._pe_target.blockSignals(True)
+        self._pe_target.clear()
+        self._pe_target.addItem("None (photos, or no conforming)", "")
+        targets = load_targets(app_base_dir())
+        for target_key, target in targets.items():
+            self._pe_target.addItem(target.label, target_key)
+        current = (preset.model_target if preset else "") or ""
+        idx = self._pe_target.findData(current)
+        if idx < 0 and current:
+            # A preset pointing at rules that have since been deleted.
+            self._pe_target.addItem(f"{current} (missing)", current)
+            idx = self._pe_target.count() - 1
+        self._pe_target.setCurrentIndex(max(0, idx))
+        # Built-in presets ship with the right target; changing it would be a
+        # silent contradiction of the format they encode.
+        editable = key in self._pe_custom
+        self._pe_target.setEnabled(editable)
+        self._pe_remove_btn.setEnabled(editable)
+        self._pe_target.blockSignals(False)
+
+    def _pe_target_changed(self, _idx: int) -> None:
+        key = self._pe_preset.currentData()
+        if key not in self._pe_custom:
+            return
+        preset = self._pe_custom[key]
+        self._pe_custom[key] = make_custom_preset(
+            key=preset.key, label=preset.label,
+            image_prompt=preset.image_prompt, video_prompt=preset.video_prompt,
+            model_target=self._pe_target.currentData() or "",
+            blurb=preset.blurb)
+
+    def _pe_add(self) -> None:
+        label, ok = QInputDialog.getText(self, "Add caption preset", "Preset name:")
+        label = (label or "").strip()
+        if not ok or not label:
+            return
+        key = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_") or "custom_preset"
+        if key in self._pe_all():
+            QMessageBox.information(self, "Add caption preset",
+                                    f"'{label}' already exists.")
+            return
+        # Seeded from the plain-text prompts rather than blank: an empty prompt
+        # produces an empty caption, and starting from something that works is
+        # easier than starting from nothing.
+        base = get_preset("plain_text")
+        self._pe_custom[key] = make_custom_preset(
+            key=key, label=label,
+            image_prompt=base.prompt_for("image"),
+            video_prompt=base.prompt_for("video"),
+            model_target="")
+        self._pe_repopulate(select=key)
+        self._pe_current = None
+        self._pe_reload()
+
+    def _pe_remove(self) -> None:
+        key = self._pe_preset.currentData()
+        if key not in self._pe_custom:
+            return
+        label = self._pe_custom[key].label
+        if QMessageBox.question(
+            self, "Remove caption preset",
+            f"Delete the '{label}' preset?\n\nFolders currently using it will fall "
+            "back to Plain text. Captions already written are untouched.",
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
+        ) != QMessageBox.Yes:
+            return
+        self._pe_custom.pop(key, None)
+        for media in ("image", "video"):
+            self._pe_pending.pop((key, media), None)
+            self._qsettings.remove(self._pe_key(key, media))
+        self._pe_repopulate()
+        self._pe_current = None
+        self._pe_reload()
+
     def _pe_key(self, preset: str, media: str) -> str:
         return f"system_prompt/{preset}/{media}"
 
@@ -2258,21 +2384,35 @@ class PreferencesDialog(QDialog):
         preset = self._pe_preset.currentData()
         media = self._pe_media.currentData()
         self._pe_current = (preset, media)
+        self._pe_refresh_target()
         if self._pe_current in self._pe_pending:
             self._pe_edit.setPlainText(self._pe_pending[self._pe_current])
             return
-        default = get_preset(preset).prompt_for(media)
+        default = self._pe_all().get(preset, get_preset(preset)).prompt_for(media)
         stored = self._qsettings.value(self._pe_key(preset, media), default, str)
         self._pe_edit.setPlainText(stored)
 
     def _pe_reset(self) -> None:
         preset, media = self._pe_current or ("", "")
-        self._pe_edit.setPlainText(get_preset(preset).prompt_for(media))
+        source = self._pe_all().get(preset, get_preset(preset))
+        self._pe_edit.setPlainText(source.prompt_for(media))
 
     def _pe_commit(self) -> None:
-        """Write every touched prompt. Called from the dialog's Save."""
+        """Write every touched prompt, and the user's presets. Called from Save."""
         if self._pe_current is not None:
             self._pe_pending[self._pe_current] = self._pe_edit.toPlainText()
+        # A custom preset's prompts live in the preset file, not QSettings, so the
+        # preset is self-contained and travels with an export.
+        for (preset_key, media), text in list(self._pe_pending.items()):
+            if preset_key in self._pe_custom:
+                existing = self._pe_custom[preset_key]
+                self._pe_custom[preset_key] = make_custom_preset(
+                    key=existing.key, label=existing.label,
+                    image_prompt=text if media == "image" else existing.image_prompt,
+                    video_prompt=text if media == "video" else existing.video_prompt,
+                    model_target=existing.model_target, blurb=existing.blurb)
+                self._pe_pending.pop((preset_key, media), None)
+        save_custom_presets(app_base_dir(), self._pe_custom)
         for (preset, media), text in self._pe_pending.items():
             default = get_preset(preset).prompt_for(media)
             key = self._pe_key(preset, media)
@@ -9266,8 +9406,8 @@ class MainWindow(QMainWindow):
 
         _row(0, "Preset:")
         self.preset_combo = QComboBox()
-        for key in PRESET_ORDER:
-            self.preset_combo.addItem(PRESETS[key].label, key)
+        for key, preset in self.available_presets().items():
+            self.preset_combo.addItem(preset.label, key)
         self.preset_combo.setToolTip("Caption format for this folder")
         # The longest label ("MiniMax H3 — Official Prompt Structure") needs about
         # 300px; below that Qt elides it, so the tooltip carries the full name and
@@ -10960,7 +11100,10 @@ class MainWindow(QMainWindow):
             # sidecar extension the store reads and writes.
             probe = CaptionStore(Path(folder), self.settings_caption_ext())
             project = probe.load_project()
-            self.preset = get_preset(project.preset)
+            # Custom presets are resolved through the merged map; get_preset alone
+            # only knows the built-ins and would silently fall back to plain text.
+            self.preset = self.available_presets().get(
+                project.preset, get_preset(project.preset))
             self.store = CaptionStore(Path(folder), self.preset.extension)
             # Clear anything an interrupted render left behind before listing.
             self.store.sweep_work_files()
@@ -11613,7 +11756,7 @@ class MainWindow(QMainWindow):
         key = self.preset_combo.currentData()
         if not key or key == self.preset.key:
             return
-        new = get_preset(key)
+        new = self.available_presets().get(key, get_preset(key))
         if self.store is not None and self.images and new.extension != self.preset.extension:
             resp = QMessageBox.question(
                 self, "Change caption preset",
@@ -12264,6 +12407,11 @@ class MainWindow(QMainWindow):
         if text and self.preset.key.startswith("minimax_h3"):
             return normalise_h3_caption(text)
         return text
+
+    def available_presets(self) -> dict:
+        """Built-ins plus any the user defined, so a preset added in Preferences
+        shows up in the strip without a restart."""
+        return all_presets(app_base_dir())
 
     def caption_issues_for(self, path: Path) -> list[str]:
         """Schema health for a caption, or [] when the active preset has no schema.

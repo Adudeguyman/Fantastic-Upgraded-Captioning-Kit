@@ -307,3 +307,84 @@ class GuidancePresetTests(unittest.TestCase):
         for presets in (self.folder, self.image):
             names = [n for n, _ in presets]
             self.assertEqual(len(names), len(set(names)))
+
+
+class CustomPresetTests(unittest.TestCase):
+    """User-defined caption presets, so a model that shipped last week doesn't have
+    to wait for an app release.
+
+    Deliberately plain-text only: the structured editor and bounding boxes are
+    Ideogram-4 machinery that can't be described by filling in a form.
+    """
+
+    def setUp(self):
+        import tempfile as tf
+        self.base = Path(tf.mkdtemp())
+
+    def _make(self, **kw):
+        from captioning_kit.presets import make_custom_preset
+        defaults = dict(key="sora9", label="Sora 9",
+                        image_prompt="Describe the still.",
+                        video_prompt="Describe the clip.",
+                        model_target="sora_9_turbo")
+        defaults.update(kw)
+        return make_custom_preset(**defaults)
+
+    def test_round_trips_through_the_file(self):
+        from captioning_kit.presets import load_custom_presets, save_custom_presets
+        save_custom_presets(self.base, {"sora9": self._make()})
+        restored = load_custom_presets(self.base)["sora9"]
+        self.assertEqual(restored.label, "Sora 9")
+        self.assertEqual(restored.model_target, "sora_9_turbo")
+        self.assertEqual(restored.prompt_for("video"), "Describe the clip.")
+
+    def test_the_frame_rule_link_is_optional(self):
+        """A stills-only preset has no frame grid; requiring one would invent a
+        constraint that doesn't exist."""
+        from captioning_kit.presets import load_custom_presets, save_custom_presets
+        save_custom_presets(self.base, {"stills": self._make(
+            key="stills", label="Stills", model_target="", video_prompt="")})
+        self.assertEqual(load_custom_presets(self.base)["stills"].model_target, "")
+
+    def test_custom_presets_are_plain_text(self):
+        preset = self._make()
+        self.assertTrue(preset.is_plain)
+        self.assertEqual(preset.extension, ".txt")
+        self.assertFalse(preset.has_boxes)
+        self.assertFalse(preset.validates)
+
+    def test_a_user_entry_cannot_shadow_a_builtin(self):
+        """Otherwise a hand-edited file could redefine Ideogram 4 as plain text."""
+        from captioning_kit.presets import load_custom_presets, save_custom_presets
+        save_custom_presets(self.base, {"x": self._make(key="ideogram4",
+                                                        label="Hijack")})
+        self.assertNotIn("ideogram4", load_custom_presets(self.base))
+
+    def test_a_malformed_entry_is_skipped_not_fatal(self):
+        import json
+        from captioning_kit.presets import custom_presets_path, load_custom_presets
+        custom_presets_path(self.base).write_text(json.dumps(
+            {"presets": [{"nonsense": True}, {"key": "ok", "label": "Fine"}]}))
+        loaded = load_custom_presets(self.base)
+        self.assertEqual(list(loaded), ["ok"])
+
+    def test_unreadable_file_yields_no_presets(self):
+        from captioning_kit.presets import custom_presets_path, load_custom_presets
+        custom_presets_path(self.base).write_text("{ not json")
+        self.assertEqual(load_custom_presets(self.base), {})
+
+    def test_merged_order_puts_builtins_first(self):
+        from captioning_kit.presets import (PRESET_ORDER, preset_order,
+                                            save_custom_presets)
+        save_custom_presets(self.base, {"sora9": self._make()})
+        order = preset_order(self.base)
+        self.assertEqual(order[:len(PRESET_ORDER)], PRESET_ORDER)
+        self.assertEqual(order[-1], "sora9")
+
+    def test_saving_an_empty_set_removes_the_file(self):
+        from captioning_kit.presets import (custom_presets_path,
+                                            save_custom_presets)
+        save_custom_presets(self.base, {"sora9": self._make()})
+        self.assertTrue(custom_presets_path(self.base).exists())
+        save_custom_presets(self.base, {})
+        self.assertFalse(custom_presets_path(self.base).exists())
