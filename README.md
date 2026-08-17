@@ -48,9 +48,9 @@ leaves your machine except the requests to the endpoint you configure.
   Sort and filter by name, date, missing captions, or failed jobs, and search
   inside caption sidecars to jump straight to the images you mean.
 - **Structured caption editing** — Edit every Ideogram JSON field (description,
-  style, background, elements, rendered text, color palette) in a native Qt
-  form, with a live raw-JSON view. Original text captions (`.txt`, `.original`)
-  stay separate from the structured JSON.
+  style, background, elements, rendered text, color palette) in proper fields
+  rather than raw text, with a live raw-JSON view alongside. Original text
+  captions (`.txt`, `.original`) stay separate from the structured JSON.
 - **Bounding boxes** — Draw, move, resize, delete, and numerically edit
   object/text boxes directly on the image, with overlap-aware selection.
 - **Caption guidance** — Attach folder-wide and per-image guidance (style,
@@ -96,7 +96,8 @@ needed for the auto-captioning features.
 ## Installation
 
 Clone the repository, then set up an environment with **either** venv or conda.
-PySide6 is a large wheel (~150–200 MB), so the first install takes a minute.
+The UI dependency is a large download (~150–200 MB), so the first install
+takes a minute.
 
 ```bash
 git clone https://github.com/Adudeguyman/Fantastic-Upgraded-Captioning-Kit.git
@@ -154,7 +155,7 @@ conda activate fantastic-captioner
 pip install -r requirements.txt
 ```
 
-PySide6 installs cleanly with pip inside the conda env, so there's no need to
+The dependencies install cleanly with pip inside the conda env, so there's no need to
 chase it down on a conda channel.
 
 ### Optional — CUDA acceleration for the built-in server (NVIDIA, Linux)
