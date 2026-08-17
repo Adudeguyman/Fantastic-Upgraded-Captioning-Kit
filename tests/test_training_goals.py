@@ -439,3 +439,87 @@ class GeneratedPromptVisibilityTests(unittest.TestCase):
         self.dlg._pe_reload()
         self.assertNotIn(("ideogram4", "image"), self.dlg._pe_pending)
         self.assertNotIn(("ideogram4", "video"), self.dlg._pe_pending)
+
+
+class GoalOverlayTests(unittest.TestCase):
+    """Goals get the same treatment as the model frame rules: data, not code.
+
+    What to describe and what to omit is an evolving practice rather than settled
+    fact, and the trade differs by model and trainer — so a user can rewrite a
+    goal or add one without waiting for a release.
+    """
+
+    def setUp(self):
+        import tempfile as tf
+        self.base = Path(tf.mkdtemp())
+
+    def test_no_file_means_the_builtins(self):
+        from captioning_kit.training_goals import builtin_goal_map, load_goals
+        self.assertEqual(load_goals(self.base), builtin_goal_map())
+
+    def test_an_edited_builtin_round_trips(self):
+        from captioning_kit.training_goals import (load_goals, make_custom_goal,
+                                                    save_goals)
+        goals = load_goals(self.base)
+        goals["motion"] = make_custom_goal("motion", "Motion / action",
+                                           "My summary.", "My rules.")
+        save_goals(self.base, goals)
+        self.assertEqual(load_goals(self.base)["motion"].rules, "My rules.")
+
+    def test_untouched_builtins_still_come_from_code(self):
+        """Writing a snapshot of everything would freeze the shipped wording out:
+        a later release improving a goal would be silently overridden."""
+        from captioning_kit.training_goals import (GOALS, load_goals,
+                                                    make_custom_goal, save_goals)
+        goals = load_goals(self.base)
+        goals["motion"] = make_custom_goal("motion", "Motion", "x", "y")
+        save_goals(self.base, goals)
+        self.assertEqual(load_goals(self.base)["character"], GOALS["character"])
+
+    def test_only_the_diff_is_written(self):
+        import json
+        from captioning_kit.training_goals import (goals_path, load_goals,
+                                                    make_custom_goal, save_goals)
+        goals = load_goals(self.base)
+        goals["custom"] = make_custom_goal("custom", "Custom", "s", "r")
+        save_goals(self.base, goals)
+        written = json.loads(goals_path(self.base).read_text())["goals"]
+        self.assertEqual([g["key"] for g in written], ["custom"])
+
+    def test_reverting_everything_removes_the_file(self):
+        from captioning_kit.training_goals import (builtin_goal_map, goals_path,
+                                                    make_custom_goal, save_goals)
+        goals = builtin_goal_map()
+        goals["custom"] = make_custom_goal("custom", "Custom", "s", "r")
+        save_goals(self.base, goals)
+        self.assertTrue(goals_path(self.base).exists())
+        save_goals(self.base, builtin_goal_map())
+        self.assertFalse(goals_path(self.base).exists())
+
+    def test_a_custom_goal_joins_the_order_after_the_builtins(self):
+        from captioning_kit.training_goals import (GOAL_ORDER, goal_order,
+                                                    load_goals, make_custom_goal,
+                                                    save_goals)
+        goals = load_goals(self.base)
+        goals["custom"] = make_custom_goal("custom", "Custom", "s", "r")
+        save_goals(self.base, goals)
+        order = goal_order(self.base)
+        self.assertEqual(order[:len(GOAL_ORDER)], GOAL_ORDER)
+        self.assertEqual(order[-1], "custom")
+
+    def test_a_malformed_file_falls_back_to_the_builtins(self):
+        from captioning_kit.training_goals import (builtin_goal_map, goals_path,
+                                                    load_goals)
+        goals_path(self.base).write_text("{ not json")
+        self.assertEqual(load_goals(self.base), builtin_goal_map())
+
+    def test_a_malformed_entry_is_skipped_not_fatal(self):
+        import json
+        from captioning_kit.training_goals import goals_path, load_goals
+        goals_path(self.base).write_text(json.dumps({"goals": [
+            {"no_key": True},
+            {"key": "ok", "label": "Fine", "summary": "s", "rules": "r"},
+        ]}))
+        loaded = load_goals(self.base)
+        self.assertIn("ok", loaded)
+        self.assertIn("character", loaded)

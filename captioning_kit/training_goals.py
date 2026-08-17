@@ -157,3 +157,90 @@ def get_goal(key: str | None) -> TrainingGoal:
     """Never raises: an unknown or missing key falls back to General, which applies
     no policy, so a corrupt project file can't silently change what gets captioned."""
     return GOALS.get((key or "").strip().lower(), GOALS[DEFAULT_GOAL])
+
+
+# --- user overlay -------------------------------------------------------------
+#
+# Same treatment as the model frame rules: goals are data, not code. What to
+# describe and what to omit is an evolving practice rather than a settled fact
+# (see the note at the top of this module), so a user can rewrite a goal or add
+# one without waiting for a release.
+
+import json
+from dataclasses import asdict
+from pathlib import Path
+
+GOALS_FILENAME = "captioner_training_goals.json"
+
+
+def builtin_goal_map() -> dict[str, TrainingGoal]:
+    return dict(GOALS)
+
+
+def goals_path(base_dir) -> Path:
+    return Path(base_dir) / GOALS_FILENAME
+
+
+def _goal_from_dict(data: dict) -> TrainingGoal | None:
+    key = str(data.get("key") or "").strip().lower()
+    label = str(data.get("label") or "").strip()
+    if not key or not label:
+        return None
+    return TrainingGoal(
+        key=key,
+        label=label,
+        summary=str(data.get("summary") or ""),
+        rules=str(data.get("rules") or ""),
+    )
+
+
+def load_goals(base_dir=None) -> dict[str, TrainingGoal]:
+    """Built-in goals overlaid with the user's file. Malformed entries are skipped
+    rather than breaking startup."""
+    goals = builtin_goal_map()
+    if base_dir is None:
+        return goals
+    try:
+        data = json.loads(goals_path(base_dir).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return goals
+    for raw in (data.get("goals") or []):
+        if isinstance(raw, dict):
+            goal = _goal_from_dict(raw)
+            if goal is not None:
+                goals[goal.key] = goal
+    return goals
+
+
+def save_goals(base_dir, goals: dict[str, TrainingGoal]) -> None:
+    """Write only what differs from the built-ins.
+
+    A snapshot of everything would freeze the shipped wording out: a later release
+    improving a goal's rules would be silently overridden by a stale copy the user
+    never knowingly edited.
+    """
+    builtins = builtin_goal_map()
+    changed = {k: g for k, g in goals.items()
+               if k not in builtins or g != builtins[k]}
+    path = goals_path(base_dir)
+    if not changed:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "_comment": "Edit to change or add training goals. Delete this file to "
+                    "restore the built-in defaults.",
+        "goals": [asdict(g) for g in changed.values()],
+    }, indent=2), encoding="utf-8")
+
+
+def goal_order(base_dir=None) -> tuple[str, ...]:
+    order = list(GOAL_ORDER)
+    if base_dir is not None:
+        order += [k for k in load_goals(base_dir) if k not in order]
+    return tuple(order)
+
+
+def make_custom_goal(key: str, label: str, summary: str = "",
+                     rules: str = "") -> TrainingGoal:
+    return TrainingGoal(key=key, label=label, summary=summary, rules=rules)

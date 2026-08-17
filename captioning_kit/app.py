@@ -160,7 +160,18 @@ from .presets import (
     make_custom_preset,
     save_custom_presets,
 )
-from .training_goals import DEFAULT_GOAL, GOAL_ORDER, GOALS, TrainingGoal, get_goal
+from .training_goals import (
+    DEFAULT_GOAL,
+    GOAL_ORDER,
+    GOALS,
+    TrainingGoal,
+    builtin_goal_map,
+    get_goal,
+    goal_order,
+    load_goals,
+    make_custom_goal,
+    save_goals,
+)
 from .video_tools import (
     VideoInfo,
     extract_poster,
@@ -2197,6 +2208,7 @@ class PreferencesDialog(QDialog):
         outer.setSpacing(10)
         tabs = QTabWidget()
         tabs.addTab(self._build_prompt_editor(), "Caption prompts")
+        tabs.addTab(self._build_goals_editor(), "Training goals")
         tabs.addTab(self._build_targets_editor(), "Model frame rules")
         outer.addWidget(tabs, 1)
 
@@ -2457,6 +2469,149 @@ class PreferencesDialog(QDialog):
                 self._qsettings.remove(key)   # back to shipped default, not a copy
             else:
                 self._qsettings.setValue(key, text)
+
+    def _build_goals_editor(self) -> QWidget:
+        """What a caption should describe and what it should leave out.
+
+        Editable for the same reason the frame rules are: this is an evolving
+        practice rather than settled fact, and the omission-vs-description trade
+        differs by model and by trainer.
+        """
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Goal:"))
+        self._tg_combo = QComboBox()
+        top.addWidget(self._tg_combo, 1)
+        add = QPushButton("Add\u2026")
+        add.setToolTip("Define a training goal of your own")
+        add.clicked.connect(self._tg_add)
+        top.addWidget(add)
+        self._tg_remove_btn = QPushButton("Remove")
+        self._tg_remove_btn.setToolTip("Delete a goal you added")
+        self._tg_remove_btn.clicked.connect(self._tg_remove)
+        top.addWidget(self._tg_remove_btn)
+        lay.addLayout(top)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 6, 0, 6)
+        self._tg_label = QLineEdit()
+        self._tg_label.setToolTip("Name shown in the Training dropdown")
+        form.addRow("Name", self._tg_label)
+        self._tg_summary = QPlainTextEdit()
+        self._tg_summary.setMaximumHeight(60)
+        self._tg_summary.setToolTip(
+            "One line, shown under the dropdown as a quick reference")
+        form.addRow("Summary", self._tg_summary)
+        lay.addLayout(form)
+
+        lay.addWidget(QLabel("Rules sent to the model"))
+        self._tg_rules = QPlainTextEdit()
+        self._tg_rules.setToolTip(
+            "Appended after the preset's prompt and before your guidance. "
+            "Say both what to omit and what to describe \u2014 half the rule leaves "
+            "the model guessing about the other half.")
+        lay.addWidget(self._tg_rules, 1)
+
+        row = QHBoxLayout()
+        self._tg_reset_btn = QPushButton("Reset to built-in")
+        self._tg_reset_btn.clicked.connect(self._tg_reset)
+        row.addWidget(self._tg_reset_btn)
+        row.addStretch(1)
+        hint = QLabel("Edits are saved when you press Save.")
+        hint.setObjectName("Hint")
+        row.addWidget(hint)
+        lay.addLayout(row)
+
+        self._tg_working = dict(load_goals(app_base_dir()))
+        self._tg_builtin = builtin_goal_map()
+        self._tg_current: str | None = None
+        for key in goal_order(app_base_dir()):
+            goal = self._tg_working.get(key)
+            if goal is not None:
+                self._tg_combo.addItem(goal.label, key)
+        self._tg_combo.currentIndexChanged.connect(self._tg_reload)
+        for widget in (self._tg_label,):
+            widget.textChanged.connect(self._tg_capture)
+        for widget in (self._tg_summary, self._tg_rules):
+            widget.textChanged.connect(self._tg_capture)
+        self._tg_reload()
+        return w
+
+    def _tg_reload(self) -> None:
+        key = self._tg_combo.currentData()
+        if not key or key not in self._tg_working:
+            return
+        self._tg_current = None          # suppress capture while repopulating
+        goal = self._tg_working[key]
+        self._tg_label.setText(goal.label)
+        self._tg_summary.setPlainText(goal.summary)
+        self._tg_rules.setPlainText(goal.rules)
+        self._tg_current = key
+        builtin = key in self._tg_builtin
+        self._tg_remove_btn.setEnabled(not builtin)
+        self._tg_reset_btn.setEnabled(builtin)
+
+    def _tg_capture(self, *_args) -> None:
+        key = self._tg_current
+        if not key:
+            return
+        self._tg_working[key] = make_custom_goal(
+            key=key,
+            label=self._tg_label.text().strip() or key,
+            summary=self._tg_summary.toPlainText(),
+            rules=self._tg_rules.toPlainText(),
+        )
+        idx = self._tg_combo.findData(key)
+        if idx >= 0 and self._tg_combo.itemText(idx) != self._tg_working[key].label:
+            self._tg_combo.setItemText(idx, self._tg_working[key].label)
+
+    def _tg_add(self) -> None:
+        label, ok = QInputDialog.getText(self, "Add training goal", "Goal name:")
+        label = (label or "").strip()
+        if not ok or not label:
+            return
+        key = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_") or "custom_goal"
+        if key in self._tg_working:
+            QMessageBox.information(self, "Add training goal",
+                                    f"'{label}' already exists.")
+            return
+        self._tg_working[key] = make_custom_goal(
+            key=key, label=label,
+            summary="Describe what this goal is for, in one line.",
+            rules="Do NOT describe: \n\nDO describe fully: ")
+        self._tg_combo.addItem(label, key)
+        self._tg_combo.setCurrentIndex(self._tg_combo.count() - 1)
+
+    def _tg_remove(self) -> None:
+        key = self._tg_current
+        if not key or key in self._tg_builtin:
+            return
+        label = self._tg_working[key].label
+        if QMessageBox.question(
+            self, "Remove training goal",
+            f"Delete the '{label}' goal?\n\nFolders using it fall back to General. "
+            "Captions already written are untouched.",
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
+        ) != QMessageBox.Yes:
+            return
+        self._tg_working.pop(key, None)
+        idx = self._tg_combo.findData(key)
+        if idx >= 0:
+            self._tg_combo.removeItem(idx)
+
+    def _tg_reset(self) -> None:
+        key = self._tg_current
+        if not key or key not in self._tg_builtin:
+            return
+        self._tg_working[key] = self._tg_builtin[key]
+        self._tg_reload()
+
+    def _tg_commit(self) -> None:
+        save_goals(app_base_dir(), self._tg_working)
 
     def _build_targets_editor(self) -> QWidget:
         """Frame rules per model: fps, the legal frame-count grid, dimension
@@ -4161,6 +4316,8 @@ class PreferencesDialog(QDialog):
         # commit here rather than through _make_field.
         if hasattr(self, "_pe_pending"):
             self._pe_commit()
+        if hasattr(self, "_tg_working"):
+            self._tg_commit()
         if hasattr(self, "_mt_working"):
             self._mt_commit()
         kwargs = {}
@@ -9472,8 +9629,7 @@ class MainWindow(QMainWindow):
         # details the caption omits.
         _row(2, "Training:")
         self.goal_combo = QComboBox()
-        for key in GOAL_ORDER:
-            goal = GOALS[key]
+        for key, goal in self.available_goals().items():
             self.goal_combo.addItem(goal.label, key)
             self.goal_combo.setItemData(
                 self.goal_combo.count() - 1, goal.summary, Qt.ToolTipRole)
@@ -12003,9 +12159,14 @@ class MainWindow(QMainWindow):
             self._mmproj_audio_cache = cached
         return cached[key]
 
+    def available_goals(self) -> dict:
+        """Built-in goals plus any the user defined, so one added in Preferences
+        appears in the strip without a restart."""
+        return load_goals(app_base_dir())
+
     def current_goal(self) -> "TrainingGoal":
         key = getattr(self.project, "training_goal", None) if self.project else None
-        return get_goal(key)
+        return self.available_goals().get(key or "", get_goal(key))
 
     def goal_rules_text(self) -> str:
         """The active goal's policy text, or "" for General."""
@@ -12049,7 +12210,8 @@ class MainWindow(QMainWindow):
         # A different goal means materially different captions, so anything
         # captioned under the old one is stale in exactly the way edited guidance is.
         self._refresh_guidance_changes()
-        self._set_status(f"Training goal: {GOALS[key].label}. "
+        label = self.available_goals().get(key, get_goal(key)).label
+        self._set_status(f"Training goal: {label}. "
                          "Captions made under the previous goal are marked changed.")
 
     def _refresh_goal_hint(self) -> None:
