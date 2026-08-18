@@ -5400,7 +5400,7 @@ class VideoStage(QWidget):
 
         self._pos_label = QLabel("0:00")
         self._pos_label.setObjectName("NavCount")
-        self._pos_label.setMinimumWidth(46)
+        self._pos_label.setFixedWidth(52)
         self._pos_label.setAlignment(Qt.AlignCenter)
         row.addWidget(self._pos_label)
 
@@ -5408,7 +5408,10 @@ class VideoStage(QWidget):
         # counted in frames, so "f0073" is the number you can act on.
         self._frame_label = QLabel("")
         self._frame_label.setObjectName("Hint")
-        self._frame_label.setMinimumWidth(58)
+        # Fixed, not minimum: this label grows as the number does ("f9 / 141" ->
+        # "f141 / 141"), and a growing label re-lays out the row, which shifted the
+        # trim bar sideways while you scrubbed.
+        self._frame_label.setFixedWidth(96)
         self._frame_label.setAlignment(Qt.AlignCenter)
         self._frame_label.setToolTip(
             "Frame under the playhead, counted from the start of the clip")
@@ -5501,23 +5504,36 @@ class VideoStage(QWidget):
 
         # Editable in/out frames. Frames, not seconds: the grid rules are counted
         # in them, so typing 73 is exact where 3.04s is a guess.
-        row.addSpacing(6)
-        row.addWidget(QLabel("In"))
-        self._in_frame = QSpinBox()
-        self._in_frame.setRange(0, 9_999_999)
-        self._in_frame.setMaximumWidth(86)
-        self._in_frame.setToolTip("First frame kept. Type a number to set it exactly.")
+        #
+        # Each label sits in a tight box with its field, otherwise the row's spare
+        # space lands between them and "In" ends up stranded from the number it
+        # names.
+        row.addSpacing(10)
+        for text, attr, tip in (
+            ("In", "_in_frame", "First frame kept. Type a number to set it exactly."),
+            ("Out", "_out_frame", "Last frame kept. Type a number to set it exactly."),
+        ):
+            pair = QHBoxLayout()
+            pair.setContentsMargins(0, 0, 0, 0)
+            pair.setSpacing(4)
+            label = QLabel(text)
+            label.setStyleSheet(f"color: {theme.text_secondary};")
+            pair.addWidget(label)
+            box = QSpinBox()
+            box.setRange(1, 9_999_999)
+            box.setFixedWidth(84)
+            box.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            box.setToolTip(tip)
+            pair.addWidget(box)
+            setattr(self, attr, box)
+            holder = QWidget()
+            holder.setLayout(pair)
+            holder.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+            row.addWidget(holder)
         self._in_frame.editingFinished.connect(lambda: self._frame_box_edited("in"))
-        row.addWidget(self._in_frame)
-        row.addWidget(QLabel("Out"))
-        self._out_frame = QSpinBox()
-        self._out_frame.setRange(0, 9_999_999)
-        self._out_frame.setMaximumWidth(86)
-        self._out_frame.setToolTip("Last frame kept. Type a number to set it exactly.")
         self._out_frame.editingFinished.connect(lambda: self._frame_box_edited("out"))
-        row.addWidget(self._out_frame)
 
-        row.addSpacing(6)
+        row.addSpacing(10)
         row.addWidget(QLabel("Target:"))
         self._target_combo = QComboBox()
         self._target_combo.addItem("None (keep source)", "")
@@ -6010,7 +6026,12 @@ class VideoStage(QWidget):
             if tool == "playhead" else
             "Hand tool: drag inside the selection to slide it, keeping its length.")
 
+    # Frame numbers shown to the user are 1-based: frame 1 is the first frame of
+    # the clip, and the out box shows the last frame KEPT rather than the exclusive
+    # end. "Frame 0" reads as nothing, and an out of 141 on a 141-frame clip looked
+    # like it was keeping one frame too many.
     def _frames_for(self, ms: int) -> int:
+        """Zero-based frame index at a timestamp — the internal form."""
         info = self._info
         return int(round(ms / 1000.0 * info.fps)) if info and info.fps else 0
 
@@ -6018,14 +6039,29 @@ class VideoStage(QWidget):
         info = self._info
         return int(round(frame / info.fps * 1000)) if info and info.fps else 0
 
+    def _total_frames(self) -> int:
+        info = self._info
+        if info is None or not info.fps:
+            return 0
+        return info.frame_count or int(round(info.duration_s * info.fps))
+
     def _refresh_frame_boxes(self) -> None:
         if self._info is None:
             return
         in_ms, out_ms = self._slider.trim()
-        for box, ms in ((self._in_frame, in_ms), (self._out_frame, out_ms)):
+        total = self._total_frames()
+        first = self._frames_for(in_ms) + 1                 # 1-based for display
+        last = max(first, self._frames_for(out_ms))         # inclusive last kept
+        if total:
+            last = min(last, total)
+        for box, value in ((self._in_frame, first), (self._out_frame, last)):
             box.blockSignals(True)
-            box.setValue(self._frames_for(ms))
+            if total:
+                box.setRange(1, total)
+            box.setValue(value)
             box.blockSignals(False)
+        self._in_frame.setSuffix("")
+        self._out_frame.setSuffix(f" / {total}" if total else "")
 
     def _frame_box_edited(self, which: str) -> None:
         """Typing a frame moves that edge, and snap still applies.
@@ -6036,7 +6072,9 @@ class VideoStage(QWidget):
         if self._info is None:
             return
         in_ms, out_ms = self._slider.trim()
-        wanted = (self._ms_for_frame(self._in_frame.value()) if which == "in"
+        # Back to zero-based: box 1 means index 0, and an inclusive out of N means
+        # the selection ends at the start of index N.
+        wanted = (self._ms_for_frame(self._in_frame.value() - 1) if which == "in"
                   else self._ms_for_frame(self._out_frame.value()))
         wanted = max(0, min(wanted, self._slider.duration()))
         if which == "in":
@@ -6397,8 +6435,10 @@ class VideoStage(QWidget):
         if info is None or not info.fps:
             self._frame_label.setText("")
             return
-        frame = int(round(ms / 1000.0 * info.fps))
+        frame = int(round(ms / 1000.0 * info.fps)) + 1        # 1-based, as above
         total = info.frame_count or int(round(info.duration_s * info.fps))
+        if total:
+            frame = min(frame, total)
         self._frame_label.setText(f"f{frame}" + (f" / {total}" if total else ""))
 
     @staticmethod

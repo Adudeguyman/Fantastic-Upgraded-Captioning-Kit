@@ -1724,3 +1724,100 @@ class DownloadConfirmationTests(unittest.TestCase):
             self.assertTrue(self.win._confirm_model_download())
         finally:
             A.missing_model_files = original
+
+
+class FrameNumberingTests(unittest.TestCase):
+    """Frames shown to the user are 1-based and the out box is inclusive.
+
+    Frame 0 reads as nothing, and an exclusive out of 141 on a 141-frame clip
+    looked like it was keeping one frame too many.
+    """
+
+    def setUp(self):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+        QApplication.instance() or QApplication([])
+        import shutil
+        import tempfile as tf
+        import captioning_kit.app as A
+        A.default_profiles_path = lambda: Path(tf.mkdtemp()) / "p.json"
+        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+        self.folder = Path(tf.mkdtemp())
+        shutil.copy("/tmp/vidtest/clip.mp4", self.folder / "c.mp4")   # 3s @ 24fps
+        self.win = A.MainWindow()
+        QFileDialog.getExistingDirectory = staticmethod(
+            lambda *a, **k: str(self.folder))
+        self.win.open_folder()
+        self.win.filmstrip.setCurrentRow(0)
+        self.stage = self.win.video_stage
+
+    def test_the_first_frame_is_one_not_zero(self):
+        self.stage._slider.set_trim(0, self.stage._slider.duration())
+        self.assertEqual(self.stage._in_frame.value(), 1)
+
+    def test_the_out_box_shows_the_last_frame_kept(self):
+        self.stage._slider.set_trim(0, self.stage._slider.duration())
+        self.assertEqual(self.stage._out_frame.value(), self.stage._total_frames())
+
+    def test_the_playhead_counter_starts_at_one(self):
+        self.stage._set_position_labels(0)
+        self.assertTrue(self.stage._frame_label.text().startswith("f1 "))
+
+    def test_the_counter_never_exceeds_the_total(self):
+        self.stage._set_position_labels(self.stage._slider.duration())
+        total = self.stage._total_frames()
+        self.assertTrue(self.stage._frame_label.text().startswith(f"f{total} "))
+
+    def test_the_boxes_reject_zero(self):
+        self.assertEqual(self.stage._in_frame.minimum(), 1)
+        self.assertEqual(self.stage._out_frame.minimum(), 1)
+
+    def test_typing_one_selects_from_the_start(self):
+        self.stage._in_frame.setValue(1)
+        self.stage._frame_box_edited("in")
+        self.assertEqual(self.stage._slider.trim()[0], 0)
+
+
+class TransportLabelStabilityTests(unittest.TestCase):
+    """A label that grows with its number re-lays out the row, which shifted the
+    trim bar sideways while scrubbing."""
+
+    def setUp(self):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+        QApplication.instance() or QApplication([])
+        import shutil
+        import tempfile as tf
+        import captioning_kit.app as A
+        A.default_profiles_path = lambda: Path(tf.mkdtemp()) / "p.json"
+        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+        folder = Path(tf.mkdtemp())
+        shutil.copy("/tmp/vidtest/clip.mp4", folder / "c.mp4")
+        self.win = A.MainWindow()
+        self.win.resize(1600, 950)
+        QFileDialog.getExistingDirectory = staticmethod(lambda *a, **k: str(folder))
+        self.win.open_folder()
+        self.win.filmstrip.setCurrentRow(0)
+        self.stage = self.win.video_stage
+
+    def _scrub(self):
+        from PySide6.QtWidgets import QApplication
+        seen = set()
+        for ms in (0, 500, 1500, 2900):
+            self.stage._set_position_labels(ms)
+            QApplication.instance().processEvents()
+            seen.add((self.stage._pos_label.width(),
+                      self.stage._frame_label.width(),
+                      self.stage._slider.x(), self.stage._slider.width()))
+        return seen
+
+    def test_nothing_in_the_transport_row_moves_while_scrubbing(self):
+        self.assertEqual(len(self._scrub()), 1)
+
+    def test_the_labels_have_fixed_widths(self):
+        self.assertEqual(self.stage._pos_label.minimumWidth(),
+                         self.stage._pos_label.maximumWidth())
+        self.assertEqual(self.stage._frame_label.minimumWidth(),
+                         self.stage._frame_label.maximumWidth())
