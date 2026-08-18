@@ -1821,3 +1821,68 @@ class TransportLabelStabilityTests(unittest.TestCase):
                          self.stage._pos_label.maximumWidth())
         self.assertEqual(self.stage._frame_label.minimumWidth(),
                          self.stage._frame_label.maximumWidth())
+
+
+class SpinBoxStepperTests(unittest.TestCase):
+    """Giving QSpinBox a border and background drops Qt's native step buttons, and
+    the fallback arrows render blank on a dark surface — so every spinbox in the
+    app had invisible steppers, not just the frame boxes."""
+
+    def setUp(self):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+        QApplication.instance() or QApplication([])
+        import shutil
+        import tempfile as tf
+        import captioning_kit.app as A
+        A.default_profiles_path = lambda: Path(tf.mkdtemp()) / "p.json"
+        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+        folder = Path(tf.mkdtemp())
+        shutil.copy("/tmp/vidtest/clip.mp4", folder / "c.mp4")
+        self.win = A.MainWindow()
+        self.win.resize(1600, 950)
+        QFileDialog.getExistingDirectory = staticmethod(lambda *a, **k: str(folder))
+        self.win.open_folder()
+        self.win.filmstrip.setCurrentRow(0)
+        self.stage = self.win.video_stage
+
+    def test_the_arrows_are_actually_drawn(self):
+        from PySide6.QtGui import QColor, QPixmap
+        box = self.stage._out_frame
+        pixmap = QPixmap(box.size())
+        pixmap.fill(QColor("black"))
+        box.render(pixmap)
+        image = pixmap.toImage()
+        arrow = QColor(self.win.theme.text_secondary).name().lower()
+        hits = sum(
+            1
+            for x in range(box.width() - 15, box.width() - 2)
+            for y in range(2, box.height() - 2)
+            if QColor(image.pixel(x, y)).name().lower() == arrow
+        )
+        self.assertGreater(hits, 10, "step arrows render blank")
+
+    def test_the_styling_covers_every_spinbox_type(self):
+        sheet = self.win.styleSheet()
+        for selector in ("QSpinBox::up-arrow", "QSpinBox::down-arrow",
+                         "QDoubleSpinBox::up-arrow", "QDoubleSpinBox::down-arrow"):
+            self.assertIn(selector, sheet)
+
+    def test_the_out_box_carries_no_suffix(self):
+        """The total is already on the frame counter; repeating it here pushed the
+        number out of a fixed-width field."""
+        self.assertEqual(self.stage._out_frame.suffix(), "")
+
+    def test_the_value_fits_the_field(self):
+        from PySide6.QtGui import QFontMetrics
+        box = self.stage._out_frame
+        metrics = QFontMetrics(box.font())
+        needed = metrics.horizontalAdvance(str(box.value())) + 34
+        self.assertGreaterEqual(box.width(), needed)
+
+    def test_stepping_still_works(self):
+        box = self.stage._out_frame
+        before = box.value()
+        box.stepBy(-1)
+        self.assertEqual(box.value(), before - 1)

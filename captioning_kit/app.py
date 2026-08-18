@@ -451,6 +451,38 @@ def build_stylesheet(s: CaptioningSettings) -> str:
         selection-background-color: {t.accent_subtle}; selection-color: {t.text_primary};
     }}
     QLineEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{ border-color: {t.accent}; }}
+
+    /* Giving QSpinBox a border and background drops Qt's native step buttons, and
+       the fallback arrows render blank on a dark surface. Draw them with the CSS
+       triangle trick so every spinbox in the app has visible steppers. */
+    QSpinBox::up-button, QDoubleSpinBox::up-button {{
+        subcontrol-origin: border; subcontrol-position: top right;
+        width: 16px; border-left: 1px solid {t.border};
+        border-top-right-radius: 6px; background: {t.surface_2};
+    }}
+    QSpinBox::down-button, QDoubleSpinBox::down-button {{
+        subcontrol-origin: border; subcontrol-position: bottom right;
+        width: 16px; border-left: 1px solid {t.border};
+        border-bottom-right-radius: 6px; background: {t.surface_2};
+    }}
+    QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+    QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{
+        background: {t.surface_hover};
+    }}
+    QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
+        width: 0; height: 0; border-left: 4px solid transparent;
+        border-right: 4px solid transparent; border-bottom: 5px solid {t.text_secondary};
+    }}
+    QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+        width: 0; height: 0; border-left: 4px solid transparent;
+        border-right: 4px solid transparent; border-top: 5px solid {t.text_secondary};
+    }}
+    QSpinBox::up-arrow:hover, QDoubleSpinBox::up-arrow:hover {{ border-bottom-color: {t.text_primary}; }}
+    QSpinBox::down-arrow:hover, QDoubleSpinBox::down-arrow:hover {{ border-top-color: {t.text_primary}; }}
+    QSpinBox::up-arrow:disabled, QSpinBox::down-arrow:disabled,
+    QDoubleSpinBox::up-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {{
+        border-bottom-color: {t.border}; border-top-color: {t.border};
+    }}
     QLineEdit:disabled, QPlainTextEdit:disabled, QComboBox:disabled {{ background: {t.surface_1}; border-color: {t.border}; color: {t.text_disabled}; }}
     QComboBox QAbstractItemView {{ background: {t.surface_2}; color: {t.text_primary}; border: 1px solid {t.border_strong}; selection-background-color: {t.accent_subtle}; selection-color: {t.text_primary}; }}
     QComboBox::drop-down {{ border: none; width: 20px; }}
@@ -6060,8 +6092,8 @@ class VideoStage(QWidget):
                 box.setRange(1, total)
             box.setValue(value)
             box.blockSignals(False)
-        self._in_frame.setSuffix("")
-        self._out_frame.setSuffix(f" / {total}" if total else "")
+        # No "/ total" suffix: the frame counter beside the playhead already shows
+        # it, and here it just crowded the number out of a fixed-width box.
 
     def _frame_box_edited(self, which: str) -> None:
         """Typing a frame moves that edge, and snap still applies.
