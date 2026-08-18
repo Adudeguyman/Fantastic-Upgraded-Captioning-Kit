@@ -703,3 +703,56 @@ class SnapFloorTests(unittest.TestCase):
     def test_minimum_never_exceeds_maximum(self):
         for target in (MINIMAX_H3, WAN22_A14B, LTX_2_3):
             self.assertLessEqual(target.min_frames(), target.max_frames())
+
+
+class PlayheadRenderTests(unittest.TestCase):
+    """The playhead must be visible and distinguishable, on every clip.
+
+    Moving the waveform above the selection fill accidentally left the playhead
+    inside the waveform branch, so a clip with no audio drew none at all.
+    """
+
+    def setUp(self):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance() or QApplication([])
+        import captioning_kit.app as A
+        from captioning_kit.llm_captioning import CaptioningSettings
+        self.A = A
+        self.theme = A.Theme(CaptioningSettings())
+
+    def _orange_pixels(self, peaks):
+        from PySide6.QtGui import QColor, QPixmap
+        bar = self.A.TrimBar(self.theme)
+        bar.set_duration(3000)
+        bar.set_trim(0, 3000)
+        bar.set_peaks(peaks)
+        bar.set_position(1500)
+        bar.resize(600, bar.minimumHeight())
+        pixmap = QPixmap(600, bar.height())
+        pixmap.fill(QColor("black"))
+        bar.render(pixmap)
+        image = pixmap.toImage()
+        want = QColor(self.A.PLAYHEAD_COLOR)
+        centre = int(bar._x_for(1500))
+        return sum(
+            1
+            for x in range(centre - 8, centre + 9)
+            for y in range(bar.height())
+            if abs(QColor(image.pixel(x, y)).red() - want.red()) < 30
+            and abs(QColor(image.pixel(x, y)).green() - want.green()) < 30
+        )
+
+    def test_visible_on_a_clip_with_no_audio(self):
+        self.assertGreater(self._orange_pixels([]), 20)
+
+    def test_visible_on_a_clip_with_a_waveform(self):
+        import math
+        self.assertGreater(
+            self._orange_pixels([abs(math.sin(i / 12)) for i in range(320)]), 20)
+
+    def test_playhead_colour_differs_from_the_trim_accent(self):
+        """They sit side by side; the same colour made the playhead hard to pick
+        out from the handle beside it."""
+        self.assertNotEqual(self.A.PLAYHEAD_COLOR.lower(), self.theme.accent.lower())

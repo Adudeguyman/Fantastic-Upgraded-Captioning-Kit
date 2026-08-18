@@ -638,6 +638,9 @@ UNSAVED_ROLE = int(Qt.UserRole) + 1  # per-item flag: has uncommitted edits
 STALE_ROLE = int(Qt.UserRole) + 2    # per-item flag: guidance changed since last caption
 STALE_COLOR = "#A78BFA"              # violet — "guidance changed since last run"
 REVIEW_ROLE = int(Qt.UserRole) + 3   # per-item flag: caption failed a health check (corrupt/off-schema)
+# Orange, not the accent: the trim brackets already use the accent, and a playhead
+# in the same colour was hard to pick out from the handle it was sitting next to.
+PLAYHEAD_COLOR = "#FF8A3D"
 MUTE_COLOR = "#E24B4A"               # red — the span whose audio will be silenced
 REVIEW_COLOR = "#E24B4A"             # red — "needs review: caption may be corrupt"
 FLAG_ROLE = int(Qt.UserRole) + 4     # per-item flag: user manually flagged for review
@@ -5208,15 +5211,7 @@ class TrimBar(QWidget):
                 painter.drawRect(QRectF(track.left() + i * step, mid - h,
                                         max(1.0, step - 0.5), h * 2))
             painter.restore()
-            # Playhead: a stem plus a square grip, so it reads as draggable and
-            # gives a big enough target to grab.
-            px = self._x_for(self._position)
-            painter.setPen(QPen(QColor(t.text_primary), 2))
-            painter.drawLine(QPointF(px, track.top() - 8), QPointF(px, track.bottom() + 8))
-            grip = QRectF(px - 6, track.center().y() - 6, 12, 12)
-            painter.setPen(QPen(QColor(t.surface_0), 1))
-            painter.setBrush(QColor(t.text_primary))
-            painter.drawRoundedRect(grip, 2, 2)
+        if self._duration > 0:
             # grip marks: signal that the selection itself can be dragged
             if keep.width() > 26:
                 cx, cy = keep.center().x(), keep.center().y()
@@ -5252,6 +5247,18 @@ class TrimBar(QWidget):
                 hx = self._x_for(ms)
                 painter.drawRoundedRect(
                     QRectF(hx - 3, track.top() - 6, 6, track.height() + 12), 2, 2)
+
+        # Playhead LAST so nothing paints over it: it's the thing you grab, and the
+        # mute wash, handles and waveform all share this strip. Outside the waveform
+        # branch too — moving the waveform above the selection fill had accidentally
+        # swallowed it, so clips with no audio drew no playhead at all.
+        px = self._x_for(self._position)
+        painter.setPen(QPen(QColor(PLAYHEAD_COLOR), 2))
+        painter.drawLine(QPointF(px, track.top() - 8), QPointF(px, track.bottom() + 8))
+        grip = QRectF(px - 6, track.center().y() - 6, 12, 12)
+        painter.setPen(QPen(QColor(t.surface_0), 1))
+        painter.setBrush(QColor(PLAYHEAD_COLOR))
+        painter.drawRoundedRect(grip, 2, 2)
         painter.end()
 
 
@@ -5361,6 +5368,16 @@ class VideoStage(QWidget):
         self._pos_label.setMinimumWidth(46)
         self._pos_label.setAlignment(Qt.AlignCenter)
         row.addWidget(self._pos_label)
+
+        # Frame number, not just a timestamp: everything about conforming a clip is
+        # counted in frames, so "f0073" is the number you can act on.
+        self._frame_label = QLabel("")
+        self._frame_label.setObjectName("Hint")
+        self._frame_label.setMinimumWidth(58)
+        self._frame_label.setAlignment(Qt.AlignCenter)
+        self._frame_label.setToolTip(
+            "Frame under the playhead, counted from the start of the clip")
+        row.addWidget(self._frame_label)
 
         self._slider = TrimBar(t)
         self._slider.positionRequested.connect(self._seek)
@@ -6119,6 +6136,7 @@ class VideoStage(QWidget):
         if self._crop_btn.isChecked():
             self._crop_btn.setChecked(False)     # also tears down the rect
         self._rotation = 0
+        self._set_position_labels(0)
         self._refresh_snap()
         self._load_peaks()
         self._restore_pending()
@@ -6210,6 +6228,21 @@ class VideoStage(QWidget):
 
     # ---- internals ----
 
+    def _set_position_labels(self, ms: int) -> None:
+        """Time and frame number for the playhead.
+
+        Frames matter more than the clock here: every rule about conforming a clip
+        is expressed in frames, so f0073 is the number you can act on.
+        """
+        self._pos_label.setText(self._fmt(ms))
+        info = self._info
+        if info is None or not info.fps:
+            self._frame_label.setText("")
+            return
+        frame = int(round(ms / 1000.0 * info.fps))
+        total = info.frame_count or int(round(info.duration_s * info.fps))
+        self._frame_label.setText(f"f{frame}" + (f" / {total}" if total else ""))
+
     @staticmethod
     def _fmt(ms: int) -> str:
         total = max(0, ms // 1000)
@@ -6255,10 +6288,10 @@ class VideoStage(QWidget):
         if self._is_playing() and out_ms > in_ms and ms >= out_ms - 40:
             self._player.setPosition(in_ms)
             self._slider.set_position(in_ms)
-            self._pos_label.setText(self._fmt(in_ms))
+            self._set_position_labels(in_ms)
             return
         self._slider.set_position(ms)
-        self._pos_label.setText(self._fmt(ms))
+        self._set_position_labels(ms)
 
     def _is_playing(self) -> bool:
         if self._player is None:
