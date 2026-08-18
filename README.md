@@ -37,9 +37,12 @@ leaves your machine except the requests to the endpoint you configure.
 - **Images and video** — One folder can hold both. Clips get a player with a
   waveform, trim brackets, crop, rotate, and a mute-section tool for clipping a
   half-spoken word off the end of a trim.
-- **Model-aware conforming** — Each video model has an fps and a legal frame-count
-  grid (Wan 4n+1, LTX 8n+1, MiniMax H3 17n+5). Trim handles snap to lengths the
-  model accepts, and clips that can't work as-is are flagged with the reason.
+- **Trainer-aware conforming** — Each video model's *trainer* has an fps and a
+  legal frame-count rule (Wan 4n+1 up to 81, LTX 8n+1 up to 121, MiniMax H3
+  exactly 22/39/56/73/90/107/124). These are the trainers' limits, not the
+  models' generation ceilings — H3 generates 15s but trains on at most 5.17s.
+  Trim handles snap to lengths the trainer accepts, and clips that can't work
+  as-is are flagged with the reason.
 - **Training goals** — A second caption axis alongside the format preset: caption
   for a character likeness, a concept, a motion, an art style or a video look.
   Each encodes what to describe and what to leave out, since what you caption
@@ -246,10 +249,10 @@ python run_captioner.py
 Selecting a clip swaps the image canvas for a player with its own edit bar.
 
 - **Trim** with the brackets on the timeline. With a model target armed, **Snap**
-  pulls each edge onto a frame count that model accepts — Wan 4n+1, LTX 8n+1,
-  MiniMax H3 17n+5 — so you can't land on a length the trainer would silently
-  truncate or pad. A clip too short for the model isn't snapped at all; it's
-  flagged instead.
+  pulls each edge onto a frame count that model's trainer accepts — Wan 4n+1,
+  LTX 8n+1, MiniMax H3 one of 22–124 in 17-frame steps — so you can't land on a
+  length the trainer would silently truncate, pad or reject. A clip too short
+  for the trainer isn't snapped at all; it's flagged instead.
 - **Scrub** by dragging the square playhead grip; grab the bar beside it to move a
   trim bracket.
 - **Mute section** puts red brackets on the waveform. Playback is silenced inside

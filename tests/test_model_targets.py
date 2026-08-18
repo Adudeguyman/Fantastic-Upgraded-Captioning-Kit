@@ -25,28 +25,47 @@ from captioning_kit.model_targets import (
 
 
 class FrameGridTests(unittest.TestCase):
-    def test_h3_ladder_is_17n_plus_5(self):
-        # published ladder: 5, 22, 39, 56, 73, 90, 107, 124, 141 ...
-        for frames in (5, 22, 39, 56, 73, 90, 107, 124, 141, 243, 362):
+    def test_h3_legality_is_the_trainer_list_not_the_grid(self):
+        """fal's H3 trainers accept exactly 22, 39, 56, 73, 90, 107, 124.
+        The 17n+5 rungs outside that window — 5 below it, 141/243/362 above —
+        are grid-legal and trainer-illegal, which is precisely the distinction
+        the first version of this table got wrong."""
+        for frames in (22, 39, 56, 73, 90, 107, 124):
             self.assertTrue(MINIMAX_H3.is_legal_frames(frames), frames)
+        for frames in (5, 141, 243, 362):
+            self.assertFalse(MINIMAX_H3.is_legal_frames(frames), frames)
         for frames in (23, 100, 240, 360):
             self.assertFalse(MINIMAX_H3.is_legal_frames(frames), frames)
 
-    def test_h3_rounds_up_like_the_model_does(self):
-        # a request for 23 frames rounds up to 39
+    def test_h3_snap_stays_inside_the_trainer_list(self):
         self.assertEqual(MINIMAX_H3.snap_frames(23, "up"), 39)
-        # ...and 15s (360 frames) becomes 362, not 360
-        self.assertEqual(MINIMAX_H3.snap_frames(360, "up"), 362)
+        # 15s of source no longer reaches for the 362-frame generation ceiling
+        self.assertEqual(MINIMAX_H3.snap_frames(360, "up"), 124)
+        self.assertEqual(MINIMAX_H3.snap_frames(360, "down"), 124)
+
+    def test_h3_down_never_promises_frames_we_lack(self):
+        """fal's own adjustment (17 * (n // 17) + 5, clamped) turns 123 into 124 —
+        rounding UP — which is fine for a generation request but would have us
+        hand the trainer a frame the source doesn't contain. Our 'down' snap
+        gives 107 instead."""
+        self.assertEqual(MINIMAX_H3.snap_frames(123, "down"), 107)
+
+    def test_h3_matches_fal_adjustment_domain(self):
+        """Every count fal's formula can emit must be one we call legal, or we'd
+        flag clips the trainer takes."""
+        for value in range(22, 130):
+            adjusted = min(124, max(22, 17 * (value // 17) + 5))
+            self.assertTrue(MINIMAX_H3.is_legal_frames(adjusted), (value, adjusted))
 
     def test_h3_durations_match_published_values(self):
-        self.assertAlmostEqual(MINIMAX_H3.seconds_for_frames(243), 10.125, places=3)
-        self.assertAlmostEqual(MINIMAX_H3.seconds_for_frames(362), 15.083, places=2)
+        self.assertAlmostEqual(MINIMAX_H3.seconds_for_frames(124), 5.167, places=2)
         self.assertAlmostEqual(MINIMAX_H3.seconds_for_frames(107), 4.458, places=2)
+        self.assertAlmostEqual(MINIMAX_H3.seconds_for_frames(22), 0.917, places=2)
 
-    def test_h3_ceiling_is_362_not_345(self):
-        """Rounding the 15s cap *down* would give 345 and waste a second of the
-        model's trained range."""
-        self.assertEqual(MINIMAX_H3.max_frames(), 362)
+    def test_h3_ceiling_is_the_trainers_124_not_generations_362(self):
+        """H3 GENERATES 362 frames (15.08s), but no trainer takes past 124
+        (5.17s) — and this tool prepares training clips."""
+        self.assertEqual(MINIMAX_H3.max_frames(), 124)
 
     def test_wan_is_4n_plus_1(self):
         for frames in (9, 41, 81):
@@ -120,6 +139,30 @@ class BuiltinConsistencyTests(unittest.TestCase):
         self.assertTrue(MINIMAX_H3.exact_fps)
         self.assertFalse(WAN22_A14B.exact_fps)
 
+    def test_training_ceilings_are_trainer_side(self):
+        """The whole point of the 2026-08-18 audit: ceilings come from what
+        trainers accept, not what the models generate."""
+        self.assertEqual(MINIMAX_H3.max_frames(), 124)      # generates 362
+        self.assertEqual(LTX_2_3.max_frames(), 121)         # generates ~241
+        self.assertEqual(WAN22_A14B.max_frames(), 81)       # the two coincide
+        for target in BUILTIN_TARGETS:
+            self.assertGreater(target.max_train_frames, 0, target.key)
+
+    def test_grid_description_names_the_real_rule(self):
+        self.assertIn("22", MINIMAX_H3.grid_description())
+        self.assertIn("124", MINIMAX_H3.grid_description())
+        self.assertIn("4n+1", WAN22_A14B.grid_description())
+
+    def test_choice_list_snap_edges(self):
+        # below the list, every mode lands on the floor rather than inventing
+        # a smaller rung
+        self.assertEqual(MINIMAX_H3.snap_frames(10, "down"), 22)
+        self.assertEqual(MINIMAX_H3.snap_frames(10, "nearest"), 22)
+        # above the list, up-snap clamps to the ceiling
+        self.assertEqual(MINIMAX_H3.snap_frames(500, "up"), 124)
+        # nearest ties break low, matching the grid maths
+        self.assertEqual(MINIMAX_H3.snap_frames(64, "nearest"), 56)
+
 
 class UserOverrideTests(unittest.TestCase):
     def setUp(self):
@@ -150,6 +193,36 @@ class UserOverrideTests(unittest.TestCase):
         loaded = load_targets(self.tmp)
         self.assertIn("future_model", loaded)
         self.assertTrue(loaded["future_model"].is_legal_frames(62))
+
+    def test_overlay_parses_trainer_fields(self):
+        """A user correcting a trainer spec supplies the new fields as plain JSON;
+        the choice list comes back sorted and deduplicated with junk dropped, so
+        snap_frames can rely on order."""
+        targets_path(self.tmp).write_text(json.dumps({"targets": [{
+            "key": "future_model", "label": "Future", "fps": 24.0,
+            "frame_modulus": 1, "frame_remainder": 0, "dimension_multiple": 8,
+            "min_seconds": 0.5, "max_seconds": 4.0,
+            "max_train_frames": 96,
+            "train_frame_choices": [48, 12, 48, "junk", -3, 96],
+        }]}))
+        loaded = load_targets(self.tmp)["future_model"]
+        self.assertEqual(loaded.train_frame_choices, (12, 48, 96))
+        self.assertEqual(loaded.max_train_frames, 96)
+        self.assertEqual(loaded.max_frames(), 96)
+        self.assertEqual(loaded.min_frames(), 12)
+        self.assertFalse(loaded.is_legal_frames(24))
+
+    def test_trainer_fields_survive_a_save_load_roundtrip(self):
+        """The Preferences editor persists through save_targets; losing the
+        choice list on the way to disk would silently revert H3 to grid-only
+        legality — 141 frames would look legal again."""
+        save_targets(self.tmp, builtin_map())
+        loaded = load_targets(self.tmp)["minimax_h3"]
+        self.assertEqual(loaded.train_frame_choices,
+                         MINIMAX_H3.train_frame_choices)
+        self.assertEqual(loaded.max_train_frames, MINIMAX_H3.max_train_frames)
+        self.assertEqual(loaded.max_frames(), 124)
+        self.assertFalse(loaded.is_legal_frames(141))
 
     def test_malformed_file_falls_back_to_builtins(self):
         targets_path(self.tmp).write_text("{ not json")
@@ -546,10 +619,11 @@ class TrimSnapTests(unittest.TestCase):
         self.bar.set_snap(lambda i, o, which: (i, 4000))
         self.assertEqual(self.bar._snapped(0, 5123, "out"), (0, 4000))
 
-    def test_h3_grid_accepts_only_17n_plus_5(self):
+    def test_h3_grid_accepts_only_trainer_counts(self):
         self.assertTrue(MINIMAX_H3.is_legal_frames(73))
         self.assertTrue(MINIMAX_H3.is_legal_frames(90))
         self.assertFalse(MINIMAX_H3.is_legal_frames(74))
+        self.assertFalse(MINIMAX_H3.is_legal_frames(141))   # grid-legal, over cap
 
     def test_nearest_snap_can_round_either_way(self):
         """'Next acceptable window' means nearest, not always down — rounding down
@@ -692,20 +766,25 @@ class SnapFloorTests(unittest.TestCase):
     valid and aren't.
     """
 
-    def test_grid_floor_and_usable_floor_differ(self):
-        for target in (MINIMAX_H3, WAN22_A14B, LTX_2_3):
+    def test_grid_floor_and_usable_floor_differ_for_grid_models(self):
+        for target in (WAN22_A14B, LTX_2_3):
             self.assertLess(target.smallest_legal_frames(), target.min_frames(),
                             target.label)
 
-    def test_h3_rungs_below_the_minimum_are_grid_legal(self):
-        """Which is exactly why grid legality is not a sufficient check."""
-        for frames in (5, 22, 39, 56):
-            self.assertTrue(MINIMAX_H3.is_legal_frames(frames))
-            self.assertLess(frames, MINIMAX_H3.min_frames())
+    def test_h3_floor_is_the_choice_lists_own(self):
+        """With an enumerated trainer list, the smallest legal count IS the
+        usable minimum — the list already excludes the useless grid rungs, so
+        the two floors coincide by construction rather than by clamping."""
+        self.assertEqual(MINIMAX_H3.smallest_legal_frames(),
+                         MINIMAX_H3.min_frames())
+        self.assertFalse(MINIMAX_H3.is_legal_frames(5))   # grid rung below floor
 
     def test_first_usable_rung_is_the_minimum_itself(self):
-        self.assertEqual(MINIMAX_H3.min_frames(), 73)
-        self.assertTrue(MINIMAX_H3.is_legal_frames(73))
+        """22, not 73: fal lists 22 as a valid count and the VAE encodes it.
+        The old 73 floor was derived from the generation API's 3s duration enum,
+        which has nothing to do with what a trainer accepts."""
+        self.assertEqual(MINIMAX_H3.min_frames(), 22)
+        self.assertTrue(MINIMAX_H3.is_legal_frames(22))
 
     def test_every_target_minimum_sits_on_its_own_grid(self):
         """If it didn't, clamping to the minimum would produce an off-grid length."""
@@ -842,3 +921,89 @@ class TrimBarToolModeTests(unittest.TestCase):
     def test_an_unknown_tool_falls_back_to_the_playhead(self):
         self.bar.set_tool("nonsense")
         self.assertEqual(self.bar.tool(), "playhead")
+
+
+class TargetsEditorTests(unittest.TestCase):
+    """The Preferences editor is the only UI onto the trainer fields; if it
+    drops the choice list on reload or capture, H3 silently reverts to
+    grid-only legality and 141-frame clips look legal again."""
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance() or QApplication([])
+
+    def _page(self):
+        from PySide6.QtWidgets import QDialog
+        import captioning_kit.app as A
+
+        class Shim(QDialog):
+            _build_targets_editor = A.PreferencesDialog._build_targets_editor
+            _mt_reload = A.PreferencesDialog._mt_reload
+            _mt_capture = A.PreferencesDialog._mt_capture
+            _mt_refresh_summary = A.PreferencesDialog._mt_refresh_summary
+            _mt_parse_choices = staticmethod(A.PreferencesDialog._mt_parse_choices)
+            _mt_add = A.PreferencesDialog._mt_add
+            _mt_remove_current = A.PreferencesDialog._mt_remove_current
+            _mt_reset_current = A.PreferencesDialog._mt_reset_current
+
+        shim = Shim()
+        # The builder returns an unparented QWidget; without a Python reference
+        # the whole tree (combo included) is garbage-collected mid-test.
+        shim._page_ref = shim._build_targets_editor()
+        return shim
+
+    @staticmethod
+    def _select(shim, key):
+        idx = shim._mt_combo.findData(key)
+        assert idx >= 0, key
+        shim._mt_combo.setCurrentIndex(idx)
+        shim._mt_reload()
+
+    def test_h3_fields_round_trip_into_the_form(self):
+        shim = self._page()
+        self._select(shim, "minimax_h3")
+        self.assertEqual(shim._mt_fields["max_train_frames"].value(), 124)
+        self.assertEqual(
+            shim._mt_parse_choices(shim._mt_fields["train_frame_choices"].text()),
+            (22, 39, 56, 73, 90, 107, 124))
+
+    def test_editing_the_choice_list_updates_the_working_copy(self):
+        shim = self._page()
+        self._select(shim, "minimax_h3")
+        shim._mt_fields["train_frame_choices"].setText("9, 17, 25")
+        working = shim._mt_working["minimax_h3"]
+        self.assertEqual(working.train_frame_choices, (9, 17, 25))
+        self.assertEqual(working.max_frames(), 25)
+
+    def test_clearing_the_choice_list_falls_back_to_the_grid(self):
+        shim = self._page()
+        self._select(shim, "minimax_h3")
+        shim._mt_fields["train_frame_choices"].setText("")
+        working = shim._mt_working["minimax_h3"]
+        self.assertEqual(working.train_frame_choices, ())
+        # grid + max_train_frames still cap the ceiling
+        self.assertEqual(working.max_frames(), 124)
+
+    def test_summary_states_the_trainer_list_for_h3(self):
+        shim = self._page()
+        self._select(shim, "minimax_h3")
+        text = shim._mt_summary.text()
+        self.assertIn("Trainer accepts exactly", text)
+        self.assertIn("124", text)
+
+    def test_summary_shows_the_ladder_for_grid_models(self):
+        shim = self._page()
+        self._select(shim, "wan22_a14b")
+        text = shim._mt_summary.text()
+        self.assertIn("Legal frame counts", text)
+        self.assertIn("81", text)
+
+    def test_parse_choices_drops_junk_and_deduplicates(self):
+        from captioning_kit.app import PreferencesDialog
+        self.assertEqual(
+            PreferencesDialog._mt_parse_choices("22, banana, -5, 39 39;22"),
+            (22, 39))
+        self.assertEqual(PreferencesDialog._mt_parse_choices(""), ())

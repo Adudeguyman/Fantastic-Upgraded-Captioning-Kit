@@ -255,35 +255,54 @@ class ShortClipTests(unittest.TestCase):
         return VideoInfo(duration_s=seconds, width=640, height=480, fps=fps,
                          frame_count=int(seconds * fps), codec="h264")
 
-    def test_six_second_clip_snaps_down_to_a_legal_count(self):
+    def test_six_second_clip_caps_at_the_trainer_ceiling(self):
+        """6s holds 144 frames, and 141 is on the 17n+5 grid — but no H3 trainer
+        takes past 124, so the plan must cut to 124 (5.17s), not offer a length
+        the trainer would truncate."""
         from captioning_kit.model_targets import MINIMAX_H3
         plan = vt.plan_for_target(self._info(6.0), MINIMAX_H3, 0.0, 6.0)
-        self.assertEqual(plan.frame_limit, 141)           # 17*8 + 5
+        self.assertEqual(plan.frame_limit, 124)
         self.assertTrue(MINIMAX_H3.is_legal_frames(plan.frame_limit))
         self.assertLessEqual(plan.frame_limit / MINIMAX_H3.fps, 6.0)
-        self.assertGreaterEqual(plan.frame_limit, MINIMAX_H3.min_frames())
 
-    def test_short_clip_is_still_legal_but_below_minimum(self):
+    def test_three_second_clip_is_now_usable(self):
+        """72 frames snaps down to 56 — inside the trainer's 22..124 window.
+        Under the old generation-derived 3s floor this read as below-minimum."""
         from captioning_kit.model_targets import MINIMAX_H3
         plan = vt.plan_for_target(self._info(3.0), MINIMAX_H3, 0.0, 3.0)
+        self.assertEqual(plan.frame_limit, 56)
         self.assertTrue(MINIMAX_H3.is_legal_frames(plan.frame_limit))
-        self.assertLess(plan.frame_limit, MINIMAX_H3.min_frames())
+        self.assertGreaterEqual(plan.frame_limit, MINIMAX_H3.min_frames())
 
     def test_never_plans_more_frames_than_the_source_has(self):
         from captioning_kit.model_targets import BUILTIN_TARGETS
         for target in BUILTIN_TARGETS:
             for seconds in (0.5, 1.0, 2.0, 3.0, 6.0, 9.0):
                 plan = vt.plan_for_target(self._info(seconds), target, 0.0, seconds)
-                self.assertTrue(target.is_legal_frames(plan.frame_limit),
-                                f"{target.key} @ {seconds}s -> {plan.frame_limit}")
                 self.assertLessEqual(
                     plan.frame_limit / target.fps, seconds + 1e-6,
                     f"{target.key} @ {seconds}s asked for frames that don't exist")
+                if int(seconds * target.fps) >= target.min_frames():
+                    self.assertTrue(target.is_legal_frames(plan.frame_limit),
+                                    f"{target.key} @ {seconds}s -> {plan.frame_limit}")
+                else:
+                    # Too short to reach the trainer's floor (H3's is 22 frames):
+                    # no legal count fits, so the plan must report the shortfall
+                    # honestly — below min_frames — for the caller to refuse,
+                    # rather than promise frames the source doesn't have.
+                    self.assertLess(plan.frame_limit, target.min_frames(),
+                                    f"{target.key} @ {seconds}s")
 
-    def test_very_short_clip_falls_back_to_smallest_legal_count(self):
+    def test_very_short_clip_reports_its_shortfall_honestly(self):
+        """The old fallback 'planned' the smallest legal count even when the
+        source couldn't supply it — 5 frames from a 2-frame clip — and ffmpeg
+        would have emitted a short file the trainer silently skips. The plan now
+        reports the frames that exist, below min_frames(), so the caller's
+        too-short check refuses before rendering anything."""
         from captioning_kit.model_targets import MINIMAX_H3
         plan = vt.plan_for_target(self._info(0.1), MINIMAX_H3, 0.0, 0.1)
-        self.assertEqual(plan.frame_limit, MINIMAX_H3.smallest_legal_frames())
+        self.assertEqual(plan.frame_limit, 2)               # 0.1s at 24fps
+        self.assertLess(plan.frame_limit, MINIMAX_H3.min_frames())
 
 
 class FrameSamplingTests(unittest.TestCase):

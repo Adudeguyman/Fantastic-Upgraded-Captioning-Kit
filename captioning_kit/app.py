@@ -2746,10 +2746,24 @@ class PreferencesDialog(QDialog):
              "Width and height must divide by this. 16 for Wan, 32 for LTX and H3.")
         _num("max_pixels", "Max pixels (0 = no cap)", 0, 100_000_000, 0,
              "Area budget, if the model documents one. H3 caps at 768\u00d71344.")
-        _num("min_seconds", "Minimum length (s)", 0, 600, 2,
-             "Shorter clips are flagged as unusable for this model.")
-        _num("max_seconds", "Maximum length (s)", 0, 600, 2,
-             "Longer clips are flagged; trim to fit.")
+        _num("min_seconds", "Minimum length (s)", 0, 600, 4,
+             "Shorter clips are flagged as unusable for this model's trainer.")
+        _num("max_seconds", "Maximum length (s)", 0, 600, 4,
+             "Longer clips are flagged; trim to fit. This should be the TRAINER's "
+             "ceiling, not the model's generation length — the two differ (H3 "
+             "generates 15s but trains on at most 5.17s).")
+        _num("max_train_frames", "Max training frames (0 = from seconds)", 0, 100_000, 0,
+             "The longest clip the trainer accepts, as an exact frame count. "
+             "Overrides the seconds-derived ceiling, which avoids rounding "
+             "surprises. 124 for H3, 121 for LTX-2, 81 for Wan A14B.")
+        self._mt_choices = QLineEdit()
+        self._mt_choices.setToolTip(
+            "If the trainer publishes an exact list of accepted frame counts, "
+            "enter it comma-separated (H3: 22, 39, 56, 73, 90, 107, 124) and it "
+            "replaces the modulus grid entirely. Leave blank to use the grid.")
+        self._mt_choices.setPlaceholderText("blank = use the frame grid above")
+        self._mt_fields["train_frame_choices"] = self._mt_choices
+        form.addRow("Legal frame counts", self._mt_choices)
         self._mt_exact = QCheckBox("Requires exactly this frame rate")
         self._mt_exact.setToolTip(
             "On for models that reject off-rate sources outright (H3 needs 24.000). "
@@ -2809,6 +2823,9 @@ class PreferencesDialog(QDialog):
         f["max_pixels"].setValue(target.max_pixels)
         f["min_seconds"].setValue(target.min_seconds)
         f["max_seconds"].setValue(target.max_seconds)
+        f["max_train_frames"].setValue(target.max_train_frames)
+        f["train_frame_choices"].setText(
+            ", ".join(str(c) for c in target.train_frame_choices))
         f["exact_fps"].setChecked(target.exact_fps)
         f["notes"].setPlainText(target.notes)
         self._mt_current = key
@@ -2831,10 +2848,24 @@ class PreferencesDialog(QDialog):
             max_pixels=int(f["max_pixels"].value()),
             min_seconds=float(f["min_seconds"].value()),
             max_seconds=float(f["max_seconds"].value()),
+            max_train_frames=max(0, int(f["max_train_frames"].value())),
+            train_frame_choices=self._mt_parse_choices(
+                f["train_frame_choices"].text()),
             exact_fps=bool(f["exact_fps"].isChecked()),
             notes=f["notes"].toPlainText(),
         )
         self._mt_refresh_summary()
+
+    @staticmethod
+    def _mt_parse_choices(text: str) -> tuple[int, ...]:
+        """Comma/space-separated frame counts to a sorted tuple; junk is dropped
+        silently while typing — a half-entered '2' shouldn't raise, and the
+        summary line below the form shows what actually got through."""
+        out = set()
+        for part in re.split(r"[,;\s]+", text or ""):
+            if part.isdigit() and int(part) > 0:
+                out.add(int(part))
+        return tuple(sorted(out))
 
     def _mt_refresh_summary(self) -> None:
         """Show the rules as legal frame counts, which is the form they're used in
@@ -2843,13 +2874,18 @@ class PreferencesDialog(QDialog):
         if not key:
             return
         t = self._mt_working[key]
-        ladder = []
-        n = t.smallest_legal_frames()
-        while len(ladder) < 6 and n <= t.max_frames():
-            ladder.append(str(n))
-            n += t.frame_modulus
+        if t.train_frame_choices:
+            ladder = [str(c) for c in t.train_frame_choices]
+            head = f"Trainer accepts exactly: {', '.join(ladder)}"
+        else:
+            ladder = []
+            n = t.smallest_legal_frames()
+            while len(ladder) < 6 and n <= t.max_frames():
+                ladder.append(str(n))
+                n += t.frame_modulus
+            head = f"Legal frame counts: {', '.join(ladder)} \u2026 up to {t.max_frames()}"
         self._mt_summary.setText(
-            f"Legal frame counts: {', '.join(ladder)} \u2026 up to {t.max_frames()} "
+            f"{head} "
             f"({t.seconds_for_frames(t.max_frames()):.2f}s at {t.fps:g}fps). "
             f"Shortest usable: {t.min_frames()} frames "
             f"({t.seconds_for_frames(t.min_frames()):.2f}s)."
@@ -5983,6 +6019,10 @@ class VideoStage(QWidget):
         frames = target.snap_frames(
             min(int(round(span_s * target.fps)), target.max_frames()), "down")
         frames = max(frames, target.smallest_legal_frames())
+        # A choice-list floor (H3's 22) can exceed what the whole clip holds; cap
+        # at the clip's real capacity so the below-minimum branch reports the
+        # truth instead of announcing a fit to frames that don't exist.
+        frames = max(1, min(frames, int(round(duration / 1000.0 * target.fps))))
         span_ms = min(int(math.ceil(frames / target.fps * 1000)), duration)
         centre = (in_ms + out_ms) // 2
         new_in = max(0, min(centre - span_ms // 2, duration - span_ms))
@@ -6189,10 +6229,12 @@ class VideoStage(QWidget):
         if target is None:
             return in_ms, out_ms
         duration = self._slider.duration()
-        # The floor is the model's MINIMUM usable length, not the smallest number
-        # that happens to satisfy the grid. For H3 those are 73 frames and 5: the
-        # rungs below the minimum (5, 22, 39, 56) are all grid-legal and all
-        # useless, so offering one looks like a valid choice and isn't.
+        # The floor is the TRAINER's minimum usable length, not the smallest number
+        # that happens to satisfy the grid. For H3 those are 22 frames and 5: the
+        # 5-frame rung is grid-legal but below what the VAE will encode, so
+        # offering it looks like a valid choice and isn't. (22 itself IS legal —
+        # fal's trainers list it — which is why the floor lives in the target's
+        # data rather than hard-coded here.)
         floor = target.min_frames()
         ceiling = target.max_frames()
         # A clip too short to hold one legal length has nothing to snap to. Leave
@@ -6360,10 +6402,9 @@ class VideoStage(QWidget):
             colour = self.controller.theme.success
         else:
             nearest = target.snap_frames(min(frames, target.max_frames()), "down")
-            reason = ("over the model's maximum" if capped
-                      else "under the model's minimum" if short
-                      else f"not on the {target.frame_modulus}n"
-                           f"+{target.frame_remainder} grid")
+            reason = ("over the trainer's maximum" if capped
+                      else "under the trainer's minimum" if short
+                      else f"not {target.grid_description()}")
             text = f"{frames} frames \u2014 {reason}; nearest {nearest}"
             colour = self.controller.theme.warning
         self._trim_label.setText(text)
@@ -12919,8 +12960,8 @@ class MainWindow(QMainWindow):
                 f"{target.seconds_for_frames(target.min_frames()):.2f}s")
         elif not target.is_legal_frames(frames_at_target):
             issues.append(
-                f"{frames_at_target} frames isn't on {target.label}'s "
-                f"{target.frame_modulus}n+{target.frame_remainder} grid")
+                f"{frames_at_target} frames is not {target.grid_description()} "
+                f"\u2014 {target.label}'s trainer won't take it as-is")
         return issues
 
     def _preset_model_target(self):

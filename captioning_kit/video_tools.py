@@ -391,7 +391,12 @@ def plan_for_target(info: "VideoInfo", target, start_s: float, end_s: float,
     # frame costs a whole 17-frame block.
     available = int(round(span * fps))
     frames = target.snap_frames(min(available, target.max_frames()), snap)
-    frames = max(frames, target.smallest_legal_frames())
+    # A source shorter than the trainer's smallest accepted count (H3's is 22)
+    # can't be conformed by cutting: snapping up would promise frames that don't
+    # exist, ffmpeg would emit a short file, and the trainer would silently skip
+    # it. Report what's actually there — an illegal count — so the caller's
+    # below-minimum check refuses loudly instead.
+    frames = max(1, min(frames, available))
     # Target dimensions follow the cropped frame, not the original one.
     width, height = (crop[2], crop[3]) if crop else (info.width, info.height)
     if bucket is not None:
