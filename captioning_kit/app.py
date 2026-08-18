@@ -8137,6 +8137,18 @@ class MainWindow(QMainWindow):
         # Model specs live in a user-editable JSON beside the app; built-ins are the
         # fallback so a bad or missing file can't stop the app starting.
         self.model_targets = load_targets(app_base_dir())
+        # An overlay entry verified before the shipped rules were is running on
+        # out-of-date research (load_targets already back-fills fields the old
+        # file couldn't know about, but explicitly-stated values still win). Say
+        # so once, visibly: the alternative is spec flags that quietly disagree
+        # with the shipped rules and no way to notice from the main window.
+        self._stale_target_overrides = [
+            t.label for k, t in self.model_targets.items()
+            if k in builtin_map()
+            and t != builtin_map()[k]
+            and t.verified and builtin_map()[k].verified
+            and t.verified < builtin_map()[k].verified
+        ]
         self.preset: CaptionPreset = get_preset(None)
         self.project: ProjectConfig = ProjectConfig()
         self.selected_element_index: int | None = None
@@ -8190,7 +8202,14 @@ class MainWindow(QMainWindow):
         # The panel is built in its structured form; sync it to the active preset so a
         # fresh launch (plain text by default) doesn't show the JSON-only controls.
         self._apply_preset_ui()
-        self._set_status("Open a folder to begin.")
+        if self._stale_target_overrides:
+            names = ", ".join(self._stale_target_overrides[:4])
+            self._set_status(
+                f"\u26a0 model_targets.json overrides rules newer than it for: {names} "
+                "\u2014 review in Preferences \u2192 LLM Instructions \u2192 Model "
+                "frame rules, or delete the file to use the shipped rules.")
+        else:
+            self._set_status("Open a folder to begin.")
 
     # ---- layout ----------------------------------------------------------
     def _build_toolbar(self) -> None:

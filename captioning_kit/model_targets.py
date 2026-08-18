@@ -376,6 +376,18 @@ def load_targets(base_dir: Path | None = None) -> dict[str, ModelTarget]:
     for item in entries:
         if not isinstance(item, dict) or not item.get("key"):
             continue
+        # Forward-migration for overrides of built-in models: a field ABSENT from
+        # the JSON means "the app that wrote this file didn't know the field
+        # existed", not "the user chose the default". Overlay files written before
+        # the 2026-08-18 trainer audit lack max_train_frames/train_frame_choices,
+        # and letting those fall to dataclass defaults silently reverted H3 to
+        # generation-era legality — every out-of-spec clip lost its amber flag
+        # with nothing on screen to say why. Fields the file states explicitly
+        # still win (state "train_frame_choices": [] to clear a list on purpose);
+        # only the gaps are filled from the shipped entry.
+        builtin = targets.get(item["key"]) if item["key"] in builtin_map() else None
+        if builtin is not None:
+            item = {**asdict(builtin), **item}
         try:
             target = _target_from_dict(item)
         except (TypeError, ValueError, KeyError):
@@ -389,7 +401,11 @@ def save_targets(base_dir: Path, targets: dict[str, ModelTarget]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "_comment": "Edit to correct or add model targets. Delete this file to "
-                    "restore the built-in defaults.",
+                    "restore the built-in defaults. For built-in models, a field "
+                    "you REMOVE from an entry falls back to the shipped value "
+                    "(so old files inherit newly-added rules); to disable a "
+                    "field on purpose, state it explicitly — e.g. "
+                    "\"train_frame_choices\": [] or \"max_train_frames\": 0.",
         "targets": [asdict(t) for t in targets.values()],
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

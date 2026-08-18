@@ -1007,3 +1007,123 @@ class TargetsEditorTests(unittest.TestCase):
             PreferencesDialog._mt_parse_choices("22, banana, -5, 39 39;22"),
             (22, 39))
         self.assertEqual(PreferencesDialog._mt_parse_choices(""), ())
+
+
+class StaleOverlayMigrationTests(unittest.TestCase):
+    """An overlay file written before the trainer audit lacks max_train_frames
+    and train_frame_choices. Left to dataclass defaults, an H3 override
+    silently reverted to generation-era legality — every out-of-spec clip lost
+    its amber filmstrip flag with nothing on screen to say why. Missing fields
+    now inherit the shipped entry; fields the file states explicitly win."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def _write(self, entries):
+        targets_path(self.tmp).write_text(json.dumps({"targets": entries}))
+
+    def test_pre_audit_h3_override_inherits_the_trainer_rules(self):
+        # exactly what an old app version saved: full entry, no trainer fields
+        self._write([{
+            "key": "minimax_h3", "label": "MiniMax H3 (Hailuo 3.0)", "fps": 24.0,
+            "frame_modulus": 17, "frame_remainder": 5, "dimension_multiple": 32,
+            "max_pixels": 768 * 1344, "min_seconds": 3.0, "max_seconds": 15.0,
+            "exact_fps": True, "verified": "2026-08-13",
+        }])
+        loaded = load_targets(self.tmp)["minimax_h3"]
+        # the stale seconds remain (explicitly stated), but the inherited choice
+        # list rules the frame maths — so the flags judge by trainer limits
+        self.assertEqual(loaded.max_seconds, 15.0)
+        self.assertEqual(loaded.train_frame_choices,
+                         MINIMAX_H3.train_frame_choices)
+        self.assertEqual(loaded.max_frames(), 124)
+        self.assertFalse(loaded.is_legal_frames(141))
+        self.assertEqual(loaded.min_frames(), 22)
+
+    def test_explicitly_empty_choices_still_clear_the_list(self):
+        self._write([{
+            "key": "minimax_h3", "label": "H3 grid-only", "fps": 24.0,
+            "frame_modulus": 17, "frame_remainder": 5, "dimension_multiple": 32,
+            "min_seconds": 3.0, "max_seconds": 15.0,
+            "train_frame_choices": [], "max_train_frames": 0,
+        }])
+        loaded = load_targets(self.tmp)["minimax_h3"]
+        self.assertEqual(loaded.train_frame_choices, ())
+        self.assertTrue(loaded.is_legal_frames(141))    # grid-only, on purpose
+
+    def test_non_builtin_keys_are_not_merged(self):
+        self._write([{
+            "key": "someone_elses_model", "label": "X", "fps": 24.0,
+            "frame_modulus": 4, "frame_remainder": 1, "dimension_multiple": 16,
+            "min_seconds": 1.0, "max_seconds": 5.0,
+        }])
+        loaded = load_targets(self.tmp)["someone_elses_model"]
+        self.assertEqual(loaded.train_frame_choices, ())
+        self.assertEqual(loaded.max_train_frames, 0)
+
+    def test_stale_ltx_override_inherits_the_training_ceiling(self):
+        self._write([{
+            "key": "ltx_2_3", "label": "LTX-2.3", "fps": 24.0,
+            "frame_modulus": 8, "frame_remainder": 1, "dimension_multiple": 32,
+            "min_seconds": 1.0, "max_seconds": 10.0, "verified": "2026-08-13",
+        }])
+        loaded = load_targets(self.tmp)["ltx_2_3"]
+        self.assertEqual(loaded.max_frames(), 121)      # not 241 from the 10s
+
+
+class SpecTrianglePaintTests(unittest.TestCase):
+    """The amber spec triangle, verified by pixel count rather than by reading
+    the paint code — the marker 'rendering' invisibly is a known failure shape
+    in this codebase."""
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance() or QApplication([])
+
+    def _amber_pixels(self, spec_flag):
+        from PySide6.QtWidgets import (QListWidget, QListWidgetItem,
+                                       QStyleOptionViewItem, QWidget)
+        from PySide6.QtGui import QPixmap, QImage, QIcon, QPainter, QColor
+        from PySide6.QtCore import Qt, QRect, QSize
+        import captioning_kit.app as A
+        from captioning_kit.llm_captioning import CaptioningSettings
+
+        class FakeWin(QWidget):
+            def __init__(self):
+                super().__init__()
+                self.theme = A.Theme(CaptioningSettings())
+                self._dirty_dot = {}
+
+        delegate = A.FilmstripDelegate(FakeWin())
+        lw = QListWidget()
+        pm = QPixmap(96, 64)
+        pm.fill(QColor("#334455"))
+        item = QListWidgetItem()
+        item.setIcon(QIcon(pm))
+        item.setData(Qt.UserRole, "/x/clip.mp4")
+        item.setData(A.DURATION_ROLE, "0:06")
+        item.setData(A.SPEC_ROLE, spec_flag)
+        lw.addItem(item)
+        img = QImage(140, 160, QImage.Format_ARGB32)
+        img.fill(QColor("#101215"))
+        painter = QPainter(img)
+        opt = QStyleOptionViewItem()
+        opt.rect = QRect(0, 0, 140, 160)
+        opt.decorationSize = QSize(96, 96)
+        delegate.paint(painter, opt, lw.model().index(0, 0))
+        painter.end()
+        amber = QColor(A.SPEC_COLOR)
+        return sum(
+            1 for y in range(img.height()) for x in range(img.width())
+            if abs(img.pixelColor(x, y).red() - amber.red()) < 25
+            and abs(img.pixelColor(x, y).green() - amber.green()) < 25
+            and abs(img.pixelColor(x, y).blue() - amber.blue()) < 25)
+
+    def test_the_triangle_is_actually_drawn(self):
+        self.assertGreater(self._amber_pixels(True), 15)
+
+    def test_no_triangle_without_the_flag(self):
+        self.assertEqual(self._amber_pixels(False), 0)
