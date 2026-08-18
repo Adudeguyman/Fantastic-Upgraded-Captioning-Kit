@@ -185,6 +185,7 @@ from .video_tools import (
     probe_video,
     apply_mute_span,
     audio_peaks,
+    export_audio,
     extract_single_frame,
     VideoEditPlan,
     apply_video_edit as run_video_edit,
@@ -5495,6 +5496,13 @@ class VideoStage(QWidget):
         self._save_frame_btn.clicked.connect(self.save_current_frame)
         row.addWidget(self._save_frame_btn)
 
+        self._save_audio_btn = QPushButton("Save audio\u2026")
+        self._save_audio_btn.setToolTip(
+            "Write this clip's audio to a file. Uses the trimmed span when one is "
+            "set, at full quality.")
+        self._save_audio_btn.clicked.connect(self.save_clip_audio)
+        row.addWidget(self._save_audio_btn)
+
         self._snap_btn = QPushButton("Snap")
         self._snap_btn.setCheckable(True)
         # Default on: a trim that isn't on the grid gets silently truncated or
@@ -5857,6 +5865,37 @@ class VideoStage(QWidget):
                 self.controller.filmstrip.setCurrentRow(row)
         self.controller._set_status(f"Saved frame {frame_no} to {saved.name}.")
 
+    def save_clip_audio(self) -> None:
+        """Write the clip's audio out, honouring the trim."""
+        if self._path is None:
+            return
+        if not has_audio_stream(self._path):
+            self.controller._set_status(
+                f"{self._path.name} has no audio track \u2014 nothing to save.")
+            return
+        in_ms, out_ms = self._slider.trim()
+        trimmed = (in_ms, out_ms) != (0, self._slider.duration())
+        suffix = "_trimmed" if trimmed else ""
+        target, _ = QFileDialog.getSaveFileName(
+            self.controller, "Save audio",
+            str(self._path.parent / f"{self._path.stem}{suffix}.wav"),
+            "WAV (*.wav);;FLAC (*.flac);;MP3 (*.mp3);;M4A (*.m4a);;Opus (*.opus)")
+        if not target:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ok, message = export_audio(
+                self._path, target,
+                start_s=in_ms / 1000.0 if trimmed else 0.0,
+                end_s=out_ms / 1000.0 if trimmed else None)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not ok:
+            QMessageBox.critical(self.controller, "Could not save the audio", message)
+            return
+        span = f" ({(out_ms - in_ms) / 1000.0:.2f}s)" if trimmed else ""
+        self.controller._set_status(f"Saved audio{span} to {Path(target).name}.")
+
     # ---- snapping to the model's frame grid ----
 
     def _on_snap_toggled(self, on: bool) -> None:
@@ -6088,7 +6127,7 @@ class VideoStage(QWidget):
         for w in (self._in_btn, self._out_btn, self._reset_btn, self._fit_btn,
                   self._apply_btn, self._target_combo, self._nudge_back,
                   self._nudge_fwd, self._crop_btn, self._mute_section_btn,
-                  self._save_frame_btn, self._snap_btn,
+                  self._save_frame_btn, self._save_audio_btn, self._snap_btn,
                   self._rot_ccw, self._rot_cw):
             w.setEnabled(info is not None)
         self._meta_label.setText(

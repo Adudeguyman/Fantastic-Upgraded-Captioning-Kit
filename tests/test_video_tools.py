@@ -512,3 +512,52 @@ class SingleFrameExtractionTests(unittest.TestCase):
             ok, message = vt.extract_single_frame("in.mp4", out, 1.0)
         self.assertFalse(ok)
         self.assertIn("No frame", message)
+
+
+class AudioExportTests(unittest.TestCase):
+    """Saving a clip's audio for you to keep.
+
+    Distinct from extract_audio, which downsamples to 16kHz mono because that's
+    what the speech encoders want — fine for a model, wrong for a file you intend
+    to listen to or edit.
+    """
+
+    def test_a_clip_without_audio_is_refused_with_a_reason(self):
+        import tempfile as tf
+        out = Path(tf.mkdtemp()) / "x.wav"
+        with mock.patch.object(vt, "has_audio_stream", lambda p: False):
+            ok, message = vt.export_audio("in.mp4", out)
+        self.assertFalse(ok)
+        self.assertIn("no audio track", message)
+
+    def test_missing_ffmpeg_is_reported(self):
+        import tempfile as tf
+        out = Path(tf.mkdtemp()) / "x.wav"
+        with mock.patch.object(vt, "find_ffmpeg", lambda: None):
+            ok, message = vt.export_audio("in.mp4", out)
+        self.assertFalse(ok)
+        self.assertIn("ffmpeg", message.lower())
+
+    def test_an_unknown_extension_names_the_supported_ones(self):
+        """ffmpeg infers the container from the extension and fails with
+        'Invalid argument', which tells the user nothing."""
+        import tempfile as tf
+        out = Path(tf.mkdtemp()) / "x.xyz"
+        with mock.patch.object(vt, "has_audio_stream", lambda p: True), \
+             mock.patch.object(vt, "find_ffmpeg", lambda: "ffmpeg"):
+            ok, message = vt.export_audio("in.mp4", out)
+        self.assertFalse(ok)
+        self.assertIn("Unsupported audio format", message)
+        self.assertIn(".wav", message)
+
+    def test_every_offered_format_has_an_encoder(self):
+        """The save dialog's filter list and the encoder table must agree, or
+        picking a format from the dropdown fails."""
+        for suffix in (".wav", ".flac", ".mp3", ".m4a", ".opus"):
+            self.assertIn(suffix, vt._AUDIO_ENCODERS)
+
+    def test_it_keeps_the_source_rate_rather_than_downsampling(self):
+        """The 16k mono treatment belongs to the captioning path, not this one."""
+        for args in vt._AUDIO_ENCODERS.values():
+            self.assertNotIn("-ar", args)
+            self.assertNotIn("-ac", args)

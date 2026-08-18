@@ -730,3 +730,59 @@ def extract_single_frame(video: Path | str, out_path: Path | str, time_s: float,
     if not out.exists() or out.stat().st_size == 0:
         return False, "No frame at that position."
     return True, ""
+
+
+# Container extension -> encoder. Anything not listed falls back to re-encoding
+# as AAC, which every player handles.
+_AUDIO_ENCODERS = {
+    ".wav": ["-c:a", "pcm_s16le"],
+    ".flac": ["-c:a", "flac"],
+    ".mp3": ["-c:a", "libmp3lame", "-q:a", "2"],
+    ".m4a": ["-c:a", "aac", "-b:a", "192k"],
+    ".aac": ["-c:a", "aac", "-b:a", "192k"],
+    ".ogg": ["-c:a", "libvorbis", "-q:a", "5"],
+    ".opus": ["-c:a", "libopus", "-b:a", "128k"],
+}
+
+
+def export_audio(video_path: Path | str, out_path: Path | str,
+                 start_s: float = 0.0, end_s: float | None = None,
+                 timeout: float = 300.0) -> tuple[bool, str]:
+    """Save a clip's audio at full quality. Returns (ok, message).
+
+    Distinct from extract_audio, which downsamples to 16kHz mono because that's
+    what the speech encoders want — fine for a model, wrong for a file you intend
+    to listen to or edit. This keeps the source rate and channels, and picks an
+    encoder from the destination's extension.
+    """
+    ffmpeg = find_ffmpeg()
+    if ffmpeg is None:
+        return False, "ffmpeg isn't installed."
+    if not has_audio_stream(video_path):
+        return False, "This clip has no audio track."
+    out = Path(out_path)
+    cmd = [str(ffmpeg), "-v", "error", "-y", "-ss", f"{max(0.0, start_s):.3f}",
+           "-i", str(video_path)]
+    if end_s is not None and end_s > start_s:
+        cmd += ["-t", f"{end_s - start_s:.3f}"]
+    suffix = out.suffix.lower()
+    if suffix not in _AUDIO_ENCODERS:
+        # ffmpeg infers the container from the extension, so an unknown one fails
+        # with "Invalid argument" and no clue what to do about it.
+        return False, ("Unsupported audio format '" + (suffix or "(none)") + "'. "
+                       "Use one of: " + ", ".join(sorted(_AUDIO_ENCODERS)) + ".")
+    cmd += ["-vn", "-map", "0:a:0"]
+    cmd += _AUDIO_ENCODERS[suffix]
+    cmd.append(str(out))
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, "ffmpeg timed out."
+    except OSError as exc:
+        return False, f"Could not run ffmpeg: {exc}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip().splitlines()
+        return False, detail[-1] if detail else "ffmpeg failed."
+    if not out.exists() or out.stat().st_size == 0:
+        return False, "No audio was written."
+    return True, ""
