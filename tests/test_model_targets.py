@@ -1186,3 +1186,85 @@ class ArmedTargetSpecRefreshTests(unittest.TestCase):
         for key in ("wan22_a14b", "ltx_2_3", "minimax_h3"):
             self._arm(key)
             self.assertTrue(bool(self.item.data(self.A.SPEC_ROLE)), key)
+
+
+class WaveformInvalidationTests(unittest.TestCase):
+    """Applying a mute rewrites the file AT the same path, but the waveform
+    cache is keyed by path — so the bar kept drawing the old audio forever.
+    Verified by measurement: the peaks themselves must fall to silence, not
+    just 'a refresh was called'."""
+
+    @classmethod
+    def setUpClass(cls):
+        import os, shutil, subprocess, tempfile as tf
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance() or QApplication([])
+        if shutil.which("ffmpeg") is None:
+            raise unittest.SkipTest("ffmpeg not available")
+        cls.folder = Path(tf.mkdtemp())
+        # 2s of video with a loud 440Hz tone — unambiguous peaks
+        subprocess.run(
+            ["ffmpeg", "-v", "error",
+             "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=24",
+             "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+             "-c:a", "aac", "-shortest", str(cls.folder / "tone.mp4")],
+            check=True)
+
+    def setUp(self):
+        import tempfile as tf
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        import captioning_kit.app as A
+        A.default_profiles_path = lambda: Path(tf.mkdtemp()) / "p.json"
+        self.A = A
+        self.win = A.MainWindow()
+        QFileDialog.getExistingDirectory = staticmethod(
+            lambda *a, **k: str(self.folder))
+        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+        self.win.open_folder()
+        self.stage = self.win.video_stage
+        # Prime the stage the way load() does, without QMediaPlayer (which this
+        # test doesn't need and headless CI can't always host).
+        self.path = self.folder / "tone.mp4"
+        self.stage._path = self.path
+        self.stage._available = True
+        self.stage._load_into_player = lambda p: None
+        self.stage.release = lambda: None
+        self.stage._load_peaks()
+
+    def _restore_clip(self):
+        # put the original back so tests are independent
+        if self.win.store.has_original_backup(self.path):
+            self.win.store.revert_to_original(self.path)
+
+    def tearDown(self):
+        self._restore_clip()
+
+    def test_peaks_fall_silent_after_a_committed_mute(self):
+        before = list(self.stage._slider._peaks)
+        self.assertTrue(before and max(before) > 0.2,
+                        "tone clip should show real peaks before the mute")
+        self.stage._slider.set_mute_range(0, 2000)     # mute the whole clip
+        self.stage.commit_mute()
+        after = list(self.stage._slider._peaks)
+        self.assertTrue(after, "waveform should still render after the mute")
+        self.assertLess(max(after), 0.05,
+                        "a full-clip mute must show as silence on the bar")
+
+    def test_cache_entry_is_dropped_not_just_redrawn(self):
+        self.stage._slider.set_mute_range(0, 2000)
+        cache = self.stage._peaks_cache
+        stale = list(cache.get(str(self.path), []))
+        self.stage.commit_mute()
+        fresh = cache.get(str(self.path), [])
+        self.assertTrue(fresh, "cache should be repopulated from the new file")
+        self.assertNotEqual(stale, list(fresh))
+
+    def test_restore_original_brings_the_waveform_back(self):
+        self.stage._slider.set_mute_range(0, 2000)
+        self.stage.commit_mute()
+        self.assertLess(max(self.stage._slider._peaks), 0.05)
+        self.win.current = self.path
+        self.win.restore_original_media(self.path)
+        self.assertGreater(max(self.stage._slider._peaks), 0.2,
+                           "the restored original's audio must reappear")

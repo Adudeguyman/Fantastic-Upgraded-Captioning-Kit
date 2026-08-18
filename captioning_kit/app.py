@@ -6360,6 +6360,10 @@ class VideoStage(QWidget):
         self._update_mute_buttons()
         self.controller._purge_poster_cache(self._path)
         self._load_into_player(self._path)
+        # The muted file replaced the old one at the SAME path, so the cached
+        # waveform is now wrong — the whole point of the bar is seeing where the
+        # silence landed.
+        self.invalidate_peaks(self._path)
         self.refresh_audio_badge()
         self.controller._set_status(f"Muted {secs:.2f}s in {self._path.name}.")
 
@@ -6478,6 +6482,20 @@ class VideoStage(QWidget):
             except Exception:
                 self._peaks_cache[key] = []
         self._slider.set_peaks(self._peaks_cache[key])
+
+    def invalidate_peaks(self, path: Path | None) -> None:
+        """Forget a clip's cached waveform because its audio changed on disk.
+
+        The cache is keyed by path and the editing paths all rewrite the file AT
+        the same path (mute render, trim/conform re-encode, restore-original), so
+        without an explicit invalidation the bar kept drawing the old audio
+        forever — a mute would apply, sound silent on playback, and still show
+        its waveform. Every path-rewriting edit must call this."""
+        if path is None:
+            return
+        self._peaks_cache.pop(str(path), None)
+        if self._path is not None and str(self._path) == str(path):
+            self._load_peaks()
 
     def _load_into_player(self, path: Path | None) -> None:
         """Point the player at a file without disturbing trim/mute state — used for
@@ -12742,6 +12760,9 @@ class MainWindow(QMainWindow):
         self.video_stage.clear_pending(path)
         self._refresh_video_edit_marker(path)
         self._purge_poster_cache(path)
+        # Trim/conform rewrites the audio along with the picture; drop the cached
+        # waveform before the metadata reload so load() recomputes it once.
+        self.video_stage.invalidate_peaks(path)
         self._reload_video_metadata()
         self._refresh_spec_markers()
         self._set_status(f"{path.name}: {', '.join(changes)}.")
@@ -13478,6 +13499,11 @@ class MainWindow(QMainWindow):
             return
         self._refresh_edited_image_cached(path)
         if is_video(path):
+            stage = getattr(self, "video_stage", None)
+            if stage is not None:
+                # The restored file has the ORIGINAL audio back; the cached
+                # waveform still shows the edited one.
+                stage.invalidate_peaks(path)
             self._reload_video_metadata()
             self._refresh_spec_markers()
         else:
