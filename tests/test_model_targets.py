@@ -275,12 +275,24 @@ class TrimBarInteractionTests(unittest.TestCase):
         self._press(self.bar._x_for(2000) + self.bar.GRIP + 3)
         self.assertEqual(self.bar._drag, "in")
 
-    def test_window_drag_still_available_away_from_the_playhead(self):
+    def test_window_drag_needs_the_hand_tool(self):
+        """Sliding the selection is now an explicit choice: with the playhead tool
+        a click inside the selection moves the cursor, which is what made the
+        playhead reachable when the selection covers the whole timeline."""
         self.bar.set_position(2500)
+        self.bar.set_tool("select")
         self._press(self.bar._x_for(7000))
         self.assertEqual(self.bar._drag, "window")
 
+    def test_the_playhead_tool_seeks_inside_the_selection(self):
+        self.bar.set_tool("playhead")
+        self.bar.set_position(2500)
+        self._press(self.bar._x_for(7000))
+        self.assertEqual(self.bar._drag, "playhead")
+
     def test_click_outside_the_selection_seeks(self):
+        """With the hand tool, outside the selection there's nothing to slide."""
+        self.bar.set_tool("select")
         self.bar.set_position(6000)
         self._press(self.bar._x_for(11000))
         self.assertEqual(self.bar._drag, "seek")
@@ -602,6 +614,7 @@ class TrimBarGrabPriorityTests(unittest.TestCase):
         self.assertEqual(self._press(self.bar._x_for(3000)), "playhead")
 
     def test_window_drag_survives_away_from_the_playhead(self):
+        self.bar.set_tool("select")
         self.bar.set_position(1000)
         self.assertEqual(self._press(self.bar._x_for(4500)), "window")
 
@@ -756,3 +769,76 @@ class PlayheadRenderTests(unittest.TestCase):
         """They sit side by side; the same colour made the playhead hard to pick
         out from the handle beside it."""
         self.assertNotEqual(self.A.PLAYHEAD_COLOR.lower(), self.theme.accent.lower())
+
+
+class TrimBarToolModeTests(unittest.TestCase):
+    """Playhead or hand, never both.
+
+    Inferring intent from where you clicked meant the playhead was unreachable
+    whenever the selection covered the whole timeline — there was nowhere left to
+    click that wasn't 'inside the selection'.
+    """
+
+    def setUp(self):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance() or QApplication([])
+        import captioning_kit.app as A
+        from captioning_kit.llm_captioning import CaptioningSettings
+        self.bar = A.TrimBar(A.Theme(CaptioningSettings()))
+        self.bar.set_duration(12000)
+        self.bar.resize(700, self.bar.minimumHeight())
+
+    def _press(self, ms):
+        from PySide6.QtCore import QPointF, QEvent, Qt
+        from PySide6.QtGui import QMouseEvent
+        self.bar._drag = None
+        y = self.bar._track_rect().center().y()
+        self.bar.mousePressEvent(QMouseEvent(
+            QEvent.MouseButtonPress, QPointF(self.bar._x_for(ms), y),
+            Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+        return self.bar._drag
+
+    def test_the_playhead_tool_reaches_a_full_width_selection(self):
+        self.bar.set_trim(0, self.bar.duration())
+        self.bar.set_position(1000)
+        self.bar.set_tool("playhead")
+        self.assertEqual(self._press(9000), "playhead")
+
+    def test_the_hand_tool_slides_the_same_click(self):
+        self.bar.set_trim(2000, 8000)
+        self.bar.set_tool("select")
+        self.assertEqual(self._press(5000), "window")
+
+    def test_brackets_work_in_both_tools(self):
+        for tool in ("playhead", "select"):
+            self.bar.set_tool(tool)
+            self.bar.set_trim(2000, 8000)
+            self.bar.set_position(11000)
+            self.assertEqual(self._press(2000), "in", tool)
+
+    def test_sliding_the_selection_leaves_the_playhead_alone(self):
+        """It used to jump to the new start, which read as the cursor resetting to
+        the first frame every time you touched the selection."""
+        from PySide6.QtCore import QPointF, QEvent, Qt
+        from PySide6.QtGui import QMouseEvent
+        self.bar.set_tool("select")
+        self.bar.set_trim(2000, 8000)
+        self.bar.set_position(5000)
+        seeks = []
+        self.bar.positionRequested.connect(seeks.append)
+        self._press(6500)
+        y = self.bar._track_rect().center().y()
+        self.bar.mouseReleaseEvent(QMouseEvent(
+            QEvent.MouseButtonRelease, QPointF(self.bar._x_for(6500), y),
+            Qt.LeftButton, Qt.NoButton, Qt.NoModifier))
+        self.assertEqual(self.bar.position(), 5000)
+        self.assertEqual(seeks, [])
+
+    def test_the_default_tool_is_the_playhead(self):
+        self.assertEqual(self.bar.tool(), "playhead")
+
+    def test_an_unknown_tool_falls_back_to_the_playhead(self):
+        self.bar.set_tool("nonsense")
+        self.assertEqual(self.bar.tool(), "playhead")

@@ -232,6 +232,15 @@ _LUCIDE_ICONS = {
     "crop": "<path d='M6 2v14a2 2 0 0 0 2 2h14' /> <path d='M18 22V8a2 2 0 0 0-2-2H2' />",
     "link": ("<path d='M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71' />"
              " <path d='M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71' />"),
+    "mouse-pointer": ("<path d='M12.586 12.586 19 19' />"
+                      " <path d='M3.688 3.037a.497.497 0 0 0-.651.651l6.5 15.999a.501.501"
+                      " 0 0 0 .947-.062l1.569-6.083a2 2 0 0 1 1.448-1.479l6.124-1.579a.5.5"
+                      " 0 0 0 .063-.947z' />"),
+    "hand": ("<path d='M18 11V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2' />"
+             " <path d='M14 10V4a2 2 0 0 0-2-2a2 2 0 0 0-2 2v2' />"
+             " <path d='M10 10.5V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2v8' />"
+             " <path d='M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34"
+             "l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15' />"),
     "copy": ("<rect width='14' height='14' x='8' y='8' rx='2' ry='2' />"
              " <path d='M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2' />"),
     "image-plus": ("<path d='M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7' />"
@@ -4944,6 +4953,11 @@ class TrimBar(QWidget):
         # Optional (in_ms, out_ms, which) -> (in_ms, out_ms) hook that pulls a drag
         # onto a legal length. Set by the stage from the selected model target.
         self._snap = None
+        # "playhead" moves the cursor, "select" slides the whole selection. One or
+        # the other, chosen by the toolbar, rather than inferred from where you
+        # happened to click — which left the playhead unreachable whenever the
+        # selection covered the timeline.
+        self._tool = "playhead"
         self.setMouseTracking(True)
         self._duration = 0
         self._position = 0
@@ -4989,6 +5003,13 @@ class TrimBar(QWidget):
         return self._position
 
     # ---- mute range ----
+
+    def set_tool(self, tool: str) -> None:
+        self._tool = "select" if tool == "select" else "playhead"
+        self.update()
+
+    def tool(self) -> str:
+        return self._tool
 
     def set_snap(self, fn) -> None:
         """Install (or clear, with None) the length-snapping hook."""
@@ -5111,6 +5132,16 @@ class TrimBar(QWidget):
             self.positionRequested.emit(self._ms_for(x))
             self.setCursor(Qt.SizeHorCursor)
             return
+        if self._tool == "playhead" and not self._mute_visible:
+            # Playhead tool: a click anywhere that isn't a bracket moves the cursor,
+            # including inside the selection.
+            near_bracket = (abs(x - self._x_for(self._in)) <= self.HANDLE + 2
+                            or abs(x - self._x_for(self._out)) <= self.HANDLE + 2)
+            if not near_bracket:
+                self._drag = "playhead"
+                self.positionRequested.emit(self._ms_for(x))
+                self.setCursor(Qt.SizeHorCursor)
+                return
         near_in = abs(x - self._x_for(self._in)) <= self.HANDLE + 2
         near_out = abs(x - self._x_for(self._out)) <= self.HANDLE + 2
         if near_in and near_out:
@@ -5120,7 +5151,8 @@ class TrimBar(QWidget):
             self._drag = "in"
         elif near_out:
             self._drag = "out"
-        elif self._x_for(self._in) < x < self._x_for(self._out):
+        elif (self._tool == "select"
+              and self._x_for(self._in) < x < self._x_for(self._out)):
             # Grab inside the selection to slide the whole window. This is what
             # makes "Fit to target" usable: the fitted length is legal, and moving
             # it preserves that length, so the user picks *which* seconds to keep
@@ -5164,14 +5196,17 @@ class TrimBar(QWidget):
                            and (abs(x - self._x_for(self._in)) <= self.HANDLE + 2
                                 or abs(x - self._x_for(self._out)) <= self.HANDLE + 2))
             inside = self._x_for(self._in) < x < self._x_for(self._out)
-            self.setCursor(Qt.SizeHorCursor if near_handle
-                           else Qt.SizeHorCursor if on_playhead
-                           else Qt.OpenHandCursor if inside
-                           else Qt.PointingHandCursor)
+            if near_handle or on_playhead:
+                self.setCursor(Qt.SizeHorCursor)
+            elif self._tool == "select" and inside:
+                self.setCursor(Qt.OpenHandCursor)
+            else:
+                self.setCursor(Qt.PointingHandCursor)
 
     def mouseReleaseEvent(self, event) -> None:
-        if self._drag == "window":
-            self.positionRequested.emit(self._in)
+        # Sliding the selection used to yank the playhead to the new start, so a
+        # click inside the selection looked like the cursor jumping to frame one.
+        # Where you were watching is independent of where the selection sits.
         if self._drag in ("in", "out"):
             # park the playhead on the handle just moved, so you see the edit frame
             self.positionRequested.emit(self._in if self._drag == "in" else self._out)
@@ -5421,6 +5456,31 @@ class VideoStage(QWidget):
         row.setSpacing(8)
         rows.addLayout(row)
 
+        # Tool selector: one or the other, so what a click does is a decision you
+        # made rather than a guess from where you clicked.
+        self._tool_playhead = QToolButton()
+        self._tool_playhead.setObjectName("NavBtn")
+        self._tool_playhead.setCheckable(True)
+        self._tool_playhead.setChecked(True)
+        self._tool_playhead.setIcon(
+            lucide_icon("mouse-pointer", theme.text_secondary, 15))
+        self._tool_playhead.setToolTip("Move the playhead (V)")
+        self._tool_playhead.clicked.connect(lambda: self.set_tool("playhead"))
+        row.addWidget(self._tool_playhead)
+
+        self._tool_select = QToolButton()
+        self._tool_select.setObjectName("NavBtn")
+        self._tool_select.setCheckable(True)
+        self._tool_select.setIcon(lucide_icon("hand", theme.text_secondary, 15))
+        self._tool_select.setToolTip("Slide the selection, keeping its length (H)")
+        self._tool_select.clicked.connect(lambda: self.set_tool("select"))
+        row.addWidget(self._tool_select)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setStyleSheet(f"color: {theme.border};")
+        row.addWidget(sep)
+
         self._in_btn = QPushButton("Set in")
         self._in_btn.setToolTip("Start the clip at the current frame ([)")
         self._in_btn.clicked.connect(self.set_in_at_playhead)
@@ -5433,6 +5493,29 @@ class VideoStage(QWidget):
         self._reset_btn.setToolTip("Select the whole clip again")
         self._reset_btn.clicked.connect(self.reset_trim)
         row.addWidget(self._reset_btn)
+
+        # These stretched to fill; they only ever hold two short words, and the
+        # space is better spent on the frame boxes.
+        for btn in (self._in_btn, self._out_btn, self._reset_btn):
+            btn.setMaximumWidth(78)
+
+        # Editable in/out frames. Frames, not seconds: the grid rules are counted
+        # in them, so typing 73 is exact where 3.04s is a guess.
+        row.addSpacing(6)
+        row.addWidget(QLabel("In"))
+        self._in_frame = QSpinBox()
+        self._in_frame.setRange(0, 9_999_999)
+        self._in_frame.setMaximumWidth(86)
+        self._in_frame.setToolTip("First frame kept. Type a number to set it exactly.")
+        self._in_frame.editingFinished.connect(lambda: self._frame_box_edited("in"))
+        row.addWidget(self._in_frame)
+        row.addWidget(QLabel("Out"))
+        self._out_frame = QSpinBox()
+        self._out_frame.setRange(0, 9_999_999)
+        self._out_frame.setMaximumWidth(86)
+        self._out_frame.setToolTip("Last frame kept. Type a number to set it exactly.")
+        self._out_frame.editingFinished.connect(lambda: self._frame_box_edited("out"))
+        row.addWidget(self._out_frame)
 
         row.addSpacing(6)
         row.addWidget(QLabel("Target:"))
@@ -5784,6 +5867,7 @@ class VideoStage(QWidget):
         self._mark_pending()
 
     def _on_trim_changed(self, in_ms: int, out_ms: int) -> None:
+        self._refresh_frame_boxes()
         self._refresh_trim_label()
         self._mark_pending()
         if self._is_playing() and not (in_ms <= self._slider.position() < out_ms):
@@ -5912,6 +5996,63 @@ class VideoStage(QWidget):
             return
         span = f" ({(out_ms - in_ms) / 1000.0:.2f}s)" if trimmed else ""
         self.controller._set_status(f"Saved audio{span} to {Path(target).name}.")
+
+    # ---- tools and frame entry ----
+
+    def set_tool(self, tool: str) -> None:
+        """Playhead or hand — never both, so a click has one meaning."""
+        tool = "select" if tool == "select" else "playhead"
+        self._slider.set_tool(tool)
+        self._tool_playhead.setChecked(tool == "playhead")
+        self._tool_select.setChecked(tool == "select")
+        self.controller._set_status(
+            "Playhead tool: click the timeline to move the cursor."
+            if tool == "playhead" else
+            "Hand tool: drag inside the selection to slide it, keeping its length.")
+
+    def _frames_for(self, ms: int) -> int:
+        info = self._info
+        return int(round(ms / 1000.0 * info.fps)) if info and info.fps else 0
+
+    def _ms_for_frame(self, frame: int) -> int:
+        info = self._info
+        return int(round(frame / info.fps * 1000)) if info and info.fps else 0
+
+    def _refresh_frame_boxes(self) -> None:
+        if self._info is None:
+            return
+        in_ms, out_ms = self._slider.trim()
+        for box, ms in ((self._in_frame, in_ms), (self._out_frame, out_ms)):
+            box.blockSignals(True)
+            box.setValue(self._frames_for(ms))
+            box.blockSignals(False)
+
+    def _frame_box_edited(self, which: str) -> None:
+        """Typing a frame moves that edge, and snap still applies.
+
+        Snapping a typed number could look like the box ignoring you, so when it
+        moves the value the status line says so rather than leaving you to spot it.
+        """
+        if self._info is None:
+            return
+        in_ms, out_ms = self._slider.trim()
+        wanted = (self._ms_for_frame(self._in_frame.value()) if which == "in"
+                  else self._ms_for_frame(self._out_frame.value()))
+        wanted = max(0, min(wanted, self._slider.duration()))
+        if which == "in":
+            new_in, new_out = min(wanted, out_ms), out_ms
+        else:
+            new_in, new_out = in_ms, max(wanted, in_ms)
+        asked_frames = self._frames_for(new_out - new_in)
+        if self._snap_btn.isChecked() and self.current_target() is not None:
+            new_in, new_out = self._snap_trim(new_in, new_out, which)
+        self._slider.set_trim(new_in, new_out)
+        self._refresh_frame_boxes()
+        got_frames = self._frames_for(new_out - new_in)
+        if got_frames != asked_frames:
+            self.controller._set_status(
+                f"Snapped to {got_frames} frames \u2014 the nearest length "
+                f"{self.current_target().label} accepts.")
 
     # ---- snapping to the model's frame grid ----
 
@@ -6137,6 +6278,7 @@ class VideoStage(QWidget):
             self._crop_btn.setChecked(False)     # also tears down the rect
         self._rotation = 0
         self._set_position_labels(0)
+        self._refresh_frame_boxes()
         self._refresh_snap()
         self._load_peaks()
         self._restore_pending()
@@ -6216,6 +6358,22 @@ class VideoStage(QWidget):
         self._audio.setMuted(muted)
         self._mute_btn.setIcon(lucide_icon(
             "volume-x" if muted else "volume-2", self.controller.theme.text_secondary, 16))
+
+    def toggle_playback(self) -> None:
+        if self._player is None:
+            return
+        if self._is_playing():
+            self._player.pause()
+        else:
+            self._player.play()
+
+    def seek_to_trim(self, edge: str) -> None:
+        """Jump the playhead to a trim bracket — the two frames you actually check."""
+        in_ms, out_ms = self._slider.trim()
+        target = in_ms if edge == "in" else max(in_ms, out_ms - 1)
+        self._slider.set_position(target)
+        self._seek(target)
+        self._set_position_labels(target)
 
     def step_frames(self, frames: int) -> None:
         """Nudge by whole frames — the precision trim work needs this."""
@@ -7805,6 +7963,13 @@ class SourcePopout(QDialog):
 
 
 class MainWindow(QMainWindow):
+    """The application window.
+
+    Note on keys: arrows and A/D mean "previous/next box" for Ideogram bounding
+    boxes and "previous/next frame" on a clip. Which one you get follows whatever
+    is on screen, so the same keys do the obvious thing without a mode to learn.
+    """
+
     _SC_THUMB_H = 300  # fixed height of the source-popout thumbnail box (stops layout jitter)
 
     def __init__(self) -> None:
@@ -12678,6 +12843,57 @@ class MainWindow(QMainWindow):
         if text and self.preset.key.startswith("minimax_h3"):
             return normalise_h3_caption(text)
         return text
+
+    def _video_editing_active(self) -> bool:
+        """True when a clip is on screen, so the video shortcuts should win."""
+        stack = getattr(self, "center_stack", None)
+        return stack is not None and stack.currentIndex() == 1
+
+    def keyPressEvent(self, event) -> None:
+        if self._video_editing_active() and self._video_key(event):
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _video_key(self, event) -> bool:
+        """Editing keys for a clip. Returns True when the key was consumed."""
+        stage = getattr(self, "video_stage", None)
+        if stage is None:
+            return False
+        key, mods = event.key(), event.modifiers()
+        shift = bool(mods & Qt.ShiftModifier)
+        plain = mods in (Qt.NoModifier, Qt.ShiftModifier)
+        if not plain:
+            return False
+        step = 10 if shift else 1          # Shift jumps ten frames at a time
+        if key in (Qt.Key_Left, Qt.Key_A):
+            stage.step_frames(-step)
+            return True
+        if key in (Qt.Key_Right, Qt.Key_D):
+            stage.step_frames(step)
+            return True
+        if key == Qt.Key_Space:
+            stage.toggle_playback()
+            return True
+        if key == Qt.Key_I:
+            stage.set_in_at_playhead()
+            return True
+        if key == Qt.Key_O:
+            stage.set_out_at_playhead()
+            return True
+        if key == Qt.Key_V:
+            stage.set_tool("playhead")
+            return True
+        if key == Qt.Key_H:
+            stage.set_tool("select")
+            return True
+        if key == Qt.Key_Home:
+            stage.seek_to_trim("in")
+            return True
+        if key == Qt.Key_End:
+            stage.seek_to_trim("out")
+            return True
+        return False
 
     def available_presets(self) -> dict:
         """Built-ins plus any the user defined, so a preset added in Preferences
