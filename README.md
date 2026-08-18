@@ -13,7 +13,7 @@ Auto-captioning is optional and runs against an OpenAI-compatible model server
 that **you** control (local llama.cpp, LM Studio, vLLM, or Ollama). Nothing
 leaves your machine except the requests to the endpoint you configure.
 
-![Fantastic Upgraded Captioning Kit screenshot](captioningKitScreenshot.png)
+![Video editing with a MiniMax H3 target armed — the trim bar flags a clip that's over the trainer's frame maximum](captioningKitScreenshot.png)
 
 ## Contents
 
