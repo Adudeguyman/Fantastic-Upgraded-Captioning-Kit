@@ -5830,9 +5830,15 @@ class VideoStage(QWidget):
         target_key = state.get("target") or ""
         idx = self._target_combo.findData(target_key)
         if idx >= 0:
+            armed_changed = idx != self._target_combo.currentIndex()
             self._target_combo.blockSignals(True)
             self._target_combo.setCurrentIndex(idx)
             self._target_combo.blockSignals(False)
+            # Signals are blocked so the restore doesn't re-mark the clip as a
+            # fresh edit, but the armed target still steers every clip's spec
+            # verdict — refresh the strip explicitly when it actually moved.
+            if armed_changed:
+                self.controller._refresh_spec_markers()
         trim = state.get("trim")
         if trim:
             self._slider.set_trim(*trim)
@@ -5983,6 +5989,12 @@ class VideoStage(QWidget):
         self._refresh_snap()
         self._refresh_trim_label()
         self._mark_pending()
+        # The armed target WINS over the preset in _preset_model_target, so this
+        # dropdown changes the spec verdict for every clip in the filmstrip —
+        # not just the one on screen. Without this the amber triangles only
+        # caught up when something else happened to repaint the items (an
+        # applied edit, a preset switch), which read as the flag not working.
+        self.controller._refresh_spec_markers()
 
     def _on_trim_changed(self, in_ms: int, out_ms: int) -> None:
         self._refresh_frame_boxes()

@@ -1127,3 +1127,62 @@ class SpecTrianglePaintTests(unittest.TestCase):
 
     def test_no_triangle_without_the_flag(self):
         self.assertEqual(self._amber_pixels(False), 0)
+
+
+class ArmedTargetSpecRefreshTests(unittest.TestCase):
+    """Choosing a model in the video edit bar's dropdown must re-judge the whole
+    filmstrip: the armed target WINS over the preset in _preset_model_target,
+    so the dropdown changes every clip's spec verdict — but nothing refreshed
+    the strip, and the amber triangle only caught up when an applied edit or a
+    preset switch happened to repaint the items."""
+
+    @classmethod
+    def setUpClass(cls):
+        import os, shutil, subprocess, tempfile as tf
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance() or QApplication([])
+        if shutil.which("ffmpeg") is None:
+            raise unittest.SkipTest("ffmpeg not available")
+        cls.folder = Path(tf.mkdtemp())
+        # 7s @ 24fps: legal under no target, over H3's 5.17s training ceiling
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+             "testsrc=duration=7:size=320x240:rate=24",
+             str(cls.folder / "clip.mp4")], check=True)
+
+    def setUp(self):
+        import tempfile as tf
+        from PySide6.QtWidgets import QFileDialog
+        import captioning_kit.app as A
+        A.default_profiles_path = lambda: Path(tf.mkdtemp()) / "p.json"
+        self.A = A
+        self.win = A.MainWindow()
+        QFileDialog.getExistingDirectory = staticmethod(
+            lambda *a, **k: str(self.folder))
+        self.win.open_folder()
+        self.item = self.win._thumb_items[str(self.folder / "clip.mp4")]
+
+    def _arm(self, key):
+        combo = self.win.video_stage._target_combo
+        idx = combo.findData(key)
+        self.assertGreaterEqual(idx, 0, key)
+        combo.setCurrentIndex(idx)
+
+    def test_arming_a_target_flags_the_strip_immediately(self):
+        self.assertFalse(bool(self.item.data(self.A.SPEC_ROLE)))  # no target yet
+        self._arm("minimax_h3")
+        self.assertTrue(bool(self.item.data(self.A.SPEC_ROLE)))
+
+    def test_disarming_clears_the_flag_again(self):
+        self._arm("minimax_h3")
+        self.assertTrue(bool(self.item.data(self.A.SPEC_ROLE)))
+        self._arm("")                                     # None (keep source)
+        self.assertFalse(bool(self.item.data(self.A.SPEC_ROLE)))
+
+    def test_each_model_judges_for_itself(self):
+        # 7s is over every trainer's ceiling, but the point is the verdict
+        # follows the dropdown without any other interaction
+        for key in ("wan22_a14b", "ltx_2_3", "minimax_h3"):
+            self._arm(key)
+            self.assertTrue(bool(self.item.data(self.A.SPEC_ROLE)), key)
