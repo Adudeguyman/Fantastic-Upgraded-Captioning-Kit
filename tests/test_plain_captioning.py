@@ -1854,12 +1854,16 @@ class SpinBoxStepperTests(unittest.TestCase):
         pixmap.fill(QColor("black"))
         box.render(pixmap)
         image = pixmap.toImage()
-        arrow = QColor(self.win.theme.text_secondary).name().lower()
+        # Tolerant match: the chevron images are antialiased, so an exact colour
+        # comparison only catches the very centre of each stroke.
+        want = QColor(self.win.theme.text_secondary)
         hits = sum(
             1
-            for x in range(box.width() - 15, box.width() - 2)
-            for y in range(2, box.height() - 2)
-            if QColor(image.pixel(x, y)).name().lower() == arrow
+            for x in range(box.width() - 18, box.width() - 1)
+            for y in range(box.height())
+            if abs(QColor(image.pixel(x, y)).red() - want.red()) < 70
+            and abs(QColor(image.pixel(x, y)).green() - want.green()) < 70
+            and abs(QColor(image.pixel(x, y)).blue() - want.blue()) < 70
         )
         self.assertGreater(hits, 10, "step arrows render blank")
 
@@ -1868,6 +1872,36 @@ class SpinBoxStepperTests(unittest.TestCase):
         for selector in ("QSpinBox::up-arrow", "QSpinBox::down-arrow",
                          "QDoubleSpinBox::up-arrow", "QDoubleSpinBox::down-arrow"):
             self.assertIn(selector, sheet)
+
+    def test_the_arrows_are_chevron_images_not_css_shapes(self):
+        """The border-triangle fallback rendered as small blocks; sub-controls can
+        only be given a real shape via an image."""
+        import re
+        urls = re.findall(r"image: url\(([^)]+)\)", self.win.styleSheet())
+        self.assertGreaterEqual(len(urls), 6)      # normal, hover, disabled x2
+        for url in urls:
+            self.assertTrue(Path(url).exists(), url)
+            self.assertGreater(Path(url).stat().st_size, 0)
+
+    def test_the_arrow_glyph_is_wide_enough_to_read(self):
+        """A 10px chevron rendered two pixels tall — present but not legible."""
+        from PySide6.QtGui import QColor, QPixmap
+        box = self.stage._out_frame
+        pixmap = QPixmap(box.size())
+        pixmap.fill(QColor("black"))
+        box.render(pixmap)
+        image = pixmap.toImage()
+        arrow = QColor(self.win.theme.text_secondary)
+        rows = set()
+        for y in range(box.height()):
+            for x in range(box.width() - 18, box.width() - 1):
+                colour = QColor(image.pixel(x, y))
+                if (abs(colour.red() - arrow.red()) < 70
+                        and abs(colour.green() - arrow.green()) < 70
+                        and abs(colour.blue() - arrow.blue()) < 70):
+                    rows.add(y)
+                    break
+        self.assertGreaterEqual(len(rows), 5, "chevrons too small to read")
 
     def test_the_out_box_carries_no_suffix(self):
         """The total is already on the frame counter; repeating it here pushed the

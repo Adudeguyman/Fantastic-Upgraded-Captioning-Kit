@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import tempfile
 import subprocess
 import sys
 import time
@@ -320,6 +321,35 @@ def lucide_pixmap(name: str, color: str = "#A6ADB6", size: int = 18, stroke: flo
     return pm
 
 
+_ARROW_FILE_CACHE: dict = {}
+
+
+def lucide_arrow_url(name: str, color: str, size: int = 16,
+                     stroke: float = 2.6) -> str:
+    """Render an icon to a PNG on disk and return a stylesheet-ready URL.
+
+    Qt stylesheets can only point sub-control arrows at an image, and the CSS
+    border-triangle trick renders as small blocks rather than arrows in this
+    theme — so the spin buttons get the same chevrons the rest of the app uses.
+    Cached per (name, colour, size) because the sheet is rebuilt on theme change.
+    """
+    key = (name, color, size, stroke)
+    hit = _ARROW_FILE_CACHE.get(key)
+    if hit is not None and Path(hit).exists():
+        return hit
+    folder = Path(tempfile.gettempdir()) / "captioning_kit_icons"
+    folder.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^a-z0-9]+", "_", f"{name}_{color}_{size}_{stroke}".lower())
+    path = folder / f"{safe}.png"
+    if not path.exists():
+        pixmap = lucide_pixmap(name, color, size, stroke)
+        if not pixmap.save(str(path), "PNG"):
+            return ""
+    url = path.as_posix()
+    _ARROW_FILE_CACHE[key] = url
+    return url
+
+
 def lucide_icon(name: str, color: str = "#A6ADB6", size: int = 18, stroke: float = 1.8) -> QIcon:
     return QIcon(lucide_pixmap(name, color, size, stroke))
 
@@ -407,6 +437,14 @@ class Theme:
 def build_stylesheet(s: CaptioningSettings) -> str:
     """Dark QSS theme built from the token palette. Applies live (no restart)."""
     t = Theme(s)
+    # Spin-button arrows are images: Qt gives sub-controls no way to draw a shape,
+    # and the CSS border-triangle fallback renders as blocks in this theme.
+    up_arrow = lucide_arrow_url("chevron-up", t.text_secondary)
+    down_arrow = lucide_arrow_url("chevron-down", t.text_secondary)
+    up_arrow_hi = lucide_arrow_url("chevron-up", t.text_primary)
+    down_arrow_hi = lucide_arrow_url("chevron-down", t.text_primary)
+    up_arrow_off = lucide_arrow_url("chevron-up", t.border)
+    down_arrow_off = lucide_arrow_url("chevron-down", t.border)
     return f"""
     QWidget {{ background: {t.surface_0}; color: {t.text_primary}; }}
     QMainWindow, QDialog {{ background: {t.surface_0}; }}
@@ -457,12 +495,12 @@ def build_stylesheet(s: CaptioningSettings) -> str:
        triangle trick so every spinbox in the app has visible steppers. */
     QSpinBox::up-button, QDoubleSpinBox::up-button {{
         subcontrol-origin: border; subcontrol-position: top right;
-        width: 16px; border-left: 1px solid {t.border};
+        width: 18px; border-left: 1px solid {t.border};
         border-top-right-radius: 6px; background: {t.surface_2};
     }}
     QSpinBox::down-button, QDoubleSpinBox::down-button {{
         subcontrol-origin: border; subcontrol-position: bottom right;
-        width: 16px; border-left: 1px solid {t.border};
+        width: 18px; border-left: 1px solid {t.border};
         border-bottom-right-radius: 6px; background: {t.surface_2};
     }}
     QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
@@ -470,19 +508,15 @@ def build_stylesheet(s: CaptioningSettings) -> str:
         background: {t.surface_hover};
     }}
     QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
-        width: 0; height: 0; border-left: 4px solid transparent;
-        border-right: 4px solid transparent; border-bottom: 5px solid {t.text_secondary};
+        image: url({up_arrow}); width: 11px; height: 11px;
     }}
     QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
-        width: 0; height: 0; border-left: 4px solid transparent;
-        border-right: 4px solid transparent; border-top: 5px solid {t.text_secondary};
+        image: url({down_arrow}); width: 11px; height: 11px;
     }}
-    QSpinBox::up-arrow:hover, QDoubleSpinBox::up-arrow:hover {{ border-bottom-color: {t.text_primary}; }}
-    QSpinBox::down-arrow:hover, QDoubleSpinBox::down-arrow:hover {{ border-top-color: {t.text_primary}; }}
-    QSpinBox::up-arrow:disabled, QSpinBox::down-arrow:disabled,
-    QDoubleSpinBox::up-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {{
-        border-bottom-color: {t.border}; border-top-color: {t.border};
-    }}
+    QSpinBox::up-arrow:hover, QDoubleSpinBox::up-arrow:hover {{ image: url({up_arrow_hi}); }}
+    QSpinBox::down-arrow:hover, QDoubleSpinBox::down-arrow:hover {{ image: url({down_arrow_hi}); }}
+    QSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:disabled {{ image: url({up_arrow_off}); }}
+    QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {{ image: url({down_arrow_off}); }}
     QLineEdit:disabled, QPlainTextEdit:disabled, QComboBox:disabled {{ background: {t.surface_1}; border-color: {t.border}; color: {t.text_disabled}; }}
     QComboBox QAbstractItemView {{ background: {t.surface_2}; color: {t.text_primary}; border: 1px solid {t.border_strong}; selection-background-color: {t.accent_subtle}; selection-color: {t.text_primary}; }}
     QComboBox::drop-down {{ border: none; width: 20px; }}
